@@ -1,0 +1,22 @@
+# Stack build artifacts
+.stack-work/
+
+# Cabal build artifacts
+dist-newstyle/
+
+# Editor backups
+*~
+*.swp
+*.swo
+\#*\#
+
+# REPL history
+.fool_history
+.tulam_history
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/

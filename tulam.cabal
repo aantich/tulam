@@ -1,0 +1,113 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.38.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           tulam
+version:        0.1.0.0
+description:    Please see the README on GitHub at <https://github.com/githubuser/fool#readme>
+homepage:       https://github.com/githubuser/fool#readme
+bug-reports:    https://github.com/githubuser/fool/issues
+author:         Anton Antich
+maintainer:     anton.antich@gmail.com
+copyright:      2016-2023 Anton Antich
+license:        BSD3
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    CHANGELOG.md
+
+source-repository head
+  type: git
+  location: https://github.com/githubuser/fool
+
+library
+  exposed-modules:
+      CLM
+      Interpreter
+      Lexer
+      Logs
+      Parser
+      Pipeline
+      State
+      Surface
+      Util.IOLogger
+      Util.Logger
+      Util.PrettyPrinting
+  other-modules:
+      Paths_tulam
+  hs-source-dirs:
+      src
+  ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , directory
+    , hashtables
+    , haskeline
+    , ilist
+    , indexed-traversable
+    , mtl
+    , parsec
+    , pretty-simple
+    , text
+    , time
+    , transformers
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
+
+executable tulam
+  main-is: Main.hs
+  other-modules:
+      Paths_tulam
+  hs-source-dirs:
+      app
+  ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , directory
+    , hashtables
+    , haskeline
+    , ilist
+    , indexed-traversable
+    , mtl
+    , parsec
+    , pretty-simple
+    , text
+    , time
+    , transformers
+    , tulam
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
+
+test-suite tulam-test
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Paths_tulam
+  hs-source-dirs:
+      test
+  ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , directory
+    , hashtables
+    , haskeline
+    , ilist
+    , indexed-traversable
+    , mtl
+    , parsec
+    , pretty-simple
+    , text
+    , time
+    , transformers
+    , tulam
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
