@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, DeriveGeneric #-}
 -- error handling
 
 module Logs where
@@ -8,11 +8,33 @@ import qualified Data.HashMap.Strict as HM
 import Util.IOLogger as IOLog
 import Util.PrettyPrinting
 import Control.Monad.IO.Class (liftIO)
+import GHC.Generics (Generic)
+import Data.Binary (Binary(..), put, get, putWord8, getWord8)
+import qualified Data.Binary as Bin
+import qualified Data.Text.Encoding as TE
+import qualified Data.ByteString as BS
 
 -- some info for debugging to attach to initially parsed module expressions
 data SourceInfo = SourceInfo {
     lineNum :: !Int, colNum :: !Int, sourceFile :: String, notes :: Text
-} | SourceInteractive deriving Eq
+} | SourceInteractive deriving (Eq, Generic)
+
+-- Manual Binary instance for SourceInfo (Text needs encoding)
+instance Binary SourceInfo where
+    put (SourceInfo l c f n) = putWord8 0 >> Bin.put l >> Bin.put c >> Bin.put f >> put (TE.encodeUtf8 n)
+    put SourceInteractive = putWord8 1
+    get = do
+        tag <- getWord8
+        case tag of
+            0 -> SourceInfo <$> Bin.get <*> Bin.get <*> Bin.get <*> (TE.decodeUtf8 <$> get)
+            _ -> pure SourceInteractive
+
+-- Binary instance for Text (via UTF-8 ByteString)
+putText :: Text -> Bin.Put
+putText = Bin.put . TE.encodeUtf8
+
+getText :: Bin.Get Text
+getText = TE.decodeUtf8 <$> Bin.get
 
 data LogPayload = LogPayload {
     linePos :: !Int,

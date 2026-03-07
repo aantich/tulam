@@ -20,9 +20,12 @@ module ModuleSystem
     , defaultLibPaths
     -- Shared loading functions (M2: single source of truth)
     , loadFileQuiet
+    , loadFileWithCache
     , loadModuleTree
     , resolveAllDeps
     , runParseOnly
+    , runModulePasses
+    , CompiledModule(..)
     , baseModulePath
     , preludeModulePath
     ) where
@@ -36,7 +39,7 @@ import Parser (parseWholeFile)
 import TypeCheck (typeCheckPass)
 
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.State.Strict (get, put, evalStateT, execStateT)
+import Control.Monad.Trans.State.Strict (get, put, modify, evalStateT, execStateT)
 import qualified Data.Text.IO as TIO
 import qualified Data.Text as T
 import System.FilePath ((</>), joinPath)
@@ -46,6 +49,7 @@ import qualified Data.Set as Set
 import Data.List (intercalate, nub)
 
 import Util.IOLogger (initLogState)
+import Interface (ModuleCache(..), writeModuleCache, loadCacheIfFresh, hashSource, toCachePath, ensureCacheDir)
 
 -- | Module tree entry points
 baseModulePath :: FilePath
@@ -228,89 +232,175 @@ getModuleVisibleNames modKey spec loadedMods =
 -- Shared module loading functions (M2: single source of truth)
 --------------------------------------------------------------------------------
 
--- | Quiet version of file loading — runs all 5 passes without printing.
+-- | Result of compiling a single module.
+data CompiledModule = CompiledModule
+    { cmModuleKey   :: String           -- ^ e.g. "Algebra.Eq" or file path
+    , cmModulePath  :: ModulePath       -- ^ e.g. ["Algebra", "Eq"]
+    , cmPublicNames :: Set.Set Name     -- ^ names visible to downstream modules
+    , cmPrivateNames :: Set.Set Name    -- ^ names hidden from downstream modules
+    , cmImports     :: [(ModulePath, ImportSpec, Maybe Name)]
+    , cmExports     :: [(ModulePath, Maybe [Name])]
+    } deriving (Show)
+
+-- | Run all compilation passes (0 through 4.5) on the current parsedModule.
+-- Assumes parsedModule is already populated with this module's expressions.
+-- Modifies currentEnvironment in place (adds types, constructors, lambdas, CLM, etc.).
+runModulePasses :: IntState ()
+runModulePasses = do
+    timedPass "Pass 0 (desugar)" afterparserPass
+    clearAllLogs
+    timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
+    clearAllLogs
+    timedPass "Pass 0.5 (action desugar)" actionDesugarPass
+    clearAllLogs
+    timedPass "Pass 1 (env build)" buildEnvPass
+    clearAllLogs
+    timedPass "Pass 1.5 (record desugar)" recordDesugarPass
+    clearAllLogs
+    timedPass "Pass 2 (case opt)" caseOptimizationPass
+    checkSealedExhaustiveness
+    clearAllLogs
+    timedPass "Pass 3 (typecheck)" typeCheckPass
+    clearAllLogs
+    timedPass "Pass 4 (CLM)" lamToCLMPass
+    clearAllLogs
+    timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
+    clearAllLogs
+
+-- | Finalize a compiled module: compute public/private names, build ModuleEnv,
+-- enforce visibility, and write cache if applicable.
+finalizeModule :: String -> T.Text -> Set.Set Name -> HashMap String ModuleEnv
+               -> [Expr] -> IntState CompiledModule
+finalizeModule nm fileText namesBefore prevLoadedMods exprs = do
+    st' <- get
+    let namesAfter = allEnvNames (currentEnvironment st')
+    let newNames = Set.difference namesAfter namesBefore
+    let privDeclNames = extractPrivateNames exprs
+    let pubNames = Set.difference newNames privDeclNames
+    let privNames = Set.intersection newNames privDeclNames
+    let modPath = extractModulePath exprs
+    let imports = extractImports exprs
+    let exports = extractExports exprs
+    let modKey = case modPath of
+            [] -> nm
+            path -> modPathToKey path
+    let menv = ModuleEnv
+            { moduleName = modPath
+            , publicNames = pubNames
+            , privateNames = privNames
+            , moduleImports = imports
+            , moduleExports = exports
+            , loadedModules = Map.insert modKey
+                (ModuleEnv modPath pubNames privNames imports exports Map.empty)
+                prevLoadedMods
+            }
+    let env' = if Set.null privNames
+            then currentEnvironment st'
+            else removeNames privNames (currentEnvironment st')
+    put $ st' { currentEnvironment = env'
+              , currentModuleEnv = menv
+              }
+    -- Record source hash for dependency tracking
+    let srcHash = hashSource fileText
+    modify (\s -> s { moduleSourceHashes = Map.insert modKey srcHash (moduleSourceHashes s) })
+    -- Write module cache for modules with proper module declarations only
+    case modPath of
+        [] -> return ()
+        _  -> do
+            st'' <- get
+            let depModKeys = [modPathToKey dp | (dp, _, Nothing) <- imports]
+            let depsHashes = [(dk, h) | dk <- depModKeys
+                                      , Just h <- [Map.lookup dk (moduleSourceHashes st'')]]
+            let envSlice = sliceEnvironment pubNames (currentEnvironment st'')
+            liftIO $ writeModuleCache ModuleCache
+                { mcVersion     = 1
+                , mcModuleKey   = modKey
+                , mcSourceHash  = srcHash
+                , mcDepsHashes  = depsHashes
+                , mcEnvironment = envSlice
+                }
+    return $ CompiledModule modKey modPath pubNames privNames imports exports
+
+-- | Quiet version of file loading — runs all passes without printing.
 -- Tracks per-module defined names and stores in loadedModules.
+-- Phase 2A: Scopes parsedModule per module — saves/restores so each module's
+-- passes only see that module's parsed expressions.
 loadFileQuiet :: String -> IntState ()
 loadFileQuiet nm = do
+    st <- get
+    -- Phase 2A: Save the accumulated parsedModule from previous modules
+    let prevParsedModule = parsedModule st
+    -- Clear parsedModule so parsing only produces this module's expressions
+    put $ st { parsedModule = [] }
     fileText <- liftIO (TIO.readFile nm)
     res <- parseWholeFile fileText nm
-    st <- get
+    st2 <- get
     -- Snapshot environment names before this module's compilation
-    let namesBefore = allEnvNames (currentEnvironment st)
+    let namesBefore = allEnvNames (currentEnvironment st2)
     -- Reset module env for this module, preserving loadedModules
-    let prevLoadedMods = loadedModules (currentModuleEnv st)
+    let prevLoadedMods = loadedModules (currentModuleEnv st2)
     -- Store source text for error display
-    let srcs = Map.insert nm fileText (loadedSources st)
-    put $ st { currentSource = fileText
-             , currentModuleEnv = emptyModuleEnv { loadedModules = prevLoadedMods }
-             , loadedSources = srcs
-             }
+    let srcs = Map.insert nm fileText (loadedSources st2)
+    put $ st2 { currentSource = fileText
+              , currentModuleEnv = emptyModuleEnv { loadedModules = prevLoadedMods }
+              , loadedSources = srcs
+              }
     case res of
-        Left _err -> liftIO $ putStrLn $ "Error loading " ++ nm ++ ": parse error"
+        Left _err -> do
+            liftIO $ putStrLn $ "Error loading " ++ nm ++ ": parse error"
+            -- Phase 2A: Restore parsedModule even on parse failure
+            modify (\s -> s { parsedModule = prevParsedModule })
         Right exprs -> do
-            timedPass "Pass 0 (desugar)" afterparserPass
-            clearAllLogs
-            timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
-            clearAllLogs
-            timedPass "Pass 0.5 (action desugar)" actionDesugarPass
-            clearAllLogs
-            timedPass "Pass 1 (env build)" buildEnvPass
-            clearAllLogs
-            timedPass "Pass 1.5 (record desugar)" recordDesugarPass
-            clearAllLogs
-            timedPass "Pass 2 (case opt)" caseOptimizationPass
-            checkSealedExhaustiveness
-            clearAllLogs
-            timedPass "Pass 3 (typecheck)" typeCheckPass
-            clearAllLogs
-            timedPass "Pass 4 (CLM)" lamToCLMPass
-            clearAllLogs
-            timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
-            clearAllLogs
-            -- After loading: diff environment to find what this module defined
+            runModulePasses
+            _cm <- finalizeModule nm fileText namesBefore prevLoadedMods exprs
+            -- Phase 2A: Restore accumulated parsedModule (this module's + all previous)
             st' <- get
-            let namesAfter = allEnvNames (currentEnvironment st')
-            let newNames = Set.difference namesAfter namesBefore
-            -- Classify new names as public or private based on parsed expressions
-            let privDeclNames = extractPrivateNames exprs
-            let pubNames = Set.difference newNames privDeclNames
-            let privNames = Set.intersection newNames privDeclNames
-            -- Extract module name and imports from parsed expressions
-            let modPath = extractModulePath exprs
-            let imports = extractImports exprs
-            let exports = extractExports exprs
-            let modKey = case modPath of
-                    [] -> nm  -- fallback to file path if no module decl
-                    path -> modPathToKey path
-            let menv = ModuleEnv
-                    { moduleName = modPath
-                    , publicNames = pubNames
-                    , privateNames = privNames
-                    , moduleImports = imports
-                    , moduleExports = exports
-                    , loadedModules = Map.insert modKey
-                        (ModuleEnv modPath pubNames privNames imports exports Map.empty)
+            let allParsed = parsedModule st' ++ prevParsedModule
+            modify (\s -> s { parsedModule = allParsed })
+
+-- | Load a module from cache if fresh, otherwise compile from source and cache.
+loadFileWithCache :: String -> String -> IntState ()
+loadFileWithCache modKey filePath = do
+    fileText <- liftIO (TIO.readFile filePath)
+    let srcHash = hashSource fileText
+    -- Pass all known module source hashes for dependency freshness checking
+    st0 <- get
+    mCache <- liftIO $ loadCacheIfFresh modKey fileText (moduleSourceHashes st0)
+    case mCache of
+        Just mc -> do
+            -- Cache hit: merge cached environment slice directly
+            modify (\s -> s {
+                currentEnvironment = mergeEnvironment (currentEnvironment s) (mcEnvironment mc),
+                -- Record source hash so downstream modules can track this as a dep
+                moduleSourceHashes = Map.insert modKey srcHash (moduleSourceHashes s)
+            })
+            -- Also register in loadedModules so downstream visibility queries work
+            st <- get
+            let prevLoadedMods = loadedModules (currentModuleEnv st)
+            let pubNames = allEnvNames (mcEnvironment mc)
+            let menv = (currentModuleEnv st) {
+                    loadedModules = Map.insert modKey
+                        (ModuleEnv [] pubNames Set.empty [] [] Map.empty)
                         prevLoadedMods
-                    }
-            -- Enforce private visibility: remove private names from the
-            -- global environment so subsequent modules cannot see them
-            let env' = if Set.null privNames
-                    then currentEnvironment st'
-                    else removeNames privNames (currentEnvironment st')
-            put $ st' { currentEnvironment = env'
-                      , currentModuleEnv = menv
-                      }
+                }
+            put $ st { currentModuleEnv = menv }
+        Nothing -> do
+            -- Cache miss: full compile (loadFileQuiet writes cache + records hash)
+            loadFileQuiet filePath
 
 -- | Load a module tree starting from an entry file.
 -- Resolves all dependencies recursively, topologically sorts them,
 -- and loads each module in order. Always loads Prelude first.
+-- Uses binary cache when available for fast loading.
 loadModuleTree :: FilePath -> IntState ()
 loadModuleTree entryFile = do
     st <- get
     let searchPaths = libSearchPaths st
+    -- Ensure cache directory exists
+    liftIO ensureCacheDir
     -- Load prelude first (primitives, no dependencies)
     liftIO $ putStrLn "  Loading Prelude..."
-    loadFileQuiet preludeModulePath
+    loadFileWithCache "Prelude" preludeModulePath
     -- Parse entry file to get its dependencies
     liftIO $ putStrLn "  Resolving module dependencies..."
     allModules <- liftIO $ resolveAllDeps searchPaths Set.empty [entryFile]
@@ -318,7 +408,7 @@ loadModuleTree entryFile = do
     liftIO $ putStrLn $ "  Loading " ++ show (length allModules) ++ " modules..."
     mapM_ (\(modKey, filePath) -> do
         liftIO $ putStrLn $ "    " ++ modKey
-        loadFileQuiet filePath
+        loadFileWithCache modKey filePath
         ) allModules
     liftIO $ putStrLn "  All modules loaded."
 

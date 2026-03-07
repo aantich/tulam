@@ -7,6 +7,8 @@
 module Algebra.Eq;
 import Core.Bool;
 
+infix 4 (==), (!=);
+
 /// Equality algebra with reflexivity, symmetry, and transitivity laws.
 algebra Eq (a:Type) = {
   /// Test two values for equality.

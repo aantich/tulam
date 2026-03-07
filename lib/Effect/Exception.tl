@@ -16,3 +16,9 @@ effect Exception = {
     /// @returns Either the computation result or the handler result
     function catch(m:b, handler: a -> b) : b
 };
+
+/// Default exception handler: throw calls error, catch is identity.
+handler DefaultException : Exception = {
+    function throw(err) = error(show(err)),
+    function catch(m, handler) = m
+};

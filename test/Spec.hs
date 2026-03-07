@@ -99,6 +99,9 @@ evalExprM input = do
                     case lookupCLMBindingOrLambda env (case ex1 of CLMID nm -> nm) of
                         Just v -> return v
                         Nothing -> return ex1
+                ex1@(CLMHANDLE _ _ _ _) -> do
+                    ex1' <- evalCLM 0 ex1
+                    _contEval 1 ex1 ex1'
                 other -> return other
 
 -- CLM expression constructors for assertions
@@ -3939,3 +3942,450 @@ main = do
                 st27 <- loadTestProgram st "tests/programs/P27_ParamRepr.tl"
                 result <- evalExpr st27 "t3()"
                 result `shouldBe` CLMLIT (LInt 0)
+
+        describe "P28: String Manipulation Demo" $ do
+            it "t1: string byte length" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t1()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t2: concat byte length" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t2()"
+                result `shouldBe` CLMLIT (LInt 11)
+            it "t3: string equality" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t3()"
+                result `shouldBe` conTrue
+            it "t4: string inequality" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t4()"
+                result `shouldBe` conTrue
+            it "t5: charCount" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t5()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t6: strStartsWith" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t6()"
+                result `shouldBe` conTrue
+            it "t7: strEndsWith" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t7()"
+                result `shouldBe` conTrue
+            it "t8: strIndexOf" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t8()"
+                result `shouldBe` CLMLIT (LInt 6)
+            it "t9: strSlice byte length" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t9()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t10: empty string check" $ do
+                st28 <- loadTestProgram (enableNewStrings st) "tests/programs/P28_StringDemo.tl"
+                result <- evalExpr st28 "t10()"
+                result `shouldBe` conTrue
+
+        describe "P29: Minimal Definition Checking" $ do
+            it "t1: (==) provided directly" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t1()"
+                result `shouldBe` conTrue
+            it "t2: (!=) from default (not (x == y))" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t2()"
+                result `shouldBe` conTrue
+            it "t3: (!=) false case via default" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t3()"
+                result `shouldBe` conFalse
+            it "t4: compare provided directly" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t4()"
+                result `shouldBe` conLT
+            it "t5: (<) derived from compare default" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t5()"
+                result `shouldBe` conTrue
+            it "t6: (>=) derived from compare default" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t6()"
+                result `shouldBe` conTrue
+            it "t7: (<=) derived from compare default" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t7()"
+                result `shouldBe` conTrue
+            it "t8: (>) derived from compare default" $ do
+                st29 <- loadTestProgram st "tests/programs/P29_MinimalDef.tl"
+                result <- evalExpr st29 "t8()"
+                result `shouldBe` conTrue
+
+        describe "P30: Derive for Parameterized Types" $ do
+            it "t1: Eq(Maybe) derive - Just(1) == Just(1)" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t1()"
+                result `shouldBe` conTrue
+            it "t2: Eq(Maybe) derive - Just(1) == Just(2) is False" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t2()"
+                result `shouldBe` conFalse
+            it "t3: Eq(Maybe) derive - Nothing == Nothing" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t3()"
+                result `shouldBe` conTrue
+            it "t4: Eq(Maybe) derive - Just(1) == Nothing is False" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t4()"
+                result `shouldBe` conFalse
+            it "t5: Eq(Box) derive - MkBox(42) == MkBox(42)" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t5()"
+                result `shouldBe` conTrue
+            it "t6: Eq(Box) derive - MkBox(42) == MkBox(99) is False" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t6()"
+                result `shouldBe` conFalse
+            it "t7: Show(Box) derive - show(MkBox(42))" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t7()"
+                result `shouldBe` CLMLIT (LString "MkBox(42)")
+            it "t8: Eq(List) derive - equal lists" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t8()"
+                result `shouldBe` conTrue
+            it "t9: Eq(List) derive - different elements" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t9()"
+                result `shouldBe` conFalse
+            it "t10: Eq(List) derive - Nil == Nil" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t10()"
+                result `shouldBe` conTrue
+            it "t11: Eq(List) derive - Cons vs Nil" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t11()"
+                result `shouldBe` conFalse
+            it "t12: nested - Just(Just(1)) == Just(Just(1))" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t12()"
+                result `shouldBe` conTrue
+            it "t13: nested - Just(Just(1)) == Just(Just(2)) is False" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t13()"
+                result `shouldBe` conFalse
+            it "t14: nested - Just(Nil) == Just(Nil)" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t14()"
+                result `shouldBe` conTrue
+            it "t15: Eq(Pair) derive - MkPair(1,2) == MkPair(1,2)" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t15()"
+                result `shouldBe` conTrue
+            it "t16: Eq(Pair) derive - different pairs" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t16()"
+                result `shouldBe` conFalse
+            it "t17: Show(Pair) derive - show(MkPair(1, True))" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t17()"
+                result `shouldBe` CLMLIT (LString "MkPair(1, True)")
+            it "t18: deriving syntax - Triple Eq" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t18()"
+                result `shouldBe` conTrue
+            it "t19: deriving syntax - Triple Eq different" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t19()"
+                result `shouldBe` conFalse
+            it "t20: deriving syntax - Triple Show" $ do
+                st30 <- loadTestProgram st "tests/programs/P30_DeriveParam.tl"
+                result <- evalExpr st30 "t20()"
+                result `shouldBe` CLMLIT (LString "MkTriple(1, True, \"hi\")")
+
+        describe "P31: Requires Constraint Enforcement" $ do
+            it "t1: Printable(Int) with satisfied requires Eq(Int)" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t1()"
+                result `shouldBe` CLMLIT (LString "42")
+            it "t2: Eq still works alongside Printable" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t2()"
+                result `shouldBe` conTrue
+            it "t3: Mappable morphism with requires - mapTo(1)" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t3()"
+                result `shouldBe` conTrue
+            it "t4: Mappable morphism with requires - mapTo(0)" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t4()"
+                result `shouldBe` conFalse
+            it "t5: derive on Wrapper - MkWrapper(10) == MkWrapper(10)" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t5()"
+                result `shouldBe` conTrue
+            it "t6: derive on Wrapper - MkWrapper(10) == MkWrapper(20)" $ do
+                st31 <- loadTestProgram st "tests/programs/P31_Requires.tl"
+                result <- evalExpr st31 "t6()"
+                result `shouldBe` conFalse
+
+        describe "P32: Effect Handlers (Runtime)" $ do
+            it "t1: handle with SilentConsole suppresses output" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t1()"
+                result `shouldBe` CLMLIT (LInt 42)
+            it "t2: SilentConsole readLine returns empty string" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t2()"
+                result `shouldBe` CLMLIT (LString "")
+            it "t3: State effect with RefState - put, modify, get" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t3()"
+                result `shouldBe` CLMLIT (LInt 15)
+            it "t4: State - initial value used" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t4()"
+                result `shouldBe` CLMLIT (LInt 42)
+            it "t5: Multiple handle scopes with different state" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t5()"
+                result `shouldBe` CLMLIT (LInt 109)
+            it "t6: handler does not leak outside scope" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t6()"
+                result `shouldBe` conTrue
+            it "t7: SilentConsole putStr returns Unit" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t7()"
+                result `shouldBe` conTrue
+
+        describe "P33: Operator Fixity and Precedence" $ do
+            it "t1: 2 + 3 * 4 == 14 (mul binds tighter)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t1()"
+                result `shouldBe` CLMLIT (LInt 14)
+            it "t2: 3 * 4 + 2 == 14 (mul binds tighter)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t2()"
+                result `shouldBe` CLMLIT (LInt 14)
+            it "t3: 1 + 2 == 3 is True (== binds looser than +)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t3()"
+                result `shouldBe` conTrue
+            it "t4: 2 * 3 == 6 is True (== binds looser than *)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t4()"
+                result `shouldBe` conTrue
+            it "t5: 1 + 2 * 3 == 7 is True (full chain)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t5()"
+                result `shouldBe` conTrue
+            it "t6: 1 - 2 - 3 == -4 (left-assoc)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t6()"
+                result `shouldBe` CLMLIT (LInt (-4))
+            it "t7: 2 * 3 * 4 == 24 (left-assoc)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t7()"
+                result `shouldBe` CLMLIT (LInt 24)
+            it "t8: 3 * -2 + 10 == 4 (unary minus)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t8()"
+                result `shouldBe` CLMLIT (LInt 4)
+            it "t9: (2 + 3) * 4 == 20 (parens override)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t9()"
+                result `shouldBe` CLMLIT (LInt 20)
+            it "t10: 10 - 2 * 3 == 4 is True (nested)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t10()"
+                result `shouldBe` conTrue
+
+            -- Group B: More prec 7 vs 6
+            it "t11: 3 + 2 * 5 == 13 (+ vs * again)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t11()"
+                result `shouldBe` CLMLIT (LInt 13)
+            it "t12: 20 - 3 * 4 - 1 == 7 (mixed prec + left-assoc)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t12()"
+                result `shouldBe` CLMLIT (LInt 7)
+
+            -- Group C: Comparison operators (all prec 4)
+            it "t13: 1 + 2 < 5 (< looser than +)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t13()"
+                result `shouldBe` conTrue
+            it "t14: 2 * 3 > 5 (> looser than *)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t14()"
+                result `shouldBe` conTrue
+            it "t15: 3 + 2 <= 5 (<= looser than +)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t15()"
+                result `shouldBe` conTrue
+            it "t16: 3 * 2 >= 6 (>= looser than *)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t16()"
+                result `shouldBe` conTrue
+            it "t17: 1 + 1 != 3 (!= looser than +)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t17()"
+                result `shouldBe` conTrue
+            it "t18: 2 * 3 < 2 * 4 (< with * on both sides)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t18()"
+                result `shouldBe` conTrue
+
+            -- Group D: Bitwise operators (prec 3, 2)
+            it "t19: 7 .&. 3 == 3 (bitwise AND)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t19()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t20: 4 .|. 2 == 6 (bitwise OR)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t20()"
+                result `shouldBe` CLMLIT (LInt 6)
+            it "t21: .&. binds tighter than .|." $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t21()"
+                result `shouldBe` CLMLIT (LInt 7)
+            it "t22: .&. binds tighter than .|. (reversed)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t22()"
+                result `shouldBe` CLMLIT (LInt 7)
+            it "t23: .&. right-assoc: 15 .&. 7 .&. 3 == 3" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t23()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t24: .|. right-assoc: 1 .|. 2 .|. 4 == 7" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t24()"
+                result `shouldBe` CLMLIT (LInt 7)
+
+            -- Group E: Cross-level precedence (bitwise vs arithmetic)
+            it "t25: .&. looser than +: 5 .&. 2 + 1 == 1" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t25()"
+                result `shouldBe` CLMLIT (LInt 1)
+            it "t26: .|. looser than +: 4 .|. 1 + 2 == 7" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t26()"
+                result `shouldBe` CLMLIT (LInt 7)
+            it "t27: .&. looser than *: 7 .&. 2 * 3 == 6" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t27()"
+                result `shouldBe` CLMLIT (LInt 6)
+            it "t28: .|. looser than *: 4 .|. 1 * 2 == 6" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t28()"
+                result `shouldBe` CLMLIT (LInt 6)
+
+            -- Group F: Full precedence chain
+            it "t29: full chain 1 .|. 2 .&. 3 + 1 * 2 == 1" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t29()"
+                result `shouldBe` CLMLIT (LInt 1)
+
+            -- Group G: Unary minus edge cases
+            it "t30: -3 * 2 == -6 (unary tighter than *)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t30()"
+                result `shouldBe` CLMLIT (LInt (-6))
+            it "t31: 10 + -2 * 3 == 4 (unary in middle)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t31()"
+                result `shouldBe` CLMLIT (LInt 4)
+            it "t32: - -5 == 5 (double unary)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t32()"
+                result `shouldBe` CLMLIT (LInt 5)
+
+            -- Group H: Custom fixity declarations
+            it "t33: custom infixr 5 (<>) binds looser than *" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t33()"
+                result `shouldBe` CLMLIT (LInt 32)
+            it "t34: custom <> binds tighter than ==" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t34()"
+                result `shouldBe` conTrue
+            it "t35: custom <> right-assoc: 1 <> 2 <> 3 == 33" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t35()"
+                result `shouldBe` CLMLIT (LInt 33)
+            it "t36: custom <> right-assoc confirmed (not 123)" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t36()"
+                result `shouldBe` conTrue
+            it "t37: custom infixl 1 (>>>) binds loosest vs *" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t37()"
+                result `shouldBe` CLMLIT (LInt 7)
+            it "t38: >>> binds looser than .&." $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t38()"
+                result `shouldBe` CLMLIT (LInt 4)
+            it "t39: >>> left-assoc: 1 >>> 2 >>> 3 == 6" $ do
+                st33 <- loadTestProgram st "tests/programs/P33_Fixity.tl"
+                result <- evalExpr st33 "t39()"
+                result `shouldBe` CLMLIT (LInt 6)
+
+            -- Parser-level tests for fixity declarations
+            it "parses infixl declaration" $ do
+                res <- parseTestString "infixl 6 (+), (-);"
+                case res of
+                    Right [FixityDecl AssocLeft 6 ["+", "-"]] -> return ()
+                    other -> expectationFailure $ "Expected FixityDecl, got: " ++ show other
+
+            it "parses infixr declaration" $ do
+                res <- parseTestString "infixr 5 (++);"
+                case res of
+                    Right [FixityDecl AssocRight 5 ["++"]] -> return ()
+                    other -> expectationFailure $ "Expected FixityDecl, got: " ++ show other
+
+            it "parses infix (non-assoc) declaration" $ do
+                res <- parseTestString "infix 4 (==);"
+                case res of
+                    Right [FixityDecl AssocNone 4 ["=="]] -> return ()
+                    other -> expectationFailure $ "Expected FixityDecl, got: " ++ show other
+
+            -- Non-associativity error tests
+            it "non-assoc: 1 == 2 == 3 is parse error" $ do
+                result <- evalExpr st "1 == 2 == 3"
+                case result of
+                    CLMERR msg _ -> msg `shouldSatisfy` isInfixOf "Non-associative"
+                    other -> expectationFailure $ "Expected parse error, got: " ++ show other
+
+            it "non-assoc: 1 < 2 < 3 is parse error" $ do
+                result <- evalExpr st "1 < 2 < 3"
+                case result of
+                    CLMERR msg _ -> msg `shouldSatisfy` isInfixOf "Non-associative"
+                    other -> expectationFailure $ "Expected parse error, got: " ++ show other
+
+            -- Interactive expression precedence tests
+            it "interactive: 2 + 3 * 4 == 14" $ do
+                result <- evalExpr st "2 + 3 * 4"
+                result `shouldBe` CLMLIT (LInt 14)
+
+            it "interactive: 1 + 2 == 3 is True" $ do
+                result <- evalExpr st "1 + 2 == 3"
+                result `shouldBe` conTrue
+
+            it "interactive: 1 - 2 - 3 == -4" $ do
+                result <- evalExpr st "1 - 2 - 3"
+                result `shouldBe` CLMLIT (LInt (-4))
+
+            -- Interactive: bitwise precedence
+            it "interactive: 5 .|. 3 .&. 6 == 7" $ do
+                result <- evalExpr st "5 .|. 3 .&. 6"
+                result `shouldBe` CLMLIT (LInt 7)
+
+            it "interactive: 5 .&. 2 + 1 == 1" $ do
+                result <- evalExpr st "5 .&. 2 + 1"
+                result `shouldBe` CLMLIT (LInt 1)
+
+            -- Default fixity: unknown ops get infixl 9 (tightest)
+            it "parses fixity declaration with single op" $ do
+                res <- parseTestString "infix 0 (<=>);"
+                case res of
+                    Right [FixityDecl AssocNone 0 ["<=>"]] -> return ()
+                    other -> expectationFailure $ "Expected FixityDecl, got: " ++ show other

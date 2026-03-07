@@ -125,6 +125,7 @@ freeVarsCLM (CLMCASE checks body) =
   where
     freeVarsCheck (CLMCheckTag _ e) = freeVarsCLM e
     freeVarsCheck (CLMCheckLit _ e) = freeVarsCLM e
+freeVarsCLM (CLMHANDLE bdy _ lets ops) = Set.unions [freeVarsCLM bdy, Set.unions (Prelude.map (freeVarsCLM . snd) lets), Set.unions (Prelude.map (freeVarsCLM . snd) ops)]
 freeVarsCLM (CLMLAM lam) = freeVarsLam lam
   where
     freeVarsLam (CLMLam vars body) =
@@ -216,6 +217,7 @@ descendCLM f (CLMARRAY exs) = CLMARRAY (Prelude.map f exs)
 descendCLM f (CLMMCALL obj meth args) = CLMMCALL (f obj) meth (Prelude.map f args)
 descendCLM f (CLMSCALL obj meth args) = CLMSCALL (f obj) meth (Prelude.map f args)
 descendCLM f (CLMNEW nm args) = CLMNEW nm (Prelude.map f args)
+descendCLM f (CLMHANDLE bdy eff lets ops) = CLMHANDLE (f bdy) eff (Prelude.map (\(n,v) -> (n, f v)) lets) (Prelude.map (\(n,impl) -> (n, f impl)) ops)
 -- Atomic nodes: return unchanged
 descendCLM _ e = e
 

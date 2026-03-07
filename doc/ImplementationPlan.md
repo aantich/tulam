@@ -4,7 +4,7 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 ---
 
-## Current State Summary (Updated after Effect System + Safety Limits)
+## Current State Summary (Updated after Effect Handler Runtime)
 
 **Package A Syntax Migration (completed):**
 - Sum types now use `type Bool = True | False;` instead of `type Bool = { True, False };` — curly braces freed for records exclusively.
@@ -39,7 +39,20 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 **What works:** Parsing sum types, functions with pattern matching, structures (typeclasses), instance declarations, actions, records with spread syntax, if/then/else, let/in, algebra/morphism/trait/bridge keywords, structure inheritance (extends), value declarations, law declarations, primitive type declarations, intrinsic instances, **anonymous lambdas** (`\x -> expr`), **first-class functions** (functions as values, passed to/returned from other functions), **common ADTs** (Maybe, Either, List with utility functions and Semigroup/Monoid instances), **combinators** (id, const, apply, compose, flip), **automated morphism composition** (transitive instances auto-derived with cycle detection), **parameterized type instances** (e.g., `Semigroup(List(a))`), **unary minus** (`-3` dispatches to `negate`), **Floating math** (sqrt, sin, cos, tan, exp, log, asin, acos, atan, pow, pi), **Bits algebra** (.&., .|., xor, complement, shiftL, shiftR, bitSize for Int), **String operations** (concat, length, Eq/Ord for String), **Int↔Float64 conversions** (toFloat, toInt, recip), **repr system** (`repr UserType as ReprType [default] where { ... }` + `expr as Type` casting), **higher-kinded types** (Functor, Applicative, Monad algebras on Type1 with instances for Maybe and List — `fmap(not, Just(True))` → `Just(False)`, `bind(Just(x), f)` → `f(x)`, List monad flatMap), **module system** (module/import/export/open/private/opaque with dependency resolution), **expanded numeric primitives** (Int8-64, UInt8-64, Float32 with full intrinsic support), **arrays** (Array(a) with length/index/slice), **SIMD type declarations** (Vec2/4/8/16 with Lane algebra stubs). Environment building handles types, constructors, lambdas, instance-specialized functions, primitive types, intrinsic expansion, morphism composition, repr registration, and module resolution. Case optimization expands patterns into constructor tag checks. CLM conversion produces simply-typed IR, including repr cast direction resolution and CLMARRAY. Interpreter evaluates: function application (including first-class), constructor matching, field access, literals, action sequences, pattern match cases, **implicit parameter dispatch** (CLMIAP) with intrinsic-first lookup (including nullary intrinsics) and partial type inference for HKT dispatch, partial application (CLMPAP), and lambda values (CLMLAM).
 
-**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion + Phase 13.3 (Type-Test Patterns + Downcast) + Phase 13.6 (TC Subtyping) COMPLETE.** 628 automated hspec tests all passing.
+**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion + Phase 13.3 (Type-Test Patterns + Downcast) + Phase 13.6 (TC Subtyping) + Minimal Definition Checking + Parameterized Derive + Requires Enforcement + Effect Handler Runtime COMPLETE.** 720 automated hspec tests all passing.
+
+**Parameterized Derive (completed):**
+- `derive` on parameterized types (Maybe, List, Pair, Triple, etc.) works via reflection — `structuralEq`/`structuralCompare`/`structuralShow` recurse into fields using CLMIAP dispatch which infers concrete types at runtime.
+- Nested parameterized types also work: `Just(Just(1)) == Just(Just(1))` dispatches through multiple layers.
+- `deriving` syntax on parameterized type declarations supported.
+- Test file: `tests/programs/P30_DeriveParam.tl` (20 tests)
+
+**Requires Constraint Enforcement (completed):**
+- `validateRequiresForInstance` in Pipeline.hs checks that required structure instances exist when processing instance declarations.
+- Structure-level `requires` constraints are propagated to instance declarations with type parameter substitution (e.g., `algebra Foo(a) requires Eq(a)` + `instance Foo(MyType)` → checks `Eq(MyType)` exists).
+- Instance-level explicit `requires` also validated.
+- Warnings emitted (consistent with permissive mode) when required instances are missing.
+- Test file: `tests/programs/P31_Requires.tl` (6 tests)
 
 **Type-Directed Dispatch (Phase 10.3 completed):**
 - `CLMTYPED` wrapper annotates CLMIAP bodies with return type hints during CLM conversion (Pass 4)
@@ -82,16 +95,24 @@ Incremental roadmap from current state to categorical type system. Each step is 
 - `betaReduceCLM` respects variable shadowing (fixed nested if/else capture bug)
 - `lookupCLMInstancePrefix` partitions direct vs composed instances (fixed morphism dispatch ambiguity)
 
+**Minimal Definition Checking (Automatic Validation):**
+- Algebra/morphism instances are automatically validated for completeness
+- When an instance doesn't provide enough functions, the compiler warns or errors
+- Default implementations in algebras are propagated to instances using fixpoint resolution
+- Functions with no default body that aren't provided → error "required (no default)"
+- Mutual defaults where none from the cycle are provided → warning "consider providing at least one"
+- Self-sufficient default groups (mutual recursion with base cases) are resolved automatically
+- Intrinsic and derive instances bypass validation
+- **Implementation**: `validateMinimalDefinition` in Pipeline.hs (Pass 1) checks instance-provided functions BEFORE default propagation. `propagateDefaults` (Pass 1) uses `fixpointResolve` with two phases: (1) iterative resolution via dependency graph, (2) self-sufficient group resolution when iterative phase stalls. `collectIdRefs` in Surface.hs extracts Id references for dependency analysis. Example: `Ord.tl` now has mutual defaults where `compare` defaults from comparison operators, and operators default from `compare`, resolved when at least one is provided.
+
 **Remaining gaps:**
-1. **No State/Exception effect runtime**: Effect declarations exist but no interpreter handler dispatch
-2. **No Ref/MutArray**: no mutable references or mutable arrays
-3. **Type checker permissive by default**: errors are warnings; `strictTypes` flag makes them fatal
-4. **SIMD Vec operations are stubs** (need native compilation backend)
-5. **No codegen backend**: interpreter only, no JS/.NET/x86 output
-6. **Type-directed dispatch**: needed for generic monadic traversal (mapM/foldM/sequence) and toEnum/range
-7. **Array HOFs for non-Int types**: foldl/filter type signatures use Int; needs polymorphic dispatch
-8. **Missing string ops**: split, join not yet implemented
-9. **Derive for parameterized types**: `derive` currently works for simple sum types; parameterized types (e.g., `Maybe(a)`) need field-level dispatch through Eq/Ord/Show instances of the parameter type
+1. ~~**No State/Exception effect runtime**~~ — **RESOLVED**: Effect handler runtime implemented. `CLMHANDLE` node, handler stack, `dispatchHandlerOp`, `dispatchEffectSequencing`. Standard library handlers: RefState, SilentConsole, DefaultException, StdFileIO.
+2. **Type checker permissive by default**: errors are warnings; `strictTypes` flag makes them fatal
+3. **SIMD Vec operations are stubs** (need native compilation backend)
+4. **No codegen backend**: interpreter only, no JS/.NET/x86 output
+5. **Array HOFs for non-Int types**: foldl/filter type signatures use Int; needs polymorphic dispatch
+6. **Missing string ops**: split, join not yet implemented
+7. **TC pattern variable warnings**: type checker emits spurious "Unbound variable" warnings for pattern match binders in catch-all arms (~95 warnings in stdlib)
 
 ---
 
@@ -870,7 +891,18 @@ ArrowType Expr Expr already exists in Surface.hs. Ensure it's usable in all type
 
 See `doc/EffectDesign.md` for the full design document.
 
-**Status:** All 6 steps completed. Effect declarations, action blocks, type checking with `TEffect Row Ty`, handlers, standard library effects (Console, FileIO, State, Exception). IO intrinsics (`putStrLn`, `putStr`, `readLine`) working via `dispatchIOIntrinsic`. 10 P12 effect tests passing.
+**Status:** All 6 steps completed + **handler runtime added**. Effect declarations, action blocks, type checking with `TEffect Row Ty`, handlers, standard library effects (Console, FileIO, State, Exception). IO intrinsics (`putStrLn`, `putStr`, `readLine`) working via `dispatchIOIntrinsic`. 10 P12 effect tests + 7 P32 effect handler runtime tests passing.
+
+**Effect Handler Runtime (completed):**
+- `HandlerDecl` AST node gained `[Var]` params field for parameterized handlers (e.g., `RefState(init:a)`)
+- `CLMHANDLE` CLM node added: carries body, effect name, let bindings, and handler ops
+- Handler stack in `InterpreterState` — dynamic scoping of handler dictionaries
+- Pipeline CLM conversion for `handle expr with handler` — resolves handlers, substitutes params
+- Interpreter: push handler, eval body, pop; `dispatchHandlerOp` checks stack before IO intrinsics
+- `dispatchEffectSequencing`: fallback for `seq`/`bind` when handler stack is active (simple function application)
+- Standard library handlers: `RefState` (State), `SilentConsole` (Console), `DefaultException` (Exception), `StdFileIO` (FileIO)
+- Cache version bumped from 1 to 2
+- Test file: `tests/programs/P32_EffectHandlers.tl` (7 tests)
 
 ### Step 9.1: Effect Declaration Parsing (Phase A)
 
@@ -918,7 +950,7 @@ Eff { console: Console | r } Unit                  // open row (effect-polymorph
 - Open rows (`| r`) enable subsumption — fewer effects usable where more expected
 - Effect rows erased in Pass 4 (CLM conversion) — zero runtime overhead
 
-### Step 9.4: Effect Handlers (Phase D)
+### Step 9.4: Effect Handlers (Phase D) ✅ RUNTIME COMPLETE
 
 ```tulam
 handler StdConsole : Console = {
@@ -926,13 +958,25 @@ handler StdConsole : Console = {
     function putStrLn(s) = intrinsic
 };
 
+// Parameterized handler with let bindings
+handler RefState(init:a) : State = {
+    let state = newRef(init),
+    function get() = readRef(state),
+    function put(x) = writeRef(state, x)
+};
+
 let result = handle greet() with StdConsole;
-// Removes console from effect row
+handle action { x <- get(), put(x + 1) } with RefState(0);
 ```
 
-- v1: Built-in effects have implicit default handlers (just execute)
-- v2: Explicit `handle...with` for testing/mocking
-- Handler application removes one effect label from the row
+- v1: Built-in effects have implicit default handlers (just execute) ✅
+- v2: Explicit `handle...with` for testing/mocking ✅
+- Handler application removes one effect label from the row ✅
+- Parameterized handlers with `[Var]` params on `HandlerDecl` ✅
+- `CLMHANDLE` CLM node with body, effect name, let bindings, ops ✅
+- Handler stack in `InterpreterState` for dynamic scoping ✅
+- `dispatchHandlerOp` checks handler stack before IO intrinsic fallback ✅
+- `dispatchEffectSequencing` for seq/bind in handler context ✅
 
 ### Step 9.5: Interop Effect Inference (Phase E)
 
@@ -1559,6 +1603,32 @@ Extends the repr system to support parameterized types (e.g., `repr Array(Int) a
 - Phase 5 (repr system) — parameterized repr extension
 - Phase 9.7 (managed mutability) — `MutArray` for efficient byte array building
 - Phase 10 (reflection + derive) — derive blocks for `Eq`/`Ord`/`Show` on `Str`
+
+---
+
+## Phase 15: Operator Fixity and Precedence ✅ COMPLETE
+
+Replaced the hard-coded 3-level `buildExpressionParser` with a Pratt parser and `infixl`/`infixr`/`infix` fixity declarations.
+
+### What was done:
+- **Surface.hs**: Added `Assoc`, `OperatorFixity` types; `FixityDecl` expr constructor
+- **State.hs**: Added `fixityTable` to `Environment`, `defaultFixities`, `lookupFixity`/`addFixity` helpers; updated `Binary Environment`, `mergeEnvironment`, `initialEnvironment`
+- **Lexer.hs**: Reserved `infixl`, `infixr`, `infix`
+- **Parser.hs**: Pratt parser (`prattExpr`/`prattLoop`/`pPrefixExpr`), `pFixityDecl`; removed `buildExpressionParser`
+- **Pipeline.hs**: `processBinding` case for `FixityDecl` (env build + cache restore)
+- **Standard library**: Fixity declarations in `Algebra/Additive.tl`, `Multiplicative.tl`, `Eq.tl`, `Ord.tl`, `Bits.tl`, `Lattice.tl`
+- **Tests**: 16 new tests (P33_Fixity.tl + parser + interactive), total 736
+
+### Default fixity table:
+| Prec | Assoc | Operators |
+|------|-------|-----------|
+| 9 | left | (unknown ops) |
+| 7 | left | `*`, `/` |
+| 6 | left | `+`, `-` |
+| 5 | right | `++` |
+| 4 | none | `==`, `!=`, `<`, `>`, `<=`, `>=` |
+| 3 | right | `.&.`, `/\` |
+| 2 | right | `.\|.`, `\/` |
 
 ---
 

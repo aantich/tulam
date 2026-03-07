@@ -883,7 +883,7 @@ infer (TargetSwitch _) = tcPure (TCon "Unit")
 
 -- Effect system nodes
 infer (EffectDecl _ _ _) = tcPure (TCon "Unit")
-infer (HandlerDecl _ _ _) = tcPure (TCon "Unit")
+infer (HandlerDecl _ _ _ _) = tcPure (TCon "Unit")
 infer (HandleWith computation _handler) =
   -- handle expr with handler: the handler eliminates an effect from the row
   -- For now, just infer the computation type and return the result type
@@ -1121,7 +1121,7 @@ checkTopLevel (Instance _structName _targs impls _reqs) =
 
 -- Effect and handler declarations — register but no deep checking needed
 checkTopLevel (EffectDecl _ _ _) = tcPure ()
-checkTopLevel (HandlerDecl _ _ _) = tcPure ()
+checkTopLevel (HandlerDecl _ _ _ _) = tcPure ()
 
 -- Sum types, structures, primitives — just validate form, no deep checking needed
 checkTopLevel (SumType _) = tcPure ()

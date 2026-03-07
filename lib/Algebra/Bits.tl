@@ -5,6 +5,9 @@
 /// @see Numeric.Int, Numeric.UInt
 module Algebra.Bits;
 
+infixr 3 (.&.);
+infixr 2 (.|.);
+
 /// Bitwise operations algebra.
 algebra Bits(a:Type) = {
     /// Bitwise AND.

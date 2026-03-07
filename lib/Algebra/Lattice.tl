@@ -6,6 +6,9 @@
 /// @see Algebra.Ord, Algebra.Bounded
 module Algebra.Lattice;
 
+infixr 3 (/\);
+infixr 2 (\/);
+
 /// Join (least upper bound) semi-lattice.
 algebra JoinSemiLattice(a:Type) = {
     /// Join — least upper bound of two values.

@@ -36,6 +36,9 @@ dependencies:
 - filepath
 - ilist
 - indexed-traversable
+- binary
+- bytestring
+- hashable
 
 ghc-options:
 # - -Wall

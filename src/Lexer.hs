@@ -76,7 +76,8 @@ lexer = Tok.makeTokenParser style
             "target", "extern",
             "effect", "handler", "handle",
             "derive", "deriving",
-            "class", "abstract", "sealed", "implements", "override", "final", "static", "super"]
+            "class", "abstract", "sealed", "implements", "override", "final", "static", "super",
+            "infixl", "infixr", "infix"]
     style = emptyDef {
                 Tok.commentStart   = "/*"
                 , Tok.commentEnd     = "*/"

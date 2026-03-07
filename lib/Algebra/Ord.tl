@@ -9,37 +9,49 @@ import Core.Bool;
 import Core.Ordering;
 import Algebra.Eq;
 
+infix 4 (<), (>), (<=), (>=);
+
 /// Total ordering with comparison and relational operators.
+/// Minimal definition: compare, OR all of (<), (>), (<=), (>=).
+/// Each group has defaults in terms of the other.
 algebra Ord(a:Type) extends Eq(a) = {
     /// Three-way comparison returning LessThan, Equal, or GreaterThan.
+    /// Default: derived from (<) and (==).
     /// @param x Left operand
     /// @param y Right operand
     /// @returns Ordering result
-    function compare(x:a, y:a) : Ordering,
+    function compare(x:a, y:a) : Ordering =
+        if x == y then Equal
+        else if x < y then LessThan
+        else GreaterThan,
 
     /// Strict less-than.
+    /// Default: derived from compare.
     /// @param x Left operand
     /// @param y Right operand
     /// @returns True if x < y
-    function (<)(x:a, y:a) : Bool,
+    function (<)(x:a, y:a) : Bool = compare(x, y) == LessThan,
 
     /// Strict greater-than.
+    /// Default: derived from compare.
     /// @param x Left operand
     /// @param y Right operand
     /// @returns True if x > y
-    function (>)(x:a, y:a) : Bool,
+    function (>)(x:a, y:a) : Bool = compare(x, y) == GreaterThan,
 
     /// Less-than-or-equal.
+    /// Default: derived from compare.
     /// @param x Left operand
     /// @param y Right operand
     /// @returns True if x <= y
-    function (<=)(x:a, y:a) : Bool,
+    function (<=)(x:a, y:a) : Bool = not(compare(x, y) == GreaterThan),
 
     /// Greater-than-or-equal.
+    /// Default: derived from compare.
     /// @param x Left operand
     /// @param y Right operand
     /// @returns True if x >= y
-    function (>=)(x:a, y:a) : Bool,
+    function (>=)(x:a, y:a) : Bool = not(compare(x, y) == LessThan),
 
     law trichotomy(x:a, y:a) = (x < y) === not(x >= y),
     law antisymmetry(x:a, y:a) = ((x <= y) === True) ==> ((y <= x) === (x == y)),

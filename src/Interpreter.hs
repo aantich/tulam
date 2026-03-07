@@ -208,16 +208,20 @@ evalCLM i e@(CLMAPP ex exs) = do
                 CLMERR _ _ -> pure ex'
                 CLMLAM lam -> evalCLM (i+1) $ applyCLMLam lam exs'
                 CLMID nm -> do
-                    -- Try IO intrinsic dispatch for unresolved function names
-                    mIO <- dispatchIOIntrinsic nm exs'
-                    case mIO of
+                    -- Try handler stack first, then IO intrinsic dispatch
+                    mH <- dispatchHandlerOp nm exs'
+                    case mH of
                         Just result -> pure result
                         Nothing -> do
-                            mRefl <- dispatchReflectionIntrinsic nm exs'
-                            case mRefl of
+                            mIO <- dispatchIOIntrinsic nm exs'
+                            case mIO of
                                 Just result -> pure result
-                                Nothing -> if ex' == ex && exs' == exs then pure e
-                                           else pure $ CLMAPP ex' exs'
+                                Nothing -> do
+                                    mRefl <- dispatchReflectionIntrinsic nm exs'
+                                    case mRefl of
+                                        Just result -> pure result
+                                        Nothing -> if ex' == ex && exs' == exs then pure e
+                                                   else pure $ CLMAPP ex' exs'
                 _ -> if ex' == ex && exs' == exs then pure e
                      else pure $ CLMAPP ex' exs'
 evalCLM i e@(CLMFieldAccess ("", fnum) (CLMCON ct tuple)) = do
@@ -390,6 +394,35 @@ evalCLM i (CLMTYPED inner@(CLMIAP (CLMID funcNm) _) typeHint) = do
                 _ -> pure result
 -- CLMTYPED for non-CLMIAP: just evaluate inner, ignore type hint
 evalCLM i (CLMTYPED inner _) = evalCLM i inner
+-- CLMHANDLE: eval lets, substitute into ops, push onto stack, eval body, pop
+evalCLM i (CLMHANDLE bdy effName lets ops) = do
+    trace $ "[depth=" ++ show i ++ "] CLMHANDLE " ++ effName ++ " lets=" ++ show (Prelude.map fst lets)
+    -- Evaluate let bindings first (e.g. let state = newRef(init))
+    evalLets <- mapM (\(nm, expr) -> do
+        val <- evalCLM (i+1) expr
+        val' <- _contEval 1 expr val
+        pure (nm, val')) lets
+    -- Substitute let values into op implementations
+    let substMap = Map.fromList evalLets
+    let substOps = Prelude.map (\(nm, impl) -> (nm, simultBetaReduce substMap impl)) ops
+    -- Also substitute into body in case it references let vars
+    let substBody = simultBetaReduce substMap bdy
+    -- Evaluate handler op implementations
+    evalOps <- mapM (\(nm, impl) -> do
+        impl' <- evalCLM (i+1) impl
+        pure (nm, impl')) substOps
+    let opMap = Map.fromList evalOps
+    -- Push handler onto stack
+    s <- get
+    let oldStack = handlerStack s
+    put $ s { handlerStack = (effName, opMap) : oldStack }
+    -- Evaluate body with handler active
+    result <- evalCLM (i+1) substBody
+    result' <- _contEval 1 substBody result
+    -- Pop handler (restore old stack)
+    s2 <- get
+    put $ s2 { handlerStack = oldStack }
+    pure result'
 -- CLMIAP: implicit param application (structure function dispatch)
 evalCLM i e@(CLMIAP (CLMID funcNm) exs) = do
     trace $ "[depth=" ++ show i ++ "] CLMIAP " ++ funcNm ++ " " ++ pprSummary 60 (CLMIAP (CLMID funcNm) exs)
@@ -401,66 +434,76 @@ evalCLM i e@(CLMIAP (CLMID funcNm) exs) = do
     case findCLMErr exs' of
         Just err -> pure err
         Nothing -> do
-          -- CHECK IO INTRINSICS first (effect operations: putStrLn, readLine, etc.)
-          mIO <- dispatchIOIntrinsic funcNm exs'
-          case mIO of
+          -- CHECK HANDLER STACK first (dynamically-scoped effect handlers)
+          mHandler <- dispatchHandlerOp funcNm exs'
+          case mHandler of
             Just result -> pure result
             Nothing -> do
-              -- TRY REF INTRINSICS (newRef, readRef, writeRef, modifyRef)
-              mRef <- dispatchRefIntrinsic funcNm exs'
-              case mRef of
+              -- CHECK EFFECT SEQUENCING (seq/bind fallback when handler stack active)
+              mSeq <- dispatchEffectSequencing funcNm exs'
+              case mSeq of
                 Just result -> pure result
                 Nothing -> do
-                  -- TRY MUTARRAY INTRINSICS (newMutArray, mutRead, mutWrite, etc.)
-                  mMut <- dispatchMutArrayIntrinsic funcNm exs'
-                  case mMut of
+                  -- CHECK IO INTRINSICS (effect operations: putStrLn, readLine, etc.)
+                  mIO <- dispatchIOIntrinsic funcNm exs'
+                  case mIO of
                     Just result -> pure result
                     Nothing -> do
-                      -- TRY REFLECTION INTRINSICS (tag, tagName, arity, field, numConstructors, constructorByIndex)
-                      mRefl <- dispatchReflectionIntrinsic funcNm exs'
-                      case mRefl of
+                      -- TRY REF INTRINSICS (newRef, readRef, writeRef, modifyRef)
+                      mRef <- dispatchRefIntrinsic funcNm exs'
+                      case mRef of
                         Just result -> pure result
                         Nothing -> do
-                          -- TRY DOWNCAST INTRINSIC (__downcast("ClassName", obj) -> Maybe)
-                          mDown <- dispatchDowncastIntrinsic funcNm exs'
-                          case mDown of
+                          -- TRY MUTARRAY INTRINSICS (newMutArray, mutRead, mutWrite, etc.)
+                          mMut <- dispatchMutArrayIntrinsic funcNm exs'
+                          case mMut of
                             Just result -> pure result
                             Nothing -> do
-                              -- TRY ARRAY HOF DISPATCH (closure-aware)
-                              mHOF <- dispatchArrayHOF funcNm exs'
-                              case mHOF of
+                              -- TRY REFLECTION INTRINSICS (tag, tagName, arity, field, numConstructors, constructorByIndex)
+                              mRefl <- dispatchReflectionIntrinsic funcNm exs'
+                              case mRefl of
                                 Just result -> pure result
-                                Nothing ->
-                                  -- For nullary implicit-param functions (e.g., value declarations),
-                                  -- we can't infer type from args — try to find any instance
-                                  if Prelude.null exs'
-                                  then dispatchNullaryIAP env funcNm
-                                  else do
-                                    -- try multi-param key first (all arg types), then fall back to single-param
-                                    let mTypeNames = inferTypeNames env exs'
-                                    trace $ "  inferred types: " ++ show mTypeNames
-                                    case mTypeNames of
-                                        Just typeNames -> do
-                                            let firstType = Prelude.head typeNames
-                                            -- CHECK INTRINSICS FIRST
-                                            case lookupIntrinsic funcNm firstType of
-                                                Just intrinsicFn -> case intrinsicFn exs' of
-                                                    Just result -> do
-                                                        trace $ "  intrinsic " ++ funcNm ++ " for " ++ firstType ++ " => " ++ pprSummary 40 result
-                                                        pure result
-                                                    Nothing ->
-                                                        if Prelude.length typeNames < Prelude.length exs'
-                                                        then do
-                                                            trace $ "  intrinsic " ++ funcNm ++ " args not ready, deferring"
-                                                            pure $ CLMIAP (CLMID funcNm) exs'
-                                                        else do
-                                                            trace $ "  intrinsic " ++ funcNm ++ " failed on args"
-                                                            pure $ CLMERR ("[RT] Intrinsic " ++ funcNm ++ " failed on args") SourceInteractive
-                                                Nothing -> dispatchInstance env funcNm typeNames exs'
-                                        Nothing -> do
-                                            -- can't determine type, return with evaluated args
-                                            trace $ "  could not infer type for " ++ funcNm
-                                            pure $ CLMIAP (CLMID funcNm) exs'
+                                Nothing -> do
+                                  -- TRY DOWNCAST INTRINSIC (__downcast("ClassName", obj) -> Maybe)
+                                  mDown <- dispatchDowncastIntrinsic funcNm exs'
+                                  case mDown of
+                                    Just result -> pure result
+                                    Nothing -> do
+                                      -- TRY ARRAY HOF DISPATCH (closure-aware)
+                                      mHOF <- dispatchArrayHOF funcNm exs'
+                                      case mHOF of
+                                        Just result -> pure result
+                                        Nothing ->
+                                          -- For nullary implicit-param functions (e.g., value declarations),
+                                          -- we can't infer type from args — try to find any instance
+                                          if Prelude.null exs'
+                                          then dispatchNullaryIAP env funcNm
+                                          else do
+                                            -- try multi-param key first (all arg types), then fall back to single-param
+                                            let mTypeNames = inferTypeNames env exs'
+                                            trace $ "  inferred types: " ++ show mTypeNames
+                                            case mTypeNames of
+                                                Just typeNames -> do
+                                                    let firstType = Prelude.head typeNames
+                                                    -- CHECK INTRINSICS FIRST
+                                                    case lookupIntrinsic funcNm firstType of
+                                                        Just intrinsicFn -> case intrinsicFn exs' of
+                                                            Just result -> do
+                                                                trace $ "  intrinsic " ++ funcNm ++ " for " ++ firstType ++ " => " ++ pprSummary 40 result
+                                                                pure result
+                                                            Nothing ->
+                                                                if Prelude.length typeNames < Prelude.length exs'
+                                                                then do
+                                                                    trace $ "  intrinsic " ++ funcNm ++ " args not ready, deferring"
+                                                                    pure $ CLMIAP (CLMID funcNm) exs'
+                                                                else do
+                                                                    trace $ "  intrinsic " ++ funcNm ++ " failed on args"
+                                                                    pure $ CLMERR ("[RT] Intrinsic " ++ funcNm ++ " failed on args") SourceInteractive
+                                                        Nothing -> dispatchInstance env funcNm typeNames exs'
+                                                Nothing -> do
+                                                    -- can't determine type, return with evaluated args
+                                                    trace $ "  could not infer type for " ++ funcNm
+                                                    pure $ CLMIAP (CLMID funcNm) exs'
 -- CLMIAP with non-id function: evaluate the function first
 evalCLM i e@(CLMIAP ex exs) = do
     trace $ "[depth=" ++ show i ++ "] CLMIAP(eval func) " ++ pprSummary 60 e
@@ -666,6 +709,41 @@ dispatchNullaryIAP env funcNm =
         Nothing -> do
             trace $ "  no instance for nullary " ++ funcNm
             pure $ CLMIAP (CLMID funcNm) []
+
+-- Effect handler dispatch: check the dynamic handler stack for an op implementation
+-- Returns Nothing if no handler provides this op (falls through to IO intrinsics)
+dispatchHandlerOp :: Name -> [CLMExpr] -> IntState (Maybe CLMExpr)
+dispatchHandlerOp funcNm args = do
+    s <- get
+    let stack = handlerStack s
+    case lookupHandlerOp funcNm stack of
+        Nothing -> pure Nothing
+        Just impl -> case impl of
+            CLMPRIMCALL -> pure Nothing  -- intrinsic marker, fall through to IO dispatch
+            CLMLAM lam -> do
+                result <- evalCLM 0 (applyCLMLam lam args)
+                result' <- _contEval 1 (applyCLMLam lam args) result
+                pure (Just result')
+            _ -> do
+                -- Handler op is a value (e.g. nullary like get())
+                result <- evalCLM 0 impl
+                result' <- _contEval 1 impl result
+                pure (Just result')
+
+-- When handler stack is non-empty, seq/bind need to work as simple sequencing
+-- even when no Monad instance is available for the result type.
+-- seq(a, f) → f(a)   where f is a lambda
+-- bind(a, f) → f(a)  where f is a lambda
+dispatchEffectSequencing :: Name -> [CLMExpr] -> IntState (Maybe CLMExpr)
+dispatchEffectSequencing funcNm args = do
+    s <- get
+    let stack = handlerStack s
+    case (stack, funcNm, args) of
+        (_:_, nm, [a, CLMLAM lam]) | nm == "seq" || nm == "bind" -> do
+            result <- evalCLM 0 (applyCLMLam lam [a])
+            result' <- _contEval 1 (applyCLMLam lam [a]) result
+            pure (Just result')
+        _ -> pure Nothing
 
 -- IO intrinsic dispatch for effect operations (Console, FileIO, etc.)
 -- These run in IntState (which has IO) rather than being pure functions.

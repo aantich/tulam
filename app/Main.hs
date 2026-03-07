@@ -22,7 +22,8 @@ import CLM (pprSummary)
 import Interpreter
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
-import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath)
+import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses)
+import Interface (cacheVersion, toCachePath, ensureCacheDir)
 import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 
 import Text.Pretty.Simple (pPrint, pShow)
@@ -80,6 +81,9 @@ showHelp = do
     putStrLn ":clm              -- show CLM (core list machine) format functions"
     putStrLn ":clm-raw          -- show pre-optimization CLM (raw)"
     putStrLn ":list <types, functions, constructors> [-d] -- list all global functions / types / constructors"
+    putStrLn ":cache status         -- show module cache stats"
+    putStrLn ":cache clear          -- delete all cached modules"
+    putStrLn ":cache rebuild        -- clear cache and recompile all modules"
     -- putStrLn ":i[nfo] <name>    -- find and show a top-level binding with <name>"
     -- putStrLn ":types            -- list all types"
     -- putStrLn ":compile          -- compile currently loaded program"
@@ -194,6 +198,43 @@ liftIO $ putStrLn "\n--------------- JS REALM ----------------"
     jsp <- get >>= \s -> pure ( (outProgram . currentEnvironment) s)
     liftIO $ mapM_ putStrLn jsp
 -}
+
+processCommand (":cache":"status":_) = do
+    let dir = ".tulam-cache/v" ++ show cacheVersion
+    exists <- liftIO $ doesDirectoryExist dir
+    if not exists then liftIO $ putStrLn "No cache directory found."
+    else do
+        files <- liftIO $ listDirectory dir
+        let tliFiles = Prelude.filter (\f -> drop (Prelude.length f - 4) f == ".tli") files
+        liftIO $ putStrLn $ "Cache: " ++ dir ++ "/"
+        liftIO $ putStrLn $ "  " ++ show (length tliFiles) ++ " cached modules"
+        st <- get
+        let hashes = moduleSourceHashes st
+        liftIO $ putStrLn $ "  " ++ show (Map.size hashes) ++ " source hashes tracked"
+
+processCommand (":cache":"clear":_) = do
+    let dir = ".tulam-cache"
+    exists <- liftIO $ doesDirectoryExist dir
+    if not exists then liftIO $ putStrLn "No cache to clear."
+    else do
+        liftIO $ removeDirectoryRecursive dir
+        liftIO $ putStrLn "Cache cleared."
+
+processCommand (":cache":"rebuild":_) = do
+    liftIO $ putStrLn "Clearing cache and reloading all modules..."
+    let dir = ".tulam-cache"
+    exists <- liftIO $ doesDirectoryExist dir
+    when exists $ liftIO $ removeDirectoryRecursive dir
+    -- Reset state and reload from scratch
+    modify (\s -> s { moduleSourceHashes = Map.empty })
+    liftIO $ ensureCacheDir
+    loadModuleTree baseModulePath
+    liftIO $ putStrLn "Cache rebuilt."
+
+processCommand (":cache":_) = liftIO $ do
+    putStrLn ":cache status   -- show cache stats"
+    putStrLn ":cache clear    -- delete all cached modules"
+    putStrLn ":cache rebuild  -- clear cache and recompile all modules"
 
 processCommand (":q":_) = processCommand [":quit"]
 processCommand (":h":_) = processCommand [":help"]

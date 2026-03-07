@@ -24,3 +24,11 @@ handler StdConsole : Console = {
     function putStrLn(s) = intrinsic,
     function putStr(s) = intrinsic
 };
+
+/// Silent Console handler: suppresses all output and returns empty for input.
+/// Useful for testing or muting side effects.
+handler SilentConsole : Console = {
+    function readLine() = "",
+    function putStrLn(s) = Unit,
+    function putStr(s) = Unit
+};

@@ -15,7 +15,7 @@ module Parser where
 import Text.Parsec
 import Text.Parsec.Prim (many)
 -- import Text.Parsec.Token as Tok
-import qualified Text.Parsec.Expr as Ex
+-- import qualified Text.Parsec.Expr as Ex  -- replaced by Pratt parser
 import Text.Parsec.Char (string)
 
 -- import Text.Parsec.String (parseFromFile)
@@ -588,15 +588,28 @@ pEffectDecl = do
     return $ EffectDecl name ps ops
 
 -- handler StdConsole : Console = { function readLine() = intrinsic, ... };
+-- handler RefState(init:a) : State = { let state = newRef(init), function get() = readRef(state), ... };
 pHandlerDecl :: Parser Expr
 pHandlerDecl = do
     reserved "handler"
     name <- identifier
+    ps <- try pVars <|> pure []
     reservedOp ":"
     effName <- uIdentifier
     reservedOp "="
-    impls <- braces (sepBy (try pFunc) (reservedOp ","))
-    return $ HandlerDecl name effName impls
+    impls <- braces (sepBy pHandlerMember (reservedOp ","))
+    return $ HandlerDecl name effName ps impls
+
+-- Parse a handler member: either a let binding or a function
+pHandlerMember :: Parser Expr
+pHandlerMember = try pHandlerLet <|> try pFunc
+  where
+    pHandlerLet = do
+        reserved "let"
+        nm <- identifier
+        reservedOp "="
+        e <- pExpr
+        return $ Value (Var nm UNDEFINED UNDEFINED) e
 
 -- handle expr with handlerExpr
 pHandleExpr :: Parser Expr
@@ -848,9 +861,57 @@ pRecordTypeExpr = braces $ do
 =====================================================================================
 -}
 -- Building expression parser - for RIGHT HAND SIDE ONLY!!!
+-- Uses a Pratt parser for correct operator precedence from the fixity table.
+
+-- Look up fixity for an operator from the environment in the parser monad
+getFixity :: Name -> Parser OperatorFixity
+getFixity op = lift (State.lookupFixity op . currentEnvironment <$> get)
+
+-- Pratt parser: parse expression with minimum precedence level
+prattExpr :: Int -> Parser Expr
+prattExpr minPrec = do
+    lhs <- pPrefixExpr
+    prattLoop minPrec lhs
+
+-- Prefix expressions: unary minus or base factor
+pPrefixExpr :: Parser Expr
+pPrefixExpr = (try (reservedOp "-") >> UnaryOp "-" <$> pPrefixExpr)
+          <|> pFactor
+
+-- Pratt loop: consume binary operators while they bind tighter than minPrec
+prattLoop :: Int -> Expr -> Parser Expr
+prattLoop minPrec lhs = do
+    mOp <- optionMaybe (try (lookAhead operator))
+    case mOp of
+        Nothing -> return lhs
+        Just opName -> do
+            fix <- getFixity opName
+            let prec = fixPrec fix
+            if prec < minPrec
+                then return lhs
+                else do
+                    _ <- operator  -- consume the operator
+                    let rightMinPrec = case fixAssoc fix of
+                            AssocLeft  -> prec + 1
+                            AssocRight -> prec
+                            AssocNone  -> prec + 1
+                    rhs <- prattExpr rightMinPrec
+                    -- For non-associative operators, check that we don't chain
+                    case fixAssoc fix of
+                        AssocNone -> do
+                            mNext <- optionMaybe (try (lookAhead operator))
+                            case mNext of
+                                Just nextOp -> do
+                                    nextFix <- getFixity nextOp
+                                    if fixPrec nextFix == prec
+                                        then fail $ "Non-associative operator " ++ show opName ++ " cannot be chained"
+                                        else prattLoop minPrec (BinaryOp opName lhs rhs)
+                                Nothing -> return (BinaryOp opName lhs rhs)
+                        _ -> prattLoop minPrec (BinaryOp opName lhs rhs)
+
 pExprBase :: Parser Expr
 pExprBase = try (Lit . LVec <$> angles (commaSep pFactor))  -- vector literals <1, 2, 3> (use pFactor to avoid > consumed as operator)
-    <|> Ex.buildExpressionParser (binops ++ [[unop],[binop]] ++ [[binary "==" Ex.AssocLeft]] ) pFactor
+    <|> prattExpr 0
 
 pExpr :: Parser Expr
 pExpr = do
@@ -1093,7 +1154,8 @@ pTargetCase = do
 
 -- All non-module declarations (used by pPrivate and pDef)
 pDeclBody :: Parser Expr
-pDeclBody = try pRepr
+pDeclBody = try pFixityDecl
+        <|> try pRepr
         <|> try pPrimitive
         <|> try pSumType
         <|> try pRecord
@@ -1147,19 +1209,24 @@ testParser p str = liftIO $ runIntState (hlpp p (L.pack str)) emptyIntState
 ----------------------------------------------------
 -- PARSER ----------------------------------------------------
 ----------------------------------------------------
-binop = Ex.Infix  (BinaryOp <$> op) Ex.AssocLeft
-unop  = Ex.Prefix (UnaryOp <$> op)
-
-binary s assoc = Ex.Infix (reservedOp s >> return (BinaryOp s)) assoc
-binaryCustom s assoc = Ex.Infix (op >>= \s -> return (BinaryOp s)) assoc
-
 op :: Parser String
 op = operator
-    
-binops = [[binary "=" Ex.AssocLeft]
-        ,[binary "*" Ex.AssocLeft, binary "/" Ex.AssocLeft, binary "*#" Ex.AssocLeft, binary "/#" Ex.AssocLeft]
-        ,[binary "+" Ex.AssocLeft, binary "-" Ex.AssocLeft, binary "+#" Ex.AssocLeft, binary "-#" Ex.AssocLeft]
-        ]
+
+-- Fixity declaration: infixl/infixr/infix prec (op1), (op2), ...;
+pFixityDecl :: Parser Expr
+pFixityDecl = do
+    assoc <- (reserved "infixl" >> return AssocLeft)
+         <|> (reserved "infixr" >> return AssocRight)
+         <|> (reserved "infix"  >> return AssocNone)
+    prec <- fromInteger <$> integer
+    ops <- sepBy1 (parens operator) (reservedOp ",")
+    -- Register fixity into environment immediately (for same-file use)
+    lift $ do
+        s <- get
+        let env = currentEnvironment s
+        let env' = Prelude.foldl (\e o -> addFixity o (OperatorFixity assoc (fromIntegral prec)) e) env ops
+        put s { currentEnvironment = env' }
+    return $ FixityDecl assoc (fromIntegral prec) ops
 
     
 -- helper parsers: lower case and upper case

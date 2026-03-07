@@ -1089,7 +1089,9 @@ instance Monoid(Nat) = {
 
 ## External Constraints (`requires`)
 
-Structures and instances can declare external constraints using `requires`. These are validated at declaration time (the required structure must exist) but runtime resolution is deferred to the type checker.
+Structures and instances can declare external constraints using `requires`. At instance declaration time, the compiler checks:
+1. That the required structure exists in the environment.
+2. That an instance of the required structure exists for the concrete types. For example, `instance Foo(MyType) requires Bar(MyType)` will warn if no `Bar(MyType)` instance is found. Structure-level `requires` constraints are propagated to instances with type parameter substitution (e.g., `algebra Foo(a) requires Eq(a)` + `instance Foo(Int)` → checks `Eq(Int)` exists). Missing required instances produce warnings (consistent with permissive mode).
 
 ### Syntax
 
@@ -1176,6 +1178,81 @@ type Direction = North | South | East | West deriving Eq, Show;
 ```
 
 This is equivalent to declaring the type and then writing separate `instance ... = derive;` declarations for each listed algebra.
+
+---
+
+## Minimal Definition Checking
+
+When you declare an instance, tulam automatically validates that you have provided enough functions to satisfy the algebra. This prevents incomplete implementations and makes default function propagation transparent.
+
+### How It Works
+
+1. **Algebra defaults**: Functions in an algebra definition can have default bodies (e.g., `function (!=)(x,y:a) : Bool = not(x == y)`). Defaults are used when an instance doesn't provide that function.
+
+2. **Instance validation**: Before an instance is accepted, the compiler checks whether it provides at least one function from each "minimal definition" group.
+
+3. **Default propagation**: After validation, defaults are resolved using **fixpoint iteration**: functions are recursively replaced with their defaults until no more substitutions are possible. Functions whose defaults reference only provided functions (direct or transitively) are automatically filled in.
+
+4. **Mutual defaults**: If multiple functions reference each other without a base case (e.g., `(==)` defaults from `(!=)` and vice versa), the compiler requires you to provide at least one from the cycle.
+
+5. **Self-sufficient groups**: If a group of mutually-defaulted functions form a complete cycle (all reference each other), they can be resolved automatically if at least one base case is provided.
+
+### Examples
+
+**Basic case — provide one function, other gets default:**
+
+```tulam
+algebra Eq(a:Type) = {
+  function (==)(x, y:a) : Bool = not(x != y),
+  function (!=)(x, y:a) : Bool = not(x == y)
+};
+
+// OK — provides (==), (!=) gets default
+instance Eq(MyType) = {
+  function (==)(x:MyType, y:MyType) : Bool = x.id == y.id
+};
+```
+
+**Mutual defaults — requires at least one:**
+
+```tulam
+// Warning: mutual defaults
+// Consider providing at least one of: ==, !=
+instance Eq(BadType) = {};
+```
+
+**Self-sufficient group — resolves automatically:**
+
+```tulam
+algebra Ord(a:Type) extends Eq(a) = {
+  function compare(x:a, y:a) : Ordering,
+  function (<)(x:a, y:a) : Bool = match compare(x, y) | LessThan -> True | _ -> False,
+  function (>)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | _ -> False,
+  function (>=)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | Equal -> True | _ -> False,
+  function (<=)(x:a, y:a) : Bool = match compare(x, y) | LessThan -> True | Equal -> True | _ -> False
+};
+
+// OK — provides (compare), all comparison operators derived from defaults
+instance Ord(MyType) = {
+  function compare(x:MyType, y:MyType) : Ordering = ...
+};
+```
+
+### Error Messages
+
+- **Required (no default)**: Function has no default body in its algebra and was not provided by the instance. This is an error.
+  ```
+  [instance] Eq(Foo) missing required function: (==)
+  ```
+
+- **Mutual defaults warning**: A group of mutually-defaulted functions needs at least one implementation.
+  ```
+  [instance] Eq(Bar) mutual defaults — consider providing at least one of: ==, !=
+  ```
+
+### Intrinsic and Derive Instances
+
+Intrinsic instances (`instance Struct(Type) = intrinsic;`) and derived instances (`instance Struct(Type) = derive;`) bypass validation entirely. The compiler trusts that the intrinsic registry or derive block provides all necessary functions.
 
 ---
 
@@ -1542,7 +1619,9 @@ Open effect rows (`| r`) enable effect polymorphism — a function with fewer ef
 
 ### Effect Handlers
 
-Handlers provide implementations for effect operations and eliminate effect labels from the row:
+Handlers provide implementations for effect operations and eliminate effect labels from the row.
+
+#### Simple Handlers
 
 ```
 handler StdConsole : Console = {
@@ -1555,6 +1634,65 @@ let result = handle greet() with StdConsole;
 ```
 
 Built-in effects (Console, FileIO) have implicit default handlers — they execute directly without explicit `handle`.
+
+#### Parameterized Handlers
+
+Handlers can take parameters, enabling stateful or configurable effect implementations:
+
+```
+handler RefState(init:a) : State = {
+    let state = newRef(init),
+    function get() = readRef(state),
+    function put(x) = writeRef(state, x)
+};
+
+// Use with arguments
+handle action { x <- get(), put(x + 1), get() } with RefState(0);
+// => 1
+```
+
+The `let` bindings inside a handler are evaluated once when the handler is installed, and their values are available to all handler operations.
+
+#### Handler Syntax
+
+```
+// Simple handler (no parameters)
+handler Name : Effect = {
+    function op(args) = body,
+    ...
+};
+
+// Parameterized handler (with let bindings)
+handler Name(params) : Effect = {
+    let binding = expr,
+    function op(args) = body,
+    ...
+};
+
+// Handle expression
+handle expr with HandlerName
+handle expr with HandlerName(args)
+handle action { stmts } with HandlerName(args)
+```
+
+#### Standard Library Handlers
+
+| Handler | Effect | Description |
+|---------|--------|-------------|
+| `RefState(init)` | State | Mutable state via `newRef`/`readRef`/`writeRef`. Parameter `init` sets initial state value. |
+| `SilentConsole` | Console | Suppresses all console output. `readLine` returns `""`, `putStrLn`/`putStr` are no-ops. |
+| `DefaultException` | Exception | Default exception handling. `throw(msg)` calls `error(msg)`. `tryCatch(body, handler)` evaluates body and applies handler on failure. |
+| `StdFileIO` | FileIO | Standard file I/O via intrinsic `readFile`/`writeFile`/`appendFile`/`fileExists`. |
+
+#### Runtime Semantics
+
+When `handle expr with Handler` is evaluated:
+1. The handler's `let` bindings are evaluated (if any)
+2. The handler's operation implementations are pushed onto a **handler stack**
+3. The body expression `expr` is evaluated
+4. During evaluation, effect operations (e.g., `get()`, `put(x)`) are intercepted by `dispatchHandlerOp`, which looks up the handler stack for matching operation names
+5. The handler is popped from the stack after the body completes
+6. Sequencing operations (`seq`, `bind`) within a handled block use `dispatchEffectSequencing` for simple function application
 
 ---
 
@@ -2202,11 +2340,43 @@ function consOf(ex:tp) : ConstructorTag = primop#;  // Returns the constructor t
 
 ---
 
+## Operator Fixity Declarations
+
+Operators can be given custom precedence (0-9) and associativity using fixity declarations:
+
+```
+infixl 6 (+), (-);     // left-associative, precedence 6
+infixr 5 (++);         // right-associative, precedence 5
+infix  4 (==), (!=);   // non-associative, precedence 4
+```
+
+- `infixl` — left-associative: `a + b + c` = `(a + b) + c`
+- `infixr` — right-associative: `a ++ b ++ c` = `a ++ (b ++ c)`
+- `infix` — non-associative: `a == b == c` is a parse error
+
+Precedence is an integer 0-9. Higher precedence binds tighter. Operators without a fixity declaration default to `infixl 9` (tightest, left-associative).
+
+### Default Fixity Table
+
+| Prec | Assoc  | Operators |
+|------|--------|-----------|
+| 9    | left   | (default for unknown operators) |
+| 7    | left   | `*`, `/`, `*#`, `/#` |
+| 6    | left   | `+`, `-`, `+#`, `-#` |
+| 5    | right  | `++` |
+| 4    | none   | `==`, `!=`, `<`, `>`, `<=`, `>=` |
+| 3    | right  | `.&.`, `/\` |
+| 2    | right  | `.\|.`, `\/` |
+
+Fixity declarations can appear at the top level of any module or file. They take effect immediately for subsequent expressions in the same file.
+
+---
+
 ## Reserved Words
 
 The following words are reserved and cannot be used as identifiers:
 
-`type`, `function`, `if`, `then`, `else`, `in`, `action`, `structure`, `instance`, `let`, `case`, `of`, `where`, `exists`, `forall`, `record`, `algebra`, `trait`, `morphism`, `bridge`, `law`, `extends`, `requires`, `value`, `primitive`, `intrinsic`, `repr`, `invariant`, `as`, `default`, `match`, `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`, `effect`, `handler`, `handle`, `derive`, `deriving`, `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super`
+`type`, `function`, `if`, `then`, `else`, `in`, `action`, `structure`, `instance`, `let`, `case`, `of`, `where`, `exists`, `forall`, `record`, `algebra`, `trait`, `morphism`, `bridge`, `law`, `extends`, `requires`, `value`, `primitive`, `intrinsic`, `repr`, `invariant`, `as`, `default`, `match`, `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`, `effect`, `handler`, `handle`, `derive`, `deriving`, `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super`, `infixl`, `infixr`, `infix`
 
 The Unicode symbols `∃` and `∀` are also reserved (for future quantifier support).
 
@@ -2312,8 +2482,9 @@ See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 | Value declaration | `value name : Type = expr` (inside structures/instances) |
 | Effect declaration | `effect Name = { function op(args) : Type, ... };` |
 | Effect row type | `Eff { label: Effect, ... \| r } ResultType` |
-| Handler | `handler Name : Effect = { function op(...) = ..., ... };` |
-| Handle expression | `handle expr with HandlerName` |
+| Handler (simple) | `handler Name : Effect = { function op(...) = ..., ... };` |
+| Handler (parameterized) | `handler Name(params) : Effect = { let x = expr, function op(...) = ..., ... };` |
+| Handle expression | `handle expr with HandlerName` or `handle expr with HandlerName(args)` |
 | Action (do-notation) | `action name() = { name <- expr, ... };` |
 | Action (legacy) | `action name = { stmts };` |
 | Anonymous lambda | `\x -> expr`, `\x:Nat, y -> expr` |

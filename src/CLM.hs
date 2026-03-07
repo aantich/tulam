@@ -1,6 +1,6 @@
-{-# LANGUAGE OverloadedStrings, NamedFieldPuns, TypeSynonymInstances, FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns, TypeSynonymInstances, FlexibleInstances, DeriveGeneric #-}
 
--- This is our PRIMARY CORE LANGUAGE, "Core List Machine", 
+-- This is our PRIMARY CORE LANGUAGE, "Core List Machine",
 -- where we use n-lists for tuples explicitly instead of lambda-applications.
 -- NO TYPES, as they must be typechecked by this point fully.
 
@@ -12,6 +12,8 @@ import Logs
 import Surface
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Set as Set
+import GHC.Generics (Generic)
+import Data.Binary (Binary)
 
 type CLMVar = (Name, CLMExpr) 
 
@@ -19,12 +21,14 @@ type CLMVar = (Name, CLMExpr)
 -- lambda with cases:
 -- Expr on the right side may ONLY be CLMCASE!!!
 data CLMLam = CLMLam [CLMVar] CLMExpr | CLMLamCases [CLMVar] [CLMExpr]
-    deriving (Show, Eq) 
+    deriving (Show, Eq, Generic)
+instance Binary CLMLam
 
 type CLMConsTagCheck = (ConsTag, CLMExpr) -- legacy alias, kept for compatibility
 
 data CLMPatternCheck = CLMCheckTag ConsTag CLMExpr | CLMCheckLit Literal CLMExpr
-    deriving (Show, Eq)
+    deriving (Show, Eq, Generic)
+instance Binary CLMPatternCheck
 
 data CLMExpr = 
     CLMEMPTY
@@ -51,7 +55,12 @@ data CLMExpr =
   | CLMMCALL CLMExpr Name [CLMExpr]  -- object.method(args) — dynamic dispatch
   | CLMSCALL CLMExpr Name [CLMExpr]  -- super.method(args) — parent dispatch
   | CLMNEW Name [CLMExpr]            -- ClassName.new(args) — construction
-    deriving (Show, Eq)
+  | CLMHANDLE CLMExpr Name [(Name, CLMExpr)] [(Name, CLMExpr)]
+    -- CLMHANDLE body effectName [(letName, letExpr)] [(opName, implementation)]
+    -- Pushes handler ops onto dynamic handler stack, evals body, pops
+    deriving (Show, Eq, Generic)
+
+instance Binary CLMExpr
 
 -- helper function that goes inside all pattern checks and
 -- checks if they all evaluate to true
@@ -176,6 +185,7 @@ simultBetaReduce subst
     go (CLMMCALL obj meth args) = CLMMCALL (go obj) meth (map go args)
     go (CLMSCALL obj meth args) = CLMSCALL (go obj) meth (map go args)
     go (CLMNEW nm args) = CLMNEW nm (map go args)
+    go (CLMHANDLE bdy eff lets ops) = CLMHANDLE (go bdy) eff (map (\(n,v) -> (n, go v)) lets) (map (\(n,impl) -> (n, go impl)) ops)
     go e = e  -- CLMLIT, CLMEMPTY, CLMPRIMCALL, CLMU, CLMERR, CLMREF, CLMMUTARRAY
     goCheck (CLMCheckTag ct e) = CLMCheckTag ct (go e)
     goCheck (CLMCheckLit lit e) = CLMCheckLit lit (go e)
@@ -211,6 +221,7 @@ betaReduceCLM (nm,val) expr = go expr
         go (CLMMCALL obj meth args) = CLMMCALL (go obj) meth (map go args)
         go (CLMSCALL obj meth args) = CLMSCALL (go obj) meth (map go args)
         go (CLMNEW nm args) = CLMNEW nm (map go args)
+        go (CLMHANDLE bdy eff lets ops) = CLMHANDLE (go bdy) eff (map (\(n,v) -> (n, go v)) lets) (map (\(n,impl) -> (n, go impl)) ops)
         go e = e
         goCheck (CLMCheckTag ct e) = CLMCheckTag ct (go e)
         goCheck (CLMCheckLit lit e) = CLMCheckLit lit (go e)
@@ -236,6 +247,7 @@ traverseCLMExpr f (CLMARRAY exs) = CLMARRAY (map f (map (traverseCLMExpr f) exs)
 traverseCLMExpr f (CLMMCALL obj meth args) = CLMMCALL (f $ traverseCLMExpr f obj) meth (map f (map (traverseCLMExpr f) args))
 traverseCLMExpr f (CLMSCALL obj meth args) = CLMSCALL (f $ traverseCLMExpr f obj) meth (map f (map (traverseCLMExpr f) args))
 traverseCLMExpr f (CLMNEW nm args) = CLMNEW nm (map f (map (traverseCLMExpr f) args))
+traverseCLMExpr f (CLMHANDLE bdy eff lets ops) = CLMHANDLE (f $ traverseCLMExpr f bdy) eff (map (\(n,v) -> (n, f $ traverseCLMExpr f v)) lets) (map (\(n,impl) -> (n, f $ traverseCLMExpr f impl)) ops)
 traverseCLMExpr f e = f e
 
 -- | Truncate ppr output to N chars, appending "..." if truncated
@@ -282,6 +294,7 @@ instance PrettyPrint CLMExpr where
     ppr (CLMMCALL obj meth args) = ppr obj ++ "." ++ as [bold,cyan] meth ++ showListRoBr ppr args
     ppr (CLMSCALL obj meth args) = as [bold,cyan] "super" ++ "." ++ meth ++ showListRoBr ppr args
     ppr (CLMNEW nm args) = as [bold,cyan] nm ++ ".new" ++ showListRoBr ppr args
+    ppr (CLMHANDLE bdy eff lets ops) = "handle " ++ ppr bdy ++ " with " ++ eff ++ "{" ++ showListPlainSep (\(n,v) -> "let " ++ n ++ "=" ++ ppr v) ", " lets ++ (if null lets then "" else ", ") ++ showListPlainSep (\(n,impl) -> n ++ "=" ++ ppr impl) ", " ops ++ "}"
     ppr e = show e
 
 instance PrettyPrint CLMConsTagCheck where

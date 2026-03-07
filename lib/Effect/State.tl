@@ -17,3 +17,12 @@ effect State = {
     /// @param f Transformation function
     function modify(f: a -> a) : Unit
 };
+
+/// Reference-based State handler: uses a mutable ref initialized with the given value.
+/// Usage: handle action { put(10), get() } with RefState(0)
+handler RefState(init:a) : State = {
+    let state = newRef(init),
+    function get() = readRef(state),
+    function put(x) = writeRef(state, x),
+    function modify(f) = modifyRef(state, f)
+};

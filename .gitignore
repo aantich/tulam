@@ -18,5 +18,8 @@ dist-newstyle/
 .DS_Store
 Thumbs.db
 
+# Module compilation cache
+.tulam-cache/
+
 # Claude Code local settings
 .claude/

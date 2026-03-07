@@ -28,6 +28,7 @@ library
       CaseOptimization
       CLM
       CLMOptimize
+      Interface
       Interpreter
       Intrinsics
       Lexer
@@ -49,9 +50,12 @@ library
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
+    , binary
+    , bytestring
     , containers
     , directory
     , filepath
+    , hashable
     , hashtables
     , haskeline
     , ilist
@@ -75,9 +79,12 @@ executable tldoc
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
+    , binary
+    , bytestring
     , containers
     , directory
     , filepath
+    , hashable
     , hashtables
     , haskeline
     , ilist
@@ -101,9 +108,12 @@ executable tulam
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , binary
+    , bytestring
     , containers
     , directory
     , filepath
+    , hashable
     , hashtables
     , haskeline
     , ilist
@@ -128,9 +138,12 @@ executable tulam-bench
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , binary
+    , bytestring
     , containers
     , directory
     , filepath
+    , hashable
     , hashtables
     , haskeline
     , ilist
@@ -156,9 +169,12 @@ test-suite tulam-test
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , binary
+    , bytestring
     , containers
     , directory
     , filepath
+    , hashable
     , hashtables
     , haskeline
     , hspec

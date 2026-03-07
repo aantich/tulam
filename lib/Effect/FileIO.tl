@@ -25,3 +25,11 @@ effect FileIO = {
     /// @returns True if the file exists
     function fileExists(path:String) : Bool
 };
+
+/// Default FileIO handler mapping to intrinsic file operations.
+handler StdFileIO : FileIO = {
+    function readFile(path) = intrinsic,
+    function writeFile(path, content) = intrinsic,
+    function appendFile(path, content) = intrinsic,
+    function fileExists(path) = intrinsic
+};

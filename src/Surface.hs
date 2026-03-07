@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, NamedFieldPuns, GADTs, PatternSynonyms #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns, GADTs, PatternSynonyms, DeriveGeneric #-}
 
 -- This is our PRIMARY CORE LANGUAGE, based on HoTT with some changes and extensions, notably -
 -- we are using N-tuples explicitly, but there's more.
@@ -10,6 +10,8 @@ import Util.PrettyPrinting
 import Logs
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.Word (Word8, Word16, Word32, Word64)
+import GHC.Generics (Generic)
+import Data.Binary (Binary)
 
 type Name = String
 type ModulePath = [Name]  -- e.g. ["Algebra", "Ring"]
@@ -18,19 +20,24 @@ data Var = Var {
     name :: Name,
     typ :: Expr,
     val :: Expr
-} deriving (Show, Eq)
+} deriving (Show, Eq, Generic)
+
+instance Binary Var
 
 -- type Tuple a = [a]
 type Record = [Var]
 
 -- Classification of structures (typeclasses)
-data StructKind = SGeneral | SAlgebra | SMorphism deriving (Show, Eq)
+data StructKind = SGeneral | SAlgebra | SMorphism deriving (Show, Eq, Generic)
+instance Binary StructKind
 
 -- Classification for class modifiers
-data ClassModifier = ClassNormal | ClassAbstract | ClassSealed deriving (Show, Eq)
+data ClassModifier = ClassNormal | ClassAbstract | ClassSealed deriving (Show, Eq, Generic)
+instance Binary ClassModifier
 
 -- Method modifier (for methods inside class bodies)
-data MethodModifier = MNone | MOverride | MFinal | MStatic deriving (Show, Eq)
+data MethodModifier = MNone | MOverride | MFinal | MStatic deriving (Show, Eq, Generic)
+instance Binary MethodModifier
 
 -- Extended structure metadata
 data StructInfo = StructInfo {
@@ -39,7 +46,9 @@ data StructInfo = StructInfo {
     structRequires  :: [Expr],
     structMandatory :: [Name],
     structDerive    :: [Expr]       -- derive { } block contents (functions for auto-deriving)
-} deriving (Show, Eq)
+} deriving (Show, Eq, Generic)
+
+instance Binary StructInfo
 
 defaultStructInfo :: StructInfo
 defaultStructInfo = StructInfo SGeneral [] [] [] []
@@ -51,12 +60,15 @@ data ClassInfo = ClassInfo {
     classModifier    :: ClassModifier,
     classExtern      :: Maybe Name,            -- Just "dotnet" | Just "js" | Just "native" | Nothing
     classMethodMods  :: [(Name, MethodModifier)]  -- per-method modifiers
-} deriving (Show, Eq)
+} deriving (Show, Eq, Generic)
+
+instance Binary ClassInfo
 
 defaultClassInfo :: ClassInfo
 defaultClassInfo = ClassInfo Nothing [] ClassNormal Nothing []
 -- constructor tag placeholder type
-data ConsTag = ConsTag Name !Int deriving (Show, Eq)
+data ConsTag = ConsTag Name !Int deriving (Show, Eq, Generic)
+instance Binary ConsTag
 
 -- this is "naive" arity as it does not take into account functions
 -- that return other functions as a result
@@ -65,17 +77,28 @@ arity lam = length (params lam)
 
 -- Import specification for module imports
 data ImportSpec = ImportAll | ImportOnly [Name] | ImportHiding [Name] | ImportAs Name
-    deriving (Show, Eq)
+    deriving (Show, Eq, Generic)
+instance Binary ImportSpec
 
 -- Visibility modifier for declarations
-data Visibility = Public | Private deriving (Show, Eq)
+data Visibility = Public | Private deriving (Show, Eq, Generic)
+instance Binary Visibility
 
 -- Action statement types for do-notation in action blocks
 data ActionStmt
   = ActionBind Name Expr      -- name <- expr (monadic bind)
   | ActionLet Name Expr       -- name = expr (let binding)
   | ActionExpr Expr           -- expr (execute for side effect)
-  deriving (Show, Eq)
+  deriving (Show, Eq, Generic)
+instance Binary ActionStmt
+
+-- Operator associativity for fixity declarations
+data Assoc = AssocLeft | AssocRight | AssocNone deriving (Show, Eq, Generic)
+instance Binary Assoc
+
+-- Operator fixity: associativity + precedence level (0-9)
+data OperatorFixity = OperatorFixity { fixAssoc :: Assoc, fixPrec :: Int } deriving (Show, Eq, Generic)
+instance Binary OperatorFixity
 
 data Literal = LInt !Int | LFloat !Double | LChar !Char | LString !String | LList [Expr] | LVec [Expr] | LTuple [Expr]
   -- Fixed-width signed integers
@@ -84,7 +107,8 @@ data Literal = LInt !Int | LFloat !Double | LChar !Char | LString !String | LLis
   | LWord8 !Word8 | LWord16 !Word16 | LWord32 !Word32 | LWord64 !Word64
   -- Single-precision float
   | LFloat32 !Float
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
+instance Binary Literal
 
 -- Lambda - represents EVERYTHING pretty much (see README in HoTT folder). Its type signature is
 -- also obvious from the definition, so it encodes Pi types already!
@@ -95,7 +119,8 @@ data Lambda = Lambda {
   , lamType    :: Expr -- return type of the function, used in type checking:
    -- Type for type constructors, Sigma for typeclasses etc, specific type for type constructors and functions etc
   , lamSrcInfo :: SourceInfo -- source location of this lambda definition
-} deriving (Show, Eq)
+} deriving (Show, Eq, Generic)
+instance Binary Lambda
 
 -- | Convenience constructor for Lambda with no source info (SourceInteractive).
 -- Use this in compiler-generated lambdas (desugaring, passes, etc.)
@@ -190,18 +215,21 @@ data Expr =
   | RecordPattern Name [(Name, Expr)]   -- Named field pattern: Point { x = Z, y = _ }
   -- Effect system nodes
   | EffectDecl Name [Var] [(Lambda)]    -- effect Name(params) = { op1, op2, ... }
-  | HandlerDecl Name Name [Expr]        -- handler Name : EffectName = { impls }
+  | HandlerDecl Name Name [Var] [Expr]  -- handler Name(params) : EffectName = { lets + impls }
   | HandleWith Expr Expr                -- handle expr with handlerExpr
   | ActionBlock [ActionStmt]            -- action { stmt, stmt, ... } (desugared to bind chains)
   | EffType Expr Expr                   -- Eff { row } resultType (in type positions)
   -- Class system nodes
   | ClassDecl Lambda ClassInfo          -- class Name(fields) [extends Parent(args)] [implements A,B] = { methods }
+  | FixityDecl Assoc Int [Name]        -- infixl/infixr/infix prec (op1), (op2), ...
   | ERROR String
 
-  
-  -- ^^^ in case of anonymous application, `name` fields will be empty or index; 
-  -- typ is calculated for type checking. Optional + Explicit params. 
-    deriving (Show, Eq)
+
+  -- ^^^ in case of anonymous application, `name` fields will be empty or index;
+  -- typ is calculated for type checking. Optional + Explicit params.
+    deriving (Show, Eq, Generic)
+
+instance Binary Expr
 
 -- Convenience pattern synonym so existing code matching on Type keeps working
 pattern Type :: Expr
@@ -285,12 +313,14 @@ traverseExpr f (RecordUpdate e fields) = RecordUpdate (f $ traverseExpr f e) (ma
 traverseExpr f (RecordPattern nm fields) = RecordPattern nm (map (\(n,e) -> (n, f $ traverseExpr f e)) fields)
 -- Effect system nodes
 traverseExpr f (EffectDecl nm ps ops) = EffectDecl nm ps (map (\l -> l { body = f $ traverseExpr f (body l) }) ops)
-traverseExpr f (HandlerDecl nm eff impls) = HandlerDecl nm eff (map (f . traverseExpr f) impls)
+traverseExpr f (HandlerDecl nm eff ps impls) = HandlerDecl nm eff ps (map (f . traverseExpr f) impls)
 traverseExpr f (HandleWith e h) = HandleWith (f $ traverseExpr f e) (f $ traverseExpr f h)
 traverseExpr f (ActionBlock stmts) = ActionBlock (map (traverseActionStmt f) stmts)
 traverseExpr f (EffType row res) = EffType (f $ traverseExpr f row) (f $ traverseExpr f res)
 -- Class system
 traverseExpr f (ClassDecl lam ci) = ClassDecl (lam { body = f $ traverseExpr f (body lam) }) ci
+-- Fixity declarations (leaf node)
+traverseExpr _ e@(FixityDecl _ _ _) = e
 traverseExpr _ e@(ERROR _) = e
 traverseExpr f e = ERROR $ "Traverse not implemented for: " ++ ppr e
 
@@ -356,6 +386,25 @@ getDefaultCase lam = case body lam of
     PatternMatches ( (CaseOf [] ex _):_ ) -> ex
     PatternMatches ( (ExpandedCase [] ex _):_ ) -> ex
     b -> b
+
+-- | Collect all Id name references in an expression (shallow, non-recursive into sub-lambdas' params)
+collectIdRefs :: Expr -> [Name]
+collectIdRefs = go
+  where
+    go (Id n)             = [n]
+    go (App e es)         = go e ++ concatMap go es
+    go (Tuple es)         = concatMap go es
+    go (ConTuple _ es)    = concatMap go es
+    go (BinaryOp _ e1 e2) = go e1 ++ go e2
+    go (UnaryOp _ e)      = go e
+    go (Function lam)     = go (body lam)
+    go (PatternMatches es) = concatMap go es
+    go (CaseOf _ e _)     = go e
+    go (ExpandedCase _ e _) = go e
+    go (Typed e _)        = go e
+    go (Lit _)            = []
+    go UNDEFINED          = []
+    go _                  = []
 
 -- --------------------------------- PRETTY PRINTING --------------------------------------------
 
@@ -446,7 +495,7 @@ instance PrettyPrint Expr where
   ppr (RecordPattern nm fields) = nm ++ " {" ++ showListPlainSep (\(n,e) -> n ++ " = " ++ ppr e) ", " fields ++ "}"
   -- Effect system
   ppr (EffectDecl nm ps ops) = (as [bold,cyan] "effect ") ++ nm ++ showListRoBr ppr ps ++ " = {" ++ showListPlainSep ppr ", " (map Function ops) ++ "}"
-  ppr (HandlerDecl nm eff impls) = (as [bold,cyan] "handler ") ++ nm ++ " : " ++ eff ++ " = {" ++ showListPlainSep ppr ", " impls ++ "}"
+  ppr (HandlerDecl nm eff ps impls) = (as [bold,cyan] "handler ") ++ nm ++ (if null ps then "" else showListRoBr ppr ps) ++ " : " ++ eff ++ " = {" ++ showListPlainSep ppr ", " impls ++ "}"
   ppr (HandleWith e h) = "handle " ++ ppr e ++ " with " ++ ppr h
   ppr (ActionBlock stmts) = "action {" ++ showListPlainSep pprActionStmt ", " stmts ++ "}"
   ppr (EffType row res) = "Eff " ++ ppr row ++ " " ++ ppr res
@@ -457,6 +506,7 @@ instance PrettyPrint Expr where
     ++ pprClassParent (classParent ci)
     ++ pprImplements (classImplements ci)
     ++ " = " ++ ppr (body lam)
+  ppr (FixityDecl assoc prec ops) = pprAssoc assoc ++ " " ++ show prec ++ " " ++ showListPlainSep (\o -> "(" ++ o ++ ")") ", " ops
   ppr (U 0) = "Type"
   ppr (U n) = "Type" ++ show n
   ppr e = show e
@@ -497,6 +547,11 @@ pprExtends es = " extends " ++ showListPlainSep ppr ", " es
 pprRequires :: [Expr] -> String
 pprRequires [] = ""
 pprRequires es = " requires " ++ showListPlainSep ppr ", " es
+
+pprAssoc :: Assoc -> String
+pprAssoc AssocLeft  = "infixl"
+pprAssoc AssocRight = "infixr"
+pprAssoc AssocNone  = "infix"
 
 pprClassMod :: ClassModifier -> String
 pprClassMod ClassNormal   = ""

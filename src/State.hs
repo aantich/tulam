@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, TypeSynonymInstances, FlexibleInstances, OverloadedStrings #-}
+{-# LANGUAGE RankNTypes, TypeSynonymInstances, FlexibleInstances, OverloadedStrings, DeriveGeneric #-}
 
 -- State / IO monad where we are doing all our transformations etc
 -- So, our parser needs to work in this monad as well
@@ -25,6 +25,12 @@ import qualified Data.List
 import Util.IOLogger as Log
 import Util.PrettyPrinting
 import Logs as Logs
+import GHC.Generics (Generic)
+import Data.Hashable (Hashable)
+import Data.Binary (Binary)
+import qualified Data.Binary as Bin
+import qualified Data.Text.Encoding as TE
+import qualified Data.ByteString as BS
 
 type NameMap = HashMap Name
 type LTProgram = [(Expr, SourceInfo)]
@@ -69,6 +75,41 @@ removeNames names env = env
     , clmBindings = Map.filterWithKey (\k _ -> not (Set.member k names)) (clmBindings env)
     }
 
+-- | Slice environment to keep only the given names (inverse of removeNames).
+-- Used for extracting a module's public environment for caching.
+sliceEnvironment :: Set.Set Name -> Environment -> Environment
+sliceEnvironment keepNames env = env
+    { types = Map.filterWithKey (\k _ -> Set.member k keepNames) (types env)
+    , constructors = Map.filterWithKey (\k _ -> Set.member k keepNames) (constructors env)
+    , topLambdas = Map.filterWithKey (\k _ -> Set.member k keepNames) (topLambdas env)
+    , topBindings = Map.filterWithKey (\k _ -> Set.member k keepNames) (topBindings env)
+    , clmLambdas = Map.filterWithKey (\k _ -> Set.member k keepNames) (clmLambdas env)
+    , clmBindings = Map.filterWithKey (\k _ -> Set.member k keepNames) (clmBindings env)
+    -- Instance keys are "funcName\0type1\0..." — keep if function name part matches
+    , instanceLambdas = Map.filterWithKey (\k _ -> instanceKeyMatches k keepNames) (instanceLambdas env)
+    , clmInstances = Map.filterWithKey (\k _ -> instanceKeyMatches k keepNames) (clmInstances env)
+    -- These are keyed by type/class/effect name
+    , structInheritance = Map.filterWithKey (\k _ -> Set.member k keepNames) (structInheritance env)
+    , reprMap = Map.filterWithKey (\k _ -> Set.member k keepNames) (reprMap env)
+    , effectDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectDecls env)
+    , effectHandlers = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectHandlers env)
+    , classDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (classDecls env)
+    -- classTagCounter, targetImports, outProgram, raw* kept as-is
+    }
+
+-- | Check if an instance key (e.g. "funcName\0TypeName") matches the keep set.
+-- An instance is kept if the function name or any type in the key is in the set.
+instanceKeyMatches :: Name -> Set.Set Name -> Bool
+instanceKeyMatches key keepNames =
+    let parts = splitOn0 key
+    in Prelude.any (`Set.member` keepNames) parts
+  where
+    splitOn0 [] = [""]
+    splitOn0 s  = let (w, rest) = Prelude.break (== '\0') s
+                  in w : case rest of
+                           [] -> []
+                           (_:rs) -> splitOn0 rs
+
 -- | Merge one environment into another (restore hidden names)
 mergeEnvironment :: Environment -> Environment -> Environment
 mergeEnvironment base overlay = Environment
@@ -90,6 +131,7 @@ mergeEnvironment base overlay = Environment
     , outProgram = Map.union (outProgram overlay) (outProgram base)
     , rawCLMLambdas = Map.union (rawCLMLambdas overlay) (rawCLMLambdas base)
     , rawCLMInstances = Map.union (rawCLMInstances overlay) (rawCLMInstances base)
+    , fixityTable = Map.union (fixityTable overlay) (fixityTable base)
     }
 
 -- Class metadata for OOP class declarations
@@ -107,7 +149,7 @@ data ClassMeta = ClassMeta {
     cmExtern        :: Maybe Name,              -- target name if extern, Nothing if tulam-native
     cmTag           :: Int,                      -- unique class tag for ConsTag
     cmSourceFile    :: String                    -- file where class was declared
-} deriving (Show, Eq)
+} deriving (Show, Eq, Generic)
 
 -- structure keeping our current environment
 data Environment = Environment {
@@ -128,8 +170,8 @@ data Environment = Environment {
     reprMap :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)],
     -- effect declarations: effect name -> (params, operations)
     effectDecls :: NameMap ([Var], [Lambda]),
-    -- effect handlers: handler name -> (effect name, implementations)
-    effectHandlers :: NameMap (Name, [Expr]),
+    -- effect handlers: handler name -> (effect name, params, implementations)
+    effectHandlers :: NameMap (Name, [Var], [Expr]),
     -- Class hierarchy
     classDecls :: NameMap ClassMeta,
     classTagCounter :: !Int,
@@ -138,8 +180,66 @@ data Environment = Environment {
     outProgram   :: NameMap String,
     -- Pre-optimization CLM snapshots (for :clm-raw comparison)
     rawCLMLambdas  :: NameMap CLMLam,
-    rawCLMInstances :: NameMap CLMLam
-} deriving Show
+    rawCLMInstances :: NameMap CLMLam,
+    -- Operator fixity table: op name -> (assoc, precedence)
+    fixityTable :: NameMap OperatorFixity
+} deriving (Show, Generic)
+
+-- Binary helpers for HashMap (not provided by binary package)
+putHashMap :: (Binary k, Binary v) => HashMap k v -> Bin.Put
+putHashMap m = Bin.put (Map.toList m)
+
+getHashMap :: (Binary k, Binary v, Eq k, Hashable k) => Bin.Get (HashMap k v)
+getHashMap = Map.fromList <$> Bin.get
+
+-- We need Hashable for HashMap keys (String/Name) — already available via unordered-containers
+
+instance Binary ClassMeta where
+    put cm = do
+        Bin.put (cmParent cm)
+        Bin.put (cmAllFields cm)
+        Bin.put (cmOwnFields cm)
+        putHashMap (cmMethods cm)
+        putHashMap (cmStaticMethods cm)
+        putHashMap (cmFieldIndices cm)
+        Bin.put (cmModifier cm)
+        Bin.put (cmChildren cm)
+        Bin.put (cmImplements cm)
+        Bin.put (cmSuperArgs cm)
+        Bin.put (cmExtern cm)
+        Bin.put (cmTag cm)
+        Bin.put (cmSourceFile cm)
+    get = ClassMeta <$> Bin.get <*> Bin.get <*> Bin.get
+                    <*> getHashMap <*> getHashMap <*> getHashMap
+                    <*> Bin.get <*> Bin.get <*> Bin.get
+                    <*> Bin.get <*> Bin.get <*> Bin.get <*> Bin.get
+
+instance Binary Environment where
+    put env = do
+        putHashMap (types env)
+        putHashMap (constructors env)
+        putHashMap (topLambdas env)
+        putHashMap (topBindings env)
+        putHashMap (clmLambdas env)
+        putHashMap (clmBindings env)
+        putHashMap (instanceLambdas env)
+        putHashMap (clmInstances env)
+        putHashMap (structInheritance env)
+        putHashMap (reprMap env)
+        putHashMap (effectDecls env)
+        putHashMap (effectHandlers env)
+        putHashMap (classDecls env)
+        Bin.put (classTagCounter env)
+        Bin.put (targetImports env)
+        putHashMap (outProgram env)
+        putHashMap (rawCLMLambdas env)
+        putHashMap (rawCLMInstances env)
+        putHashMap (fixityTable env)
+    get = Environment <$> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> Bin.get <*> Bin.get <*> getHashMap
+                      <*> getHashMap <*> getHashMap <*> getHashMap
 
 initialEnvironment = Environment {
     types       = Map.empty,
@@ -159,9 +259,35 @@ initialEnvironment = Environment {
     targetImports = [],
     outProgram   = Map.empty,
     rawCLMLambdas = Map.empty,
-    rawCLMInstances = Map.empty
+    rawCLMInstances = Map.empty,
+    fixityTable = defaultFixities
 }
 
+
+-- Default operator fixities (matching standard math/logic conventions)
+defaultFixities :: HashMap Name OperatorFixity
+defaultFixities = Map.fromList
+    [ ("*",  OperatorFixity AssocLeft  7), ("/",  OperatorFixity AssocLeft  7)
+    , ("*#", OperatorFixity AssocLeft  7), ("/#", OperatorFixity AssocLeft  7)
+    , ("+",  OperatorFixity AssocLeft  6), ("-",  OperatorFixity AssocLeft  6)
+    , ("+#", OperatorFixity AssocLeft  6), ("-#", OperatorFixity AssocLeft  6)
+    , ("++", OperatorFixity AssocRight 5)
+    , ("==", OperatorFixity AssocNone  4), ("!=", OperatorFixity AssocNone  4)
+    , ("<",  OperatorFixity AssocNone  4), (">",  OperatorFixity AssocNone  4)
+    , ("<=", OperatorFixity AssocNone  4), (">=", OperatorFixity AssocNone  4)
+    , (".&.", OperatorFixity AssocRight 3), ("/\\", OperatorFixity AssocRight 3)
+    , (".|.", OperatorFixity AssocRight 2), ("\\/", OperatorFixity AssocRight 2)
+    ]
+
+-- Look up fixity for an operator. Unknown operators default to infixl 9.
+lookupFixity :: Name -> Environment -> OperatorFixity
+lookupFixity op env = case Map.lookup op (fixityTable env) of
+    Just fix -> fix
+    Nothing  -> OperatorFixity AssocLeft 9
+
+-- Add/update fixity for an operator
+addFixity :: Name -> OperatorFixity -> Environment -> Environment
+addFixity op fix env = env { fixityTable = Map.insert op fix (fixityTable env) }
 
 -- scary, building a stack - stacking IO inside logger monad
 -- type IntState = StateT InterpreterState IO
@@ -182,12 +308,17 @@ data InterpreterState = InterpreterState {
     libSearchPaths :: [FilePath],
     -- | Source text per loaded file, for error display
     loadedSources :: HashMap FilePath Text,
+    -- | Source hashes per module, for dependency hash tracking in cache
+    moduleSourceHashes :: HashMap String Int,
     -- Managed mutability: IORef-backed mutable references
     refTable       :: HashMap Int (IORef CLMExpr),
     nextRefId      :: !Int,
     -- Managed mutability: mutable arrays (IORef-wrapped list for simplicity)
     mutArrayTable  :: HashMap Int (IORef [CLMExpr]),
-    nextMutArrayId :: !Int
+    nextMutArrayId :: !Int,
+    -- Effect handler stack: [(effectName, opName → implementation)]
+    -- Head of list = innermost handler (checked first)
+    handlerStack   :: [(Name, HashMap Name CLMExpr)]
 }
 
 instance Show InterpreterState where
@@ -195,6 +326,7 @@ instance Show InterpreterState where
         ++ ", parsedModule = " ++ show (Prelude.length (parsedModule st)) ++ " items"
         ++ ", refs = " ++ show (nextRefId st) ++ " allocated"
         ++ ", mutArrays = " ++ show (nextMutArrayId st) ++ " allocated"
+        ++ ", handlers = " ++ show (Prelude.length (handlerStack st)) ++ " active"
         ++ " }"
 
 emptyIntState = InterpreterState {
@@ -205,10 +337,12 @@ emptyIntState = InterpreterState {
     currentModuleEnv = emptyModuleEnv,
     libSearchPaths = ["lib/"],
     loadedSources = Map.empty,
+    moduleSourceHashes = Map.empty,
     refTable = Map.empty,
     nextRefId = 0,
     mutArrayTable = Map.empty,
-    nextMutArrayId = 0
+    nextMutArrayId = 0,
+    handlerStack = []
 }
 
 -- | Per-pass optimization flags
@@ -250,11 +384,21 @@ initializeInterpreter = return $ InterpreterState {
     currentModuleEnv = emptyModuleEnv,
     libSearchPaths = ["lib/"],
     loadedSources = Map.empty,
+    moduleSourceHashes = Map.empty,
     refTable = Map.empty,
     nextRefId = 0,
     mutArrayTable = Map.empty,
-    nextMutArrayId = 0
+    nextMutArrayId = 0,
+    handlerStack = []
 }
+
+-- | Look up a handler op by name in the handler stack (innermost first)
+lookupHandlerOp :: Name -> [(Name, HashMap Name CLMExpr)] -> Maybe CLMExpr
+lookupHandlerOp _ [] = Nothing
+lookupHandlerOp opName ((_, ops):rest) =
+    case Map.lookup opName ops of
+        Just impl -> Just impl
+        Nothing   -> lookupHandlerOp opName rest
 
 -- | Apply a pure lambda transformation to both topLambdas and instanceLambdas.
 -- Common pattern used by multiple passes (record desugaring, CLM conversion, etc.)
@@ -314,9 +458,11 @@ traverseExprM f (RecordType fields isOpen) = (\fs -> RecordType fs isOpen) <$> m
 traverseExprM f (RecordConstruct nm fields) = RecordConstruct nm <$> mapM (\(n,e) -> (,) n <$> f e) fields
 traverseExprM f (RecordUpdate e fields) = RecordUpdate <$> f e <*> mapM (\(n,ex) -> (,) n <$> f ex) fields
 traverseExprM f (RecordPattern nm fields) = RecordPattern nm <$> mapM (\(n,e) -> (,) n <$> f e) fields
+-- Fixity declarations (leaf node)
+traverseExprM _ e@(FixityDecl _ _ _) = pure e
 -- Effect system nodes
 traverseExprM _ e@(EffectDecl _ _ _) = pure e
-traverseExprM _ e@(HandlerDecl _ _ _) = pure e
+traverseExprM _ e@(HandlerDecl _ _ _ _) = pure e
 traverseExprM f (HandleWith e h) = HandleWith <$> f e <*> f h
 traverseExprM f (ActionBlock stmts) = ActionBlock <$> mapM (traverseActionStmtM f) stmts
 traverseExprM f (EffType row res) = EffType <$> f row <*> f res

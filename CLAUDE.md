@@ -122,3 +122,4 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `override`, `final`, `static` = method modifiers inside class body. `super` = reserved for parent method calls.
 - `ClassName.new(args)` = construction. `obj.method(args)` = method call (dynamic dispatch). `obj.field` = field access.
 - `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super` are reserved words.
+- `infixl N (op);` / `infixr N (op);` / `infix N (op);` = operator fixity declarations. N is precedence 0-9. Default for unknown ops is `infixl 9`. `infixl`, `infixr`, `infix` are reserved words.

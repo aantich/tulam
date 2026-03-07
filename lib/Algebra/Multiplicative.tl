@@ -6,6 +6,8 @@
 /// @see Algebra.Additive, Algebra.Ring
 module Algebra.Multiplicative;
 
+infixl 7 (*), (/);
+
 /// Associative multiplication.
 algebra MultiplicativeSemigroup(a:Type) = {
     /// Multiply two values.

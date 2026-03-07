@@ -7,6 +7,8 @@
 /// @see Algebra.Multiplicative, Algebra.Ring
 module Algebra.Additive;
 
+infixl 6 (+), (-);
+
 /// Associative addition.
 algebra AdditiveSemigroup(a:Type) = {
     /// Add two values.
