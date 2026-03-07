@@ -17,12 +17,15 @@ import Data.HashMap.Strict as Map
 
 import Data.Traversable.WithIndex
 import Data.Maybe (isJust, catMaybes)
-import Data.List (intercalate)
+import Data.List (intercalate, nub)
 import Control.Monad (filterM, foldM)
 import Data.Foldable (foldrM)
 import Intrinsics (lookupIntrinsic, boolToCLM)
 import System.Directory (doesFileExist)
 import Data.IORef
+import Data.Char (chr)
+import Data.Word (Word8)
+import Data.Bits ((.&.), (.|.), shiftL)
 
 
 
@@ -40,10 +43,13 @@ addBinding e = liftIO $ putStrLn $ "Cant add binding for expr " ++ ppr e
 
 processInteractive :: Expr -> IntState ()
 processInteractive ex0 = do
-    -- apply afterparse desugaring (binary ops -> App calls etc)
-    -- then action block desugaring (ActionBlock -> bind chains)
-    let ex = desugarActions . afterparse $ traverseExpr afterparse ex0
     s <- get
+    -- apply afterparse desugaring (binary ops -> App calls etc)
+    -- then string literal desugaring (if enabled)
+    -- then action block desugaring (ActionBlock -> bind chains)
+    let ns = newStrings (currentFlags s)
+    let desugarStr = if ns then desugarStringLiterals else id
+    let ex = desugarActions . desugarStr . afterparse $ traverseExpr afterparse ex0
     let env = currentEnvironment s
     let clmex = exprToCLM env ex
     liftIO $ putStrLn $ "CLM:\n" ++ ppr clmex
@@ -415,41 +421,46 @@ evalCLM i e@(CLMIAP (CLMID funcNm) exs) = do
                       case mRefl of
                         Just result -> pure result
                         Nothing -> do
-                          -- TRY ARRAY HOF DISPATCH (closure-aware)
-                          mHOF <- dispatchArrayHOF funcNm exs'
-                          case mHOF of
+                          -- TRY DOWNCAST INTRINSIC (__downcast("ClassName", obj) -> Maybe)
+                          mDown <- dispatchDowncastIntrinsic funcNm exs'
+                          case mDown of
                             Just result -> pure result
-                            Nothing ->
-                              -- For nullary implicit-param functions (e.g., value declarations),
-                              -- we can't infer type from args — try to find any instance
-                              if Prelude.null exs'
-                              then dispatchNullaryIAP env funcNm
-                              else do
-                                -- try multi-param key first (all arg types), then fall back to single-param
-                                let mTypeNames = inferTypeNames env exs'
-                                trace $ "  inferred types: " ++ show mTypeNames
-                                case mTypeNames of
-                                    Just typeNames -> do
-                                        let firstType = Prelude.head typeNames
-                                        -- CHECK INTRINSICS FIRST
-                                        case lookupIntrinsic funcNm firstType of
-                                            Just intrinsicFn -> case intrinsicFn exs' of
-                                                Just result -> do
-                                                    trace $ "  intrinsic " ++ funcNm ++ " for " ++ firstType ++ " => " ++ pprSummary 40 result
-                                                    pure result
-                                                Nothing ->
-                                                    if Prelude.length typeNames < Prelude.length exs'
-                                                    then do
-                                                        trace $ "  intrinsic " ++ funcNm ++ " args not ready, deferring"
-                                                        pure $ CLMIAP (CLMID funcNm) exs'
-                                                    else do
-                                                        trace $ "  intrinsic " ++ funcNm ++ " failed on args"
-                                                        pure $ CLMERR ("[RT] Intrinsic " ++ funcNm ++ " failed on args") SourceInteractive
-                                            Nothing -> dispatchInstance env funcNm typeNames exs'
-                                    Nothing -> do
-                                        -- can't determine type, return with evaluated args
-                                        trace $ "  could not infer type for " ++ funcNm
-                                        pure $ CLMIAP (CLMID funcNm) exs'
+                            Nothing -> do
+                              -- TRY ARRAY HOF DISPATCH (closure-aware)
+                              mHOF <- dispatchArrayHOF funcNm exs'
+                              case mHOF of
+                                Just result -> pure result
+                                Nothing ->
+                                  -- For nullary implicit-param functions (e.g., value declarations),
+                                  -- we can't infer type from args — try to find any instance
+                                  if Prelude.null exs'
+                                  then dispatchNullaryIAP env funcNm
+                                  else do
+                                    -- try multi-param key first (all arg types), then fall back to single-param
+                                    let mTypeNames = inferTypeNames env exs'
+                                    trace $ "  inferred types: " ++ show mTypeNames
+                                    case mTypeNames of
+                                        Just typeNames -> do
+                                            let firstType = Prelude.head typeNames
+                                            -- CHECK INTRINSICS FIRST
+                                            case lookupIntrinsic funcNm firstType of
+                                                Just intrinsicFn -> case intrinsicFn exs' of
+                                                    Just result -> do
+                                                        trace $ "  intrinsic " ++ funcNm ++ " for " ++ firstType ++ " => " ++ pprSummary 40 result
+                                                        pure result
+                                                    Nothing ->
+                                                        if Prelude.length typeNames < Prelude.length exs'
+                                                        then do
+                                                            trace $ "  intrinsic " ++ funcNm ++ " args not ready, deferring"
+                                                            pure $ CLMIAP (CLMID funcNm) exs'
+                                                        else do
+                                                            trace $ "  intrinsic " ++ funcNm ++ " failed on args"
+                                                            pure $ CLMERR ("[RT] Intrinsic " ++ funcNm ++ " failed on args") SourceInteractive
+                                                Nothing -> dispatchInstance env funcNm typeNames exs'
+                                        Nothing -> do
+                                            -- can't determine type, return with evaluated args
+                                            trace $ "  could not infer type for " ++ funcNm
+                                            pure $ CLMIAP (CLMID funcNm) exs'
 -- CLMIAP with non-id function: evaluate the function first
 evalCLM i e@(CLMIAP ex exs) = do
     trace $ "[depth=" ++ show i ++ "] CLMIAP(eval func) " ++ pprSummary 60 e
@@ -503,20 +514,25 @@ dispatchInstance env funcNm typeNames exs' = do
     case lookupCLMInstance funcNm typeNames env of
         Just clmLam -> do
             trace $ "Found instance " ++ funcNm ++ " for " ++ show typeNames
-            pure $ applyCLMLam clmLam exs'
+            evalCLM 0 $ applyCLMLam clmLam exs'
         Nothing -> do
             -- try prefix-based lookup (for morphisms where arg types < all type params)
             case lookupCLMInstancePrefix funcNm typeNames env of
                 Just clmLam -> do
                     trace $ "Found prefix instance " ++ funcNm ++ " for " ++ show typeNames
-                    pure $ applyCLMLam clmLam exs'
+                    evalCLM 0 $ applyCLMLam clmLam exs'
                 Nothing -> do
-                    -- fall back to single-param (first arg only)
-                    let singleKey = [Prelude.head typeNames]
-                    case lookupCLMInstance funcNm singleKey env of
-                        Just clmLam -> do
-                            trace $ "Found single-param instance " ++ funcNm ++ " for " ++ show singleKey
-                            pure $ applyCLMLam clmLam exs'
+                    -- fall back to single-param: try each arg type until one matches
+                    -- (algebra methods may have non-algebra-type args first, e.g.,
+                    --  charCountStep(r:Maybe(..), count:Int, str:s) — the instance key is ["s"])
+                    let tryKeys [] = Nothing
+                        tryKeys (t:ts) = case lookupCLMInstance funcNm [t] env of
+                            Just clmLam -> Just (clmLam, t)
+                            Nothing -> tryKeys ts
+                    case tryKeys (nub typeNames) of
+                        Just (clmLam, matchedType) -> do
+                            trace $ "Found single-param instance " ++ funcNm ++ " for [\"" ++ matchedType ++ "\"]"
+                            evalCLM 0 $ applyCLMLam clmLam exs'
                         Nothing -> do
                             -- UNIVERSAL SHOW FALLBACK: for "show" on CLMCON / CLMARRAY values
                             case (funcNm, exs') of
@@ -872,7 +888,27 @@ dispatchReflectionIntrinsic "constructorByIndex" [CLMLIT (LString typeName), CLM
                         ++ " out of bounds for " ++ typeName) SourceInteractive
             _ -> pure $ Just $ CLMERR ("constructorByIndex: " ++ typeName ++ " has no constructors") SourceInteractive
         Nothing -> pure $ Just $ CLMERR ("constructorByIndex: type " ++ typeName ++ " not found") SourceInteractive
+-- intToByte(n): convert Int to Byte (truncating to low 8 bits)
+dispatchReflectionIntrinsic "intToByte" [CLMLIT (LInt n)] =
+    pure $ Just $ CLMLIT (LWord8 (fromIntegral n))
+-- byteToInt(b): convert Byte to Int (widening)
+dispatchReflectionIntrinsic "byteToInt" [CLMLIT (LWord8 w)] =
+    pure $ Just $ CLMLIT (LInt (fromIntegral w))
 dispatchReflectionIntrinsic _ _ = pure Nothing
+
+-- | Safe downcast intrinsic: __downcast("TargetClass", obj) -> Maybe(obj)
+-- Checks if obj's concrete class is targetClass or a subclass of it.
+-- Returns Just(obj) on success, Nothing on failure.
+dispatchDowncastIntrinsic :: Name -> [CLMExpr] -> IntState (Maybe CLMExpr)
+dispatchDowncastIntrinsic "__downcast" [CLMLIT (LString targetClass), obj@(CLMCON (ConsTag srcClass _) _)] = do
+    s <- get
+    let env = currentEnvironment s
+    if isSubclassOf srcClass targetClass env
+        then pure $ Just $ CLMCON (ConsTag "Just" 1) [obj]
+        else pure $ Just $ CLMCON (ConsTag "Nothing" 0) []
+dispatchDowncastIntrinsic "__downcast" [CLMLIT (LString _), _] =
+    pure $ Just $ CLMCON (ConsTag "Nothing" 0) []  -- non-object value → downcast fails
+dispatchDowncastIntrinsic _ _ = pure Nothing
 
 -- Closure-aware dispatch for Array higher-order functions.
 -- Called from CLMIAP eval path when args contain closures + arrays.
@@ -927,5 +963,37 @@ clmExprToString (CLMLIT (LString s)) = s
 clmExprToString (CLMLIT (LInt n)) = show n
 clmExprToString (CLMLIT (LFloat f)) = show f
 clmExprToString (CLMLIT (LChar c)) = [c]
+clmExprToString (CLMCON (ConsTag "Str" _) [CLMARRAY bytes, _]) = decodeUtf8CLM bytes
 clmExprToString (CLMCON (ConsTag nm _) []) = nm
 clmExprToString e = ppr e
+
+-- | Decode a CLM byte array (list of CLMLIT LWord8/LInt) to a Haskell String (UTF-8)
+decodeUtf8CLM :: [CLMExpr] -> String
+decodeUtf8CLM exprs =
+    let bytes = Prelude.map toByte exprs
+    in decodeUtf8Bytes bytes
+  where
+    toByte (CLMLIT (LWord8 w)) = w
+    toByte (CLMLIT (LInt n))   = fromIntegral n
+    toByte _                   = 0
+
+-- | Decode a list of UTF-8 bytes to a Haskell String
+decodeUtf8Bytes :: [Word8] -> String
+decodeUtf8Bytes [] = []
+decodeUtf8Bytes (b:bs)
+    | b <= 0x7F = chr (fromIntegral b) : decodeUtf8Bytes bs
+    | b .&. 0xE0 == 0xC0 = case bs of
+        (b1:rest) -> chr (((fromIntegral b .&. 0x1F) `shiftL` 6) .|. (fromIntegral b1 .&. 0x3F))
+                     : decodeUtf8Bytes rest
+        _ -> '?' : decodeUtf8Bytes bs
+    | b .&. 0xF0 == 0xE0 = case bs of
+        (b1:b2:rest) -> chr (((fromIntegral b .&. 0x0F) `shiftL` 12) .|. ((fromIntegral b1 .&. 0x3F) `shiftL` 6)
+                             .|. (fromIntegral b2 .&. 0x3F))
+                        : decodeUtf8Bytes rest
+        _ -> '?' : decodeUtf8Bytes bs
+    | b .&. 0xF8 == 0xF0 = case bs of
+        (b1:b2:b3:rest) -> chr (((fromIntegral b .&. 0x07) `shiftL` 18) .|. ((fromIntegral b1 .&. 0x3F) `shiftL` 12)
+                                .|. ((fromIntegral b2 .&. 0x3F) `shiftL` 6) .|. (fromIntegral b3 .&. 0x3F))
+                           : decodeUtf8Bytes rest
+        _ -> '?' : decodeUtf8Bytes bs
+    | otherwise = '?' : decodeUtf8Bytes bs

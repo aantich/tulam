@@ -96,6 +96,16 @@ Double-quoted string literals:
 
 Standard escape sequences are supported (e.g., `\"`, `\\`, `\n`).
 
+**String Literal Desugaring** (when `:s newstrings on`): String literals are desugared at compile time (Pass 0.25) into `Str` constructor calls with UTF-8 encoded byte arrays:
+
+```
+"Hello" → Str([0x48, 0x65, 0x6C, 0x6C, 0x6F], 5)
+```
+
+The `Str` type is a pure tulam record: `record Str = { bytes: Array(Byte), byteLen: Int }`. The `StringLike` algebra provides universal string operations. See the `FromString` algebra in `lib/String/FromString.tl` for the overloading mechanism.
+
+When `newstrings` is off (default), string literals pass through as `primitive String` with existing intrinsic-backed operations.
+
 ### Lists
 
 Square brackets with comma-separated elements:
@@ -599,6 +609,7 @@ expr as TargetType
 The compiler resolves the direction automatically:
 - If `TargetType` is a user type (left-hand side of some `repr`) → calls `fromRepr(expr)`
 - If `TargetType` is a repr type (right-hand side of some `repr`) → calls `toRepr(expr)`
+- If `TargetType` is a class name → performs a **safe downcast**, returning `Maybe(TargetType)`. Returns `Just(obj)` if the object's concrete class is `TargetType` or a subclass; `Nothing` otherwise.
 
 **Examples:**
 
@@ -607,6 +618,18 @@ The compiler resolves the direction automatically:
 2
 > (5 as Nat)
 Succ(Succ(Succ(Succ(Succ(Z)))))
+```
+
+**Class downcast example:**
+
+```
+class Animal(name:String, age:Int) = { ... };
+class Dog(breed:String) extends Animal = { ... };
+
+> match (Dog.new("Rex", 5, "Lab") as Dog) | Just(d) -> d.breed | Nothing -> "fail"
+"Lab"
+> match (Animal.new("X", 1) as Dog) | Just(d) -> d.breed | Nothing -> "not a dog"
+"not a dog"
 ```
 
 The `toRepr` and `fromRepr` functions are also callable directly:
@@ -624,6 +647,19 @@ Succ(Succ(Succ(Z)))
 - Each function is also stored as an instance lambda: `toRepr` keyed by the user type name, `fromRepr` keyed by the repr type name. This ensures type-directed dispatch finds the right implementation.
 - `ReprCast` in `exprToCLM` checks `reprMap` to determine direction and emits the appropriate `CLMIAP` node.
 - Multiple repr mappings for the same user type are supported (different target types). The `default` flag marks the preferred one for unambiguous casts.
+
+### Parameterized Repr
+
+The `repr` declaration supports parameterized types as the user type. This enables representation mappings for generic types like `Array(Byte)`:
+
+```
+repr Array(Byte) as PackedBytes where {
+    function toRepr(a:Array(Byte)) : PackedBytes = ...,
+    function fromRepr(p:PackedBytes) : Array(Byte) = ...
+};
+```
+
+Parameterized types use qualified keys internally (e.g., `"Array\0Byte"`) following the same `\0`-separator pattern as instance lambda keys. Simple types like `repr Nat as Int` remain backward-compatible (key is just `"Nat"`).
 
 ### `as` is a Reserved Word
 
@@ -1775,12 +1811,15 @@ The `lib/` directory contains the modular standard library:
 | `lib/Collection/` | Collection types and operations |
 | `lib/SIMD/` | SIMD vector types and Lane algebra |
 | `lib/Repr/` | Representation mappings |
+| `lib/String/` | Pure tulam string library (Str, UTF-8 codec, StringLike) |
+| `lib/Effect/` | Effect system (Console, FileIO, State, Exception) |
+| `lib/Mutable/` | Managed mutability (Ref, MutArray) |
 
 ---
 
 ## Standard Library (prelude.tl + base.tl)
 
-> **Full API Reference:** See [doc/StandardLibrary.md](StandardLibrary.md) for auto-generated documentation of all 59 standard library modules, including every type, algebra, function, instance, and effect with doc comments.
+> **Full API Reference:** See [doc/StandardLibrary.md](StandardLibrary.md) for auto-generated documentation of all 69 standard library modules, including every type, algebra, function, instance, and effect with doc comments.
 
 The standard library is loaded automatically when you start the REPL. It consists of two files loaded in order:
 
@@ -1945,6 +1984,37 @@ instance Eq(Int) = intrinsic;       instance Ord(Int) = intrinsic;
 instance Eq(Float64) = intrinsic;   instance Ord(Float64) = intrinsic;
 instance Eq(String) = intrinsic;    instance Ord(String) = intrinsic;
 ```
+
+#### Pure String Library (`lib/String/`)
+
+The pure tulam string library provides a `Str` type backed by UTF-8 encoded byte arrays:
+
+```
+record Str = { bytes: Array(Byte), byteLen: Int };
+```
+
+The `StringLike` algebra defines universal string operations:
+
+```
+algebra StringLike(s:Type) extends Eq(s), Ord(s), Monoid(s) = {
+    function byteLength(s:s) : Int,
+    function strSlice(s:s, start:Int, end:Int) : s,
+    function strDecodeAt(s:s, byteOffset:Int) : Maybe(Pair(Char, Int)),
+    function strIndexOf(haystack:s, needle:s) : Int,
+    function strFromChar(c:Char) : s
+    // ... plus ~25 defaulted methods: strStartsWith, strEndsWith,
+    // charCount, nthChar, strSplit, strJoin, strReplace, etc.
+};
+```
+
+**Modules:**
+- `String.Utf8` — UTF-8 codec (pure bitwise math)
+- `String.Str` — Str record type + constructors
+- `String.Instances` — StringLike(Str) implementation
+- `String.Ops` — Generic high-level string operations
+- `String.Algebras` — Eq/Ord/Semigroup/Monoid for Str
+- `String.FromString` — FromString algebra for string literal overloading
+- `Algebra.StringLike` — Universal string contract
 
 #### Core Types
 
@@ -2170,6 +2240,20 @@ opaque type Handle = MkHandle(Int);
 ```
 
 Pattern match cases use `|` as a separator/prefix and do not require commas or semicolons between them.
+
+---
+
+## Interop Pattern
+
+tulam uses an **algebra-based interop pattern** for cross-platform native integration. Three existing language features compose together:
+
+1. **Algebra** — defines the behavioral contract (e.g., `StringLike`, `MapLike`)
+2. **Repr** — bridges data between pure and native representations
+3. **Target-qualified extern instances** — maps algebra methods to native platform methods
+
+For each algebra call site, the compiler can choose: use native (if value already in native repr), convert + use native (insert toRepr at boundary), or use pure tulam (reference implementation). This applies to strings, collections, IO, date/time, concurrency, and any domain where native platforms have optimized implementations.
+
+See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 
 ---
 

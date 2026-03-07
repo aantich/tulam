@@ -281,7 +281,7 @@ pPrimitive = do
 pRepr :: Parser Expr
 pRepr = do
     reserved "repr"
-    userType <- uIdentifier
+    userTypeExpr <- pReprUserType
     reserved "as"
     reprType <- concreteType
     isDefault <- option False (reserved "default" >> return True)
@@ -290,7 +290,16 @@ pRepr = do
         funcs <- sepBy1 (try pFunc) (reservedOp ",")
         inv <- optionMaybe (try (reservedOp "," >> pReprInvariant))
         return (funcs, inv)
-    return $ Repr userType reprType isDefault fns inv
+    return $ Repr userTypeExpr reprType isDefault fns inv
+
+-- Parse user type in repr declaration: either "Name" or "Name(Arg1, Arg2, ...)"
+pReprUserType :: Parser Expr
+pReprUserType = do
+    name <- uIdentifier
+    margs <- optionMaybe (parens (sepBy1 concreteType (reservedOp ",")))
+    case margs of
+        Nothing   -> return $ Id name
+        Just args -> return $ App (Id name) args
 
 pReprInvariant :: Parser Expr
 pReprInvariant = do
@@ -379,11 +388,14 @@ pFuncHeader = do
     pos <- getPosition
     reserved "function"
     name <- try identifier <|> (parens operator)
+    -- Optional implicit type params in brackets: function foo [s:Type] (x:s) : Int
+    implicitArgs <- option [] (try (brackets (sepBy pVar (reservedOp ","))))
     args <- try pVars <|> pure []
     tp <- typeSignature
+    let implicitArgs' = map (\v -> v { typ = Implicit (typ v) }) implicitArgs
     return Lambda {
        lamName    = name
-     , params = args
+     , params = implicitArgs' ++ args
      , body       = UNDEFINED
      , lamType    = tp
      , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
@@ -535,11 +547,13 @@ pPatternMatch :: Lambda -> Parser Expr
 pPatternMatch lam = do
     pos <- getPosition
     ex1 <- sepBy1 pInsideLeftPattern (reservedOp ",")
-    if (length (params lam) /= (length ex1) )
+    -- Filter out implicit type params — they don't participate in pattern matching
+    let valueParams = filter (not . isImplicitParam) (params lam)
+    if (length valueParams /= (length ex1) )
     then parserFail $
             "\nWrong number of arguments in a pattern match in a function:\n\n"
             ++ (ppr lam) ++ "\n\nThe function expects "
-            ++ show (length (params lam)) ++ " arguments "
+            ++ show (length valueParams) ++ " arguments "
             ++ "but was given " ++ show (length ex1)
             ++ " in the pattern match shown above."
     else
@@ -552,8 +566,11 @@ pPatternMatch lam = do
         -- Since Parser has no context, we make a straightforward conversion:
         -- f(x:t1,y:t2) = match | a, b -> expr gets converted into
         -- CaseOf [Var "x" t1 a, Var "y" t2 b] expr
-        let bnd = zipWith (\arg pat -> arg {val = pat} ) (params lam) ex1
+        let bnd = zipWith (\arg pat -> arg {val = pat} ) valueParams ex1
         return $ CaseOf bnd ex2 (SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) "")
+  where
+    isImplicitParam (Var _ (Implicit _) _) = True
+    isImplicitParam _ = False
 
     
     

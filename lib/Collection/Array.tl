@@ -72,3 +72,22 @@ algebra ArrayHOF(a:Type) = {
 
 /// ArrayHOF backed by intrinsics.
 instance ArrayHOF(Array) = intrinsic;
+
+/// Element access by index (0-based).
+/// @param arr The array
+/// @param i Index
+/// @returns Element at index i
+function index(arr:Array(a), i:Int) : a = intrinsic;
+
+/// Extract a subarray by range [start, end).
+/// @param arr The array
+/// @param start Start index (inclusive)
+/// @param end End index (exclusive)
+/// @returns The subarray
+function slice(arr:Array(a), start:Int, end:Int) : Array(a) = intrinsic;
+
+/// Generate a range of integers [start, end).
+/// @param start Start value (inclusive)
+/// @param end End value (exclusive)
+/// @returns Array of integers
+function range(start:Int, end:Int) : Array(Int) = intrinsic;

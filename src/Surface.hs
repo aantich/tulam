@@ -166,8 +166,9 @@ data Expr =
   | Primitive Lambda -- primitive type declaration: primitive Int;
   | Intrinsic        -- intrinsic body marker for functions/instances
   | Derive           -- derive marker for auto-derived instances
-  | Repr Name Expr Bool [Expr] (Maybe Expr)
-    -- Repr userTypeName reprType isDefault [toRepr, fromRepr] maybeInvariant
+  | Repr Expr Expr Bool [Expr] (Maybe Expr)
+    -- Repr userTypeExpr reprType isDefault [toRepr, fromRepr] maybeInvariant
+    -- userTypeExpr is Id "Name" for simple types, App (Id "Name") [args] for parameterized
   | ReprCast Expr Expr
     -- ReprCast exprToCast targetType (desugars to toRepr/fromRepr call)
   | RecordLit [(Name, Expr)]    -- Record literal: {x = 1, y = 2}
@@ -264,7 +265,7 @@ traverseExpr _ PrimCall = PrimCall
 traverseExpr _ e@(Primitive _) = e
 traverseExpr _ Intrinsic = Intrinsic
 traverseExpr _ Derive = Derive
-traverseExpr f (Repr nm tp def fns inv) = Repr nm (f $ traverseExpr f tp) def (map (f . traverseExpr f) fns) (fmap (f . traverseExpr f) inv)
+traverseExpr f (Repr userTp tp def fns inv) = Repr (f $ traverseExpr f userTp) (f $ traverseExpr f tp) def (map (f . traverseExpr f) fns) (fmap (f . traverseExpr f) inv)
 traverseExpr f (ReprCast e tp) = ReprCast (f $ traverseExpr f e) (f $ traverseExpr f tp)
 traverseExpr f (RecordLit fields) = RecordLit (map (\(n,e) -> (n, f $ traverseExpr f e)) fields)
 traverseExpr f (RecordType fields isOpen) = RecordType (map (\(n,e) -> (n, f $ traverseExpr f e)) fields) isOpen
@@ -344,6 +345,11 @@ hasImplicit lam = case params lam of
     (Var _ (Implicit _) _):_ -> True
     _ -> False
 
+-- | Check if a Var has an Implicit type wrapper
+isImplicitVar :: Var -> Bool
+isImplicitVar (Var _ (Implicit _) _) = True
+isImplicitVar _ = False
+
 -- getting "default" case from inside any function that has cases:
 getDefaultCase :: Lambda -> Expr
 getDefaultCase lam = case body lam of
@@ -420,7 +426,7 @@ instance PrettyPrint Expr where
   ppr (Primitive lam) = (as [bold,magenta] "primitive ") ++ ppr lam
   ppr Intrinsic = as [bold,cyan] "intrinsic"
   ppr Derive = as [bold,cyan] "derive"
-  ppr (Repr nm tp def fns inv) = (as [bold,magenta] "repr ") ++ nm ++ " as " ++ ppr tp
+  ppr (Repr nm tp def fns inv) = (as [bold,magenta] "repr ") ++ ppr nm ++ " as " ++ ppr tp
     ++ (if def then " default" else "") ++ " where { " ++ showListPlainSep ppr ", " fns ++ " }"
   ppr (ReprCast e tp) = ppr e ++ " as " ++ ppr tp
   ppr (RecordLit fields) = "{" ++ showListPlainSep (\(n,e) -> n ++ " = " ++ ppr e) ", " fields ++ "}"

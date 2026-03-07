@@ -44,8 +44,10 @@ primitive Float64;
 -- Text and bytes
 primitive Char;        -- Unicode scalar value
 primitive Byte;        -- raw byte (unsigned 8-bit)
-primitive String;      -- UTF-8 string (opaque, not a list of chars)
+primitive String;      -- UTF-8 string (opaque, compiler-internal literal carrier)
 ```
+
+**Note on Strings:** `primitive String` is retained as the compiler-internal string literal type. The user-facing string type is `Str` (a pure tulam record: `record Str = { bytes: Array(Byte), byteLen: Int }`). When `:s newstrings on`, string literals desugar to `Str` constructor calls. The `StringLike` algebra provides universal string operations, and `FromString` enables string literal overloading. See `lib/String/` and `doc/InteropPattern.md`.
 
 After declaration, a primitive type is used identically to any user-defined type. `Int` is just a type name — no magic syntax anywhere it appears.
 
@@ -437,7 +439,20 @@ If no `default` is specified and only one repr exists, it is implicitly default.
 
 4. **Invariant checking**: In debug/safe mode, `invariant` is checked at `fromRepr` boundaries. In release mode, it's elided.
 
-### 5.5 The `as` Expression — Explicit Repr Casts
+### 5.5 Parameterized Repr
+
+The `repr` declaration supports parameterized types as the user type:
+
+```tulam
+repr Array(Byte) as PackedBytes where {
+    function toRepr(a:Array(Byte)) : PackedBytes = ...,
+    function fromRepr(p:PackedBytes) : Array(Byte) = ...
+};
+```
+
+This enables representation mappings for generic types. The compiler uses qualified keys internally (e.g., `"Array\0Byte"`) following the same `\0`-separator pattern as instance lambda keys.
+
+### 5.6 The `as` Expression — Explicit Repr Casts
 
 ```tulam
 let packed : UInt32 = myColor as UInt32;   -- explicit repr conversion

@@ -274,6 +274,7 @@ fromIntEntries =
     , (mkKey "fromInt" "Int32",  fromIntTo LInt32 fromIntegral)
     , (mkKey "fromInt" "Int64",  fromIntTo LInt64 fromIntegral)
     , (mkKey "fromInt" "UInt8",  fromIntTo LWord8 fromIntegral)
+    , (mkKey "fromInt" "Byte",   fromIntTo LWord8 fromIntegral)
     , (mkKey "fromInt" "UInt16", fromIntTo LWord16 fromIntegral)
     , (mkKey "fromInt" "UInt32", fromIntTo LWord32 fromIntegral)
     , (mkKey "fromInt" "UInt64", fromIntTo LWord64 fromIntegral)
@@ -316,6 +317,14 @@ conversionEntries =
     -- Cross-sign
     , mkConv "Int" "UInt64" extractInt (LWord64 . fromIntegral)
     , mkConv "UInt64" "Int" extractWord64 (LInt . fromIntegral)
+    -- Byte <-> Int
+    , mkConv "Int" "Byte" extractInt (LWord8 . fromIntegral)
+    , mkConv "Byte" "Int" extractWord8 (LInt . fromIntegral)
+    , (mkKey "toInt" "Byte", byteToInt)
+    , (mkKey "byteToInt" "Byte", byteToInt)
+    , (mkKey "byteToInt" "Int", byteToInt)    -- also handle when arg is LInt (from array index)
+    , (mkKey "intToByte" "Int", intToByte)
+    , (mkKey "intToByte" "Byte", intToByte)   -- also handle when arg is LWord8
     -- Legacy compat
     , (mkKey "toFloat" "Int",  legacyToFloat)
     , (mkKey "toInt" "Float64", legacyToInt)
@@ -338,6 +347,16 @@ legacyToFloat _ = Nothing
 legacyToInt :: IntrinsicFn
 legacyToInt [CLMLIT (LFloat f)] = Just $ CLMLIT (LInt (truncate f))
 legacyToInt _ = Nothing
+
+byteToInt :: IntrinsicFn
+byteToInt [CLMLIT (LWord8 w)] = Just $ CLMLIT (LInt (fromIntegral w))
+byteToInt [CLMLIT (LInt n)]   = Just $ CLMLIT (LInt n)  -- identity when already Int
+byteToInt _ = Nothing
+
+intToByte :: IntrinsicFn
+intToByte [CLMLIT (LInt n)] = Just $ CLMLIT (LWord8 (fromIntegral n))
+intToByte [CLMLIT (LWord8 w)] = Just $ CLMLIT (LWord8 w)  -- identity when already Byte
+intToByte _ = Nothing
 
 -- ============================================================================
 -- String operations

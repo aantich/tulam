@@ -39,7 +39,7 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 **What works:** Parsing sum types, functions with pattern matching, structures (typeclasses), instance declarations, actions, records with spread syntax, if/then/else, let/in, algebra/morphism/trait/bridge keywords, structure inheritance (extends), value declarations, law declarations, primitive type declarations, intrinsic instances, **anonymous lambdas** (`\x -> expr`), **first-class functions** (functions as values, passed to/returned from other functions), **common ADTs** (Maybe, Either, List with utility functions and Semigroup/Monoid instances), **combinators** (id, const, apply, compose, flip), **automated morphism composition** (transitive instances auto-derived with cycle detection), **parameterized type instances** (e.g., `Semigroup(List(a))`), **unary minus** (`-3` dispatches to `negate`), **Floating math** (sqrt, sin, cos, tan, exp, log, asin, acos, atan, pow, pi), **Bits algebra** (.&., .|., xor, complement, shiftL, shiftR, bitSize for Int), **String operations** (concat, length, Eq/Ord for String), **Int↔Float64 conversions** (toFloat, toInt, recip), **repr system** (`repr UserType as ReprType [default] where { ... }` + `expr as Type` casting), **higher-kinded types** (Functor, Applicative, Monad algebras on Type1 with instances for Maybe and List — `fmap(not, Just(True))` → `Just(False)`, `bind(Just(x), f)` → `f(x)`, List monad flatMap), **module system** (module/import/export/open/private/opaque with dependency resolution), **expanded numeric primitives** (Int8-64, UInt8-64, Float32 with full intrinsic support), **arrays** (Array(a) with length/index/slice), **SIMD type declarations** (Vec2/4/8/16 with Lane algebra stubs). Environment building handles types, constructors, lambdas, instance-specialized functions, primitive types, intrinsic expansion, morphism composition, repr registration, and module resolution. Case optimization expands patterns into constructor tag checks. CLM conversion produces simply-typed IR, including repr cast direction resolution and CLMARRAY. Interpreter evaluates: function application (including first-class), constructor matching, field access, literals, action sequences, pattern match cases, **implicit parameter dispatch** (CLMIAP) with intrinsic-first lookup (including nullary intrinsics) and partial type inference for HKT dispatch, partial application (CLMPAP), and lambda values (CLMLAM).
 
-**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion COMPLETE.** 449 automated hspec tests all passing.
+**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion + Phase 13.3 (Type-Test Patterns + Downcast) + Phase 13.6 (TC Subtyping) COMPLETE.** 628 automated hspec tests all passing.
 
 **Type-Directed Dispatch (Phase 10.3 completed):**
 - `CLMTYPED` wrapper annotates CLMIAP bodies with return type hints during CLM conversion (Pass 4)
@@ -1328,10 +1328,12 @@ Gated by `UnsafeMemory` effect — sandboxable at module boundaries.
 - Extern classes not available in interpreter (by design); will be populated by codegen backends
 - **Test:** `tests/programs/P23_ExternClasses.tl` (3 tests)
 
-### Phase 13.3: Type-Test Patterns + Downcast (Milestone 3)
+### Phase 13.3: Type-Test Patterns + Downcast (Milestone 3) ✅ DONE
 
-- Type-test patterns: `match a | Dog(_, _, breed) -> ... | Cat() -> ... | _ -> ...`
-- Downcast via `as` → `Maybe`: extend `ReprCast` resolution to check `classDecls` hierarchy
+- Type-test patterns: `match a | Dog(_, _, breed) -> ... | Cat() -> ... | _ -> ...` — works via function-level pattern matching (class constructors registered in constructors map with ConsTag)
+- Safe downcast via `as`: `obj as ClassName` → `Maybe(ClassName)`. Extends `ReprCast` CLM conversion to emit `CLMIAP "__downcast" [CLMLIT targetClass, obj]` when target is a class. `dispatchDowncastIntrinsic` in Interpreter.hs checks `isSubclassOf` and returns `Just(obj)` or `Nothing`
+- TC: `infer (ReprCast e tp)` returns `TApp (TCon "Maybe") [targetTy]` when target is a class type
+- **Test:** `tests/programs/P24_ClassSubtyping.tl` (9 tests: pattern matching, subtype passing, safe downcast success/failure)
 
 ### Phase 13.4: Extern Class Resolution (Milestone 4)
 
@@ -1342,12 +1344,25 @@ Gated by `UnsafeMemory` effect — sandboxable at module boundaries.
 - Subclassing extern classes works automatically (processBinding already handles it)
 - Super calls across tulam/extern boundary
 
-### Phase 13.6: Type Checker Integration
+### Phase 13.6: Type Checker Integration ✅ DONE
 
-- Subtype judgments in `unify`/`check`: walk `cmParent` chain via `isSubclassOf`
-- Implicit upcast insertion when subtype matches expected supertype
-- Override signature checking (covariant return, parameter compatibility)
-- Sealed exhaustiveness checking
+**Completed:**
+- `tcWarnOrFail` helper respects `tcMode` (strict=fatal, relaxed=warning)
+- Error context tracking (`WithContext`, `tcWithContext`) for better error messages
+- `TForall` alpha-renaming in unification (proper structural comparison with rigid vars)
+- `TRigid` unification case (same-name rigid vars unify)
+- Catch-all warnings in `infer`, `exprToTy`, unbound var emission
+- Reduced `exprToTy` catch-all surface (declaration forms, compound App, Function, ConTuple)
+- Recursive function self-binding in `inferLambda`
+- `checkTopLevel (ClassDecl ...)`: field type validation, method body checking with `self` in scope
+- Override signature checking (type comparison of overridden methods vs parent)
+- Constructor arity checking for `ClassName.new(args)` (via `lookupClass`/`cmAllFields`)
+- Abstract class instantiation prevention
+- Implements contract validation (checks algebra method list against class methods, respects derive blocks)
+- **Subtype checking**: `subtype :: Ty -> Ty -> TC ()` walks class hierarchy via `isSubclassOf`. `SubtypeMismatch` error variant. Wired into `check` subsumption fallback (unify first, then subtype).
+- **Implicit upcast**: `check` accepts subclass where superclass expected — no runtime coercion needed (Dog and Animal share CLMCON representation)
+- **Class downcast type inference**: `infer (ReprCast e tp)` returns `Maybe(ClassName)` when target is a class
+- 628 tests passing
 
 ### Key Dependencies
 - Phase 10 (Reflection + Derive) — needed for `derive` on classes
@@ -1476,6 +1491,74 @@ The `<1, 2, 3>` angle-bracket syntax currently parses to `Lit (LVec [exprs])` bu
 2. **SIMD vector literal** — `Vec4(Float32)` etc., register-width, for math-heavy inner loops
 
 This requires the type checker (Phase 11) to resolve. Implementation deferred until then. For now, `LVec` is parsed and stored but not evaluable.
+
+---
+
+## Phase 14: Pure String Library + Algebra-Based Interop Pattern (COMPLETE)
+
+**Goal:** Build a pure-tulam string library that replaces primitive String with a proper byte-array-backed Str type, demonstrating the algebra-based interop pattern where all string operations flow through algebras rather than hardcoded intrinsics.
+
+**Test count:** 669 (was 628 before Phase 14)
+
+### Phase 14.1: Pure Tulam String Library (COMPLETE)
+
+New standard library modules for string processing:
+- `lib/Algebra/StringLike.tl` — Universal string contract: 5 core methods + ~25 default methods derived from them
+- `lib/String/Utf8.tl` — UTF-8 codec implemented in pure bitwise math (no intrinsics)
+- `lib/String/Str.tl` — `Str` record type (byte array + cached length)
+- `lib/String/Instances.tl` — `StringLike(Str)` 5 core method implementations
+- `lib/String/Ops.tl` — `charCount`, `nthChar` (generic StringLike operations)
+- `lib/String/Algebras.tl` — `Eq`/`Ord`/`Semigroup`/`Monoid` instances for `Str`
+- `lib/String/FromString.tl` — `FromString` algebra + `Str` instance
+- `lib/Repr/Char.tl` — `repr Char as Int` (disabled: key collision with `Repr.Nat`)
+- `tests/programs/P25_Strings.tl` — 28 tests
+
+**Interpreter fixes:**
+- `dispatchInstance` evaluation: found-instance branches must `evalCLM` results (not catch-all — `CLMTYPED` needs unevaluated form)
+- Multi-type single-param dispatch: must try all arg types, not just first (algebra methods may have non-algebra-type first params)
+- Byte intrinsics added for low-level operations
+
+### Phase 14.2: FromString Algebra + Literal Desugaring (COMPLETE)
+
+String literal desugaring transforms `"hello"` into `Str` constructor calls at compile time:
+- `src/Pipeline.hs` — String literal desugaring pass (Pass 0.25): `"hello"` becomes `Str([0x68,...], 5)`
+- `src/Interpreter.hs` — IO bridge: `putStrLn`/`putStr` decode `Str` byte arrays to Haskell strings
+- `src/State.hs` — `newStrings` flag in `CurrentFlags`
+- `app/Main.hs` — `:s newstrings on/off` toggle
+- `src/ModuleSystem.hs` — Pass 0.25 integrated into pipeline
+- `tests/programs/P26_StringDesugar.tl` — 10 tests
+
+**Design decision:** String literal desugaring produces `Str` constructor directly (not `fromStringLiteral`) to avoid type-directed dispatch complexity at this stage.
+
+### Phase 14.3: Parameterized Repr (COMPLETE)
+
+Extends the repr system to support parameterized types (e.g., `repr Array(Int) as ...`):
+- `src/Parser.hs` — `pReprUserType` allows type expressions like `Array(Int)`
+- `src/Surface.hs` — Repr AST: `Name` changed to `Expr` for user type position
+- `src/State.hs` — `mkReprKey` builds qualified keys (`Array\0Int`)
+- `src/Pipeline.hs` — `processBinding` uses `mkReprKey`, `exprToCLM` `ReprCast` uses `mkReprKey`
+- `tests/programs/P27_ParamRepr.tl` — 3 tests
+
+**Key insight:** Parameterized repr uses qualified keys with `\0` separator (same pattern as instance keys).
+
+### Phase 14.4: Documentation (COMPLETE)
+
+- `doc/InteropPattern.md` — New design document describing the algebra-based interop pattern
+- `doc/ImplementationPlan.md` — This phase added
+- `doc/LanguageReference.md` — Updated with new string library and parameterized repr
+
+### Key Learnings
+
+- **dispatchInstance must evalCLM results** in found-instance branches (not catch-all — `CLMTYPED` needs unevaluated form for type-directed dispatch)
+- **Single-param dispatch must try all arg types**, not just the first argument (algebra methods may have non-algebra-type first params, e.g., `charAt(s:Str, i:Int)`)
+- **String literal desugaring produces Str constructor directly** rather than going through `fromStringLiteral` to avoid type-directed dispatch complexity
+- **Parameterized repr uses qualified keys** with `\0` separator, following the same pattern as multi-param instance keys
+
+### Key Dependencies
+- Phase 4 (primitive types, intrinsics) — byte-level operations
+- Phase 5 (repr system) — parameterized repr extension
+- Phase 9.7 (managed mutability) — `MutArray` for efficient byte array building
+- Phase 10 (reflection + derive) — derive blocks for `Eq`/`Ord`/`Show` on `Str`
 
 ---
 

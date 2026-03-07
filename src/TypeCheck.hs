@@ -12,16 +12,17 @@ module TypeCheck
     -- * Core operations
   , runTC, freshTyVar, freshRowVar
   , exprToTy
-    -- * Unification
-  , unify, applySubst
+    -- * Unification & Subtyping
+  , unify, applySubst, subtype
     -- * Bidirectional checking
   , infer, check
     -- * Polymorphism
   , instantiate, generalize, substTyVar
     -- * Internal helpers (for testing)
-  , tcBind, tcPure, tcWarn, tcTry, tcLocal
-  , checkTopLevel, buildTCEnvFromEnvironment, inferLambda
-  , resolveConstraints, showTCError
+  , tcBind, tcPure, tcWarn, tcWarnOrFail, tcTry, tcLocal, tcWithContext, tcFail
+  , checkTopLevel, buildTCEnvFromEnvironment, inferLambda, lamToTy
+  , resolveConstraints, showTCError, showExprBrief, showTy, showRow
+  , tyToName, bindRow
     -- * Pipeline integration
   , typeCheckPass
   ) where
@@ -93,6 +94,8 @@ data TCError
   | ArityMismatch Int Int      -- ^ Expected vs actual argument count
   | ConstraintUnsolved Constraint -- ^ Unresolved structure constraint
   | OtherError String          -- ^ Generic error
+  | WithContext String TCError  -- ^ Error with location context
+  | SubtypeMismatch Ty Ty      -- ^ Subtype relationship doesn't hold
   deriving (Show)
 
 data Constraint
@@ -113,6 +116,7 @@ data TCEnv = TCEnv
   { varTypes    :: HashMap Name Ty            -- ^ Local variable types (gamma context)
   , tyVarScope  :: [Name]                     -- ^ In-scope type variables
   , envCompiler :: Maybe Environment          -- ^ Compiler environment for lookups
+  , tcContext   :: [String]                   -- ^ Error context stack (e.g., "function 'foo'")
   }
 
 initTCState :: TCMode -> TCState
@@ -130,6 +134,7 @@ emptyTCEnv = TCEnv
   { varTypes    = Map.empty
   , tyVarScope  = []
   , envCompiler = Nothing
+  , tcContext   = []
   }
 
 -- | The TC monad: state over TCState, with environment passed explicitly.
@@ -164,12 +169,26 @@ tcAsk env st = Right (env, st)
 tcLocal :: (TCEnv -> TCEnv) -> TC a -> TC a
 tcLocal f ma env st = ma (f env) st
 
+-- | Run a TC action with added context for error messages
+tcWithContext :: String -> TC a -> TC a
+tcWithContext ctx = tcLocal (\env -> env { tcContext = ctx : tcContext env })
+
 tcFail :: TCError -> TC a
 tcFail err _env _st = Left [err]
 
 -- | Record a non-fatal error and continue
 tcWarn :: TCError -> TC ()
 tcWarn err _env st = Right ((), st { tcErrors = err : tcErrors st })
+
+-- | Warn in relaxed mode, fail in strict mode. Attaches context if available.
+tcWarnOrFail :: TCError -> TC ()
+tcWarnOrFail err env st =
+  let wrapped = case tcContext env of
+        []      -> err
+        (ctx:_) -> WithContext ctx err
+  in case tcMode st of
+    TCStrict  -> Left [wrapped]
+    TCRelaxed -> Right ((), st { tcErrors = wrapped : tcErrors st })
 
 tcMapM :: (a -> TC b) -> [a] -> TC [b]
 tcMapM _ [] = tcPure []
@@ -232,6 +251,12 @@ exprToTy (Id name) = do
          else tcPure (TRigid name)  -- assume type variable even if not in scope
   where
     isUpper c = c >= 'A' && c <= 'Z'
+-- PropEqT(A, x, y) → TId (must be before general App (Id name) case)
+exprToTy (App (Id "PropEqT") [tyExpr, lhs, rhs]) =
+  exprToTy tyExpr `tcBind` \t ->
+    exprToTy lhs `tcBind` \l ->
+      exprToTy rhs `tcBind` \r ->
+        tcPure (TId t l r)
 exprToTy (App (Id name) args) =
   tcMapM exprToTy args `tcBind` \tyArgs ->
     tcPure (TApp (TCon name) tyArgs)
@@ -248,12 +273,6 @@ exprToTy (Tuple exprs) =
       []  -> tcPure (TCon "Unit")
       [t] -> tcPure t
       _   -> tcPure (Prelude.foldr1 TProd tys)
--- PropEqT(A, x, y) → TId
-exprToTy (App (Id "PropEqT") [tyExpr, lhs, rhs]) =
-  exprToTy tyExpr `tcBind` \t ->
-    exprToTy lhs `tcBind` \l ->
-      exprToTy rhs `tcBind` \r ->
-        tcPure (TId t l r)
 -- Record type: {x:Int, y:Bool, ..}
 exprToTy (RecordType fields isOpen) =
   tcMapM (\(n, tpExpr) -> exprToTy tpExpr `tcBind` \ty -> tcPure (n, ty)) fields `tcBind` \typedFields ->
@@ -266,8 +285,32 @@ exprToTy (EffType rowExpr resultExpr) =
   exprToEffRow rowExpr `tcBind` \row ->
     exprToTy resultExpr `tcBind` \resTy ->
       tcPure (TEffect row resTy)
--- Fallback: if we can't convert, use a fresh variable
-exprToTy _ = freshTyVar
+-- General App (non-Id head)
+exprToTy (App e args) =
+  exprToTy e `tcBind` \headTy ->
+    tcMapM exprToTy args `tcBind` \tyArgs ->
+      tcPure (TApp headTy tyArgs)
+-- Function in type position → arrow type
+exprToTy (Function lam) = lamToTy lam
+-- ConTuple in type position
+exprToTy (ConTuple (ConsTag cname _) args) =
+  tcMapM exprToTy args `tcBind` \tyArgs ->
+    tcPure (TApp (TCon cname) tyArgs)
+-- Known declaration forms — not types, skip silently
+exprToTy (ModuleDecl _) = freshTyVar
+exprToTy (Import _ _ _) = freshTyVar
+exprToTy (Export _ _) = freshTyVar
+exprToTy (PrivateDecl _) = freshTyVar
+exprToTy (SumType _) = freshTyVar
+exprToTy (Structure _ _) = freshTyVar
+exprToTy (Instance _ _ _ _) = freshTyVar
+exprToTy (ClassDecl _ _) = freshTyVar
+exprToTy Intrinsic = freshTyVar
+exprToTy Derive = freshTyVar
+-- Fallback: if we can't convert, use a fresh variable with warning
+exprToTy e =
+  tcWarn (OtherError $ "Cannot convert to type: " ++ showExprBrief e)
+    `tcBind` \_ -> freshTyVar
 
 -- | Convert an effect row expression to a Row
 exprToEffRow :: Expr -> TC Row
@@ -378,6 +421,7 @@ unify t1 t2 =
 unify' :: Ty -> Ty -> TC ()
 unify' (TVar v) t = bind v t
 unify' t (TVar v) = bind v t
+unify' (TRigid a) (TRigid b) | a == b = tcPure ()
 unify' (TCon a) (TCon b) | a == b = tcPure ()
 unify' (TU n) (TU m) | n == m = tcPure ()
 unify' (TPi _ a1 r1) (TPi _ a2 r2) =
@@ -394,8 +438,15 @@ unify' (TRecord r1) (TRecord r2) = unifyRows r1 r2
 unify' (TEffect r1 t1) (TEffect r2 t2) =
   unifyRows r1 r2 `tcBind` \_ -> unify t1 t2
 unify' (TForall a t1) (TForall b t2) =
-  -- Simple alpha-equivalence: unify bodies treating both names as same rigid
-  unify t1 t2  -- TODO: proper alpha-renaming
+  -- Alpha-rename: replace both bound vars with the same fresh rigid var, then unify bodies
+  -- Using a rigid var ensures we check structural equivalence, not unifiability
+  tcGet `tcBind` \st ->
+    let freshName = "__forall_" ++ show (nextVar st)
+        rigid = TRigid freshName
+    in tcModify (\s -> s { nextVar = nextVar s + 1 }) `tcBind` \_ ->
+      let t1' = substTyVar a rigid t1
+          t2' = substTyVar b rigid t2
+      in unify t1' t2'
 unify' t1 t2 = tcFail (Mismatch t1 t2)
 
 -- | Row unification (Remy-style)
@@ -434,6 +485,39 @@ bindRow v row =
       _ -> if occursInRow v row'
            then tcFail (OtherError "Occurs check in row unification")
            else tcModify (\st -> st { rowSubst = Map.insert v row' (rowSubst st) })
+
+-- ============================================================================
+-- Subtype Checking
+-- ============================================================================
+
+-- | Check if t1 is a subtype of t2 (t1 <: t2).
+-- First tries unification (exact match); falls back to class hierarchy walk.
+subtype :: Ty -> Ty -> TC ()
+subtype t1 t2 =
+  applySubst t1 `tcBind` \t1' ->
+    applySubst t2 `tcBind` \t2' ->
+      tcTry (unify t1' t2') `tcBind` \result ->
+        case result of
+          Just _  -> tcPure ()  -- exact match is always a subtype
+          Nothing -> subtype' t1' t2'
+
+subtype' :: Ty -> Ty -> TC ()
+subtype' (TCon a) (TCon b) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Just cenv | isSubclassOf a b cenv -> tcPure ()
+      _ -> tcFail (SubtypeMismatch (TCon a) (TCon b))
+-- TApp: covariant subtyping for immutable type constructors
+subtype' (TApp (TCon a) as1) (TApp (TCon b) as2)
+  | a == b && Prelude.length as1 == Prelude.length as2 =
+      tcMapM_ (\(x,y) -> subtype x y) (Prelude.zip as1 as2)
+  | otherwise =
+      tcAsk `tcBind` \env ->
+        case envCompiler env of
+          Just cenv | isSubclassOf a b cenv && Prelude.length as1 == Prelude.length as2 ->
+            tcMapM_ (\(x,y) -> subtype x y) (Prelude.zip as1 as2)
+          _ -> tcFail (SubtypeMismatch (TApp (TCon a) as1) (TApp (TCon b) as2))
+subtype' t1 t2 = tcFail (SubtypeMismatch t1 t2)
 
 -- ============================================================================
 -- Polymorphism: Instantiation & Generalization
@@ -627,13 +711,33 @@ infer (Id name) =
   lookupVarType name `tcBind` \mty ->
     case mty of
       Just ty -> instantiate ty  -- instantiate polymorphic types
-      Nothing -> freshTyVar  -- unknown var gets a fresh type (will be caught later if needed)
+      Nothing -> tcWarn (UnboundVar name) `tcBind` \_ -> freshTyVar
 
 -- Typed expression: e : T
 infer (Typed e tExpr) =
   exprToTy tExpr `tcBind` \ty ->
     check e ty `tcBind` \_ ->
       tcPure ty
+
+-- Class constructor: ClassName.new(args) — check arity and abstract
+infer (App (RecFieldAccess ("new", _) (Id className)) args) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (TCon className)
+      Just cenv -> case lookupClass className cenv of
+        Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (TCon className)
+        Just cm
+          | cmModifier cm == ClassAbstract ->
+            tcWarnOrFail (OtherError $ "Cannot instantiate abstract class " ++ className)
+              `tcBind` \_ -> tcPure (TCon className)
+          | otherwise ->
+            let expected = Prelude.length (cmAllFields cm)
+                actual = Prelude.length args
+            in (if expected /= actual
+                then tcWarnOrFail (ArityMismatch expected actual)
+                else tcPure ()) `tcBind` \_ ->
+              tcMapM infer args `tcBind` \_ ->
+                tcPure (TCon className)
 
 -- Function application: f(args)
 infer (App f args) =
@@ -652,7 +756,7 @@ infer (ConTuple (ConsTag name _tag) args) =
           let ps = params lam
               retExpr = lamType lam
           in if Prelude.length ps /= Prelude.length args
-             then tcWarn (ArityMismatch (Prelude.length ps) (Prelude.length args)) `tcBind` \_ -> freshTyVar
+             then tcWarnOrFail (ArityMismatch (Prelude.length ps) (Prelude.length args)) `tcBind` \_ -> freshTyVar
              else tcMapM (\(Var _ tp _, arg) -> exprToTy tp `tcBind` \pty -> infer arg `tcBind` \aty ->
                     tcTry (unify pty aty) `tcBind` \_ -> tcPure ())
                     (Prelude.zip ps args) `tcBind` \_ ->
@@ -723,8 +827,7 @@ infer (IfThenElse cond thenE elseE) =
 
 -- Let-in (should be desugared but handle anyway)
 infer (LetIn binds bodyExpr) =
-  inferLetBinds binds `tcBind` \_ ->
-    infer bodyExpr
+  inferLetBindsAndBody binds bodyExpr
 
 -- PropEq, Implies, Law — type-level/proof constructs
 infer (PropEq _ _) = tcPure (TU 0)
@@ -733,7 +836,15 @@ infer (Law _ _) = tcPure (TCon "Unit")
 
 -- Repr, ReprCast
 infer (Repr _ _ _ _ _) = tcPure (TCon "Unit")
-infer (ReprCast e tp) = exprToTy tp
+infer (ReprCast e tp) =
+  exprToTy tp `tcBind` \targetTy ->
+    tcAsk `tcBind` \env ->
+      case envCompiler env of
+        Just cenv | isClassType targetTy cenv -> tcPure (TApp (TCon "Maybe") [targetTy])
+        _ -> tcPure targetTy
+  where
+    isClassType (TCon n) cenv = Map.member n (classDecls cenv)
+    isClassType _ _ = False
 infer (Value v _) = exprToTy (typ v)
 
 -- Record literal: {x = 1, y = true}
@@ -798,13 +909,15 @@ infer (Constructors _) = tcPure (TU 0)
 infer (ERROR msg) = tcWarn (OtherError $ "ERROR node: " ++ msg) `tcBind` \_ -> freshTyVar
 
 -- Catch-all
-infer e = freshTyVar
+infer e =
+  tcWarn (OtherError $ "Cannot infer type: " ++ showExprBrief e)
+    `tcBind` \_ -> freshTyVar
 
 -- | Apply a function type to arguments
 inferApp :: Ty -> [Expr] -> TC Ty
 inferApp fTy [] = tcPure fTy
 inferApp (TArrow paramTy retTy) (arg:rest) =
-  check arg paramTy `tcBind` \_ ->
+  tcWithContext "argument of application" (check arg paramTy) `tcBind` \_ ->
     applySubst retTy `tcBind` \retTy' ->
       inferApp retTy' rest
 inferApp (TVar v) args =
@@ -824,9 +937,17 @@ inferLambda lam =
   let ps = case params lam of
         (Var _ (Implicit _) _):rest -> rest
         p -> p
-  in tcMapM (\(Var n tp _) ->
+      selfName = lamName lam
+      ctx = if selfName /= "" then "function '" ++ selfName ++ "'" else "anonymous lambda"
+  in tcWithContext ctx (
+    tcMapM (\(Var n tp _) ->
        exprToTy tp `tcBind` \ty -> tcPure (n, ty)) ps `tcBind` \paramBindings ->
-     let extendEnv env = env { varTypes = Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) paramBindings }
+     freshTyVar `tcBind` \selfTy ->
+     let paramNames = Prelude.map fst paramBindings
+         extendEnv env = env { varTypes =
+           (if selfName /= "" && selfName `Prelude.notElem` paramNames
+            then Map.insert selfName selfTy else id) $
+           Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) paramBindings }
      in exprToTy (lamType lam) `tcBind` \retTy ->
           tcLocal extendEnv (
             case retTy of
@@ -834,7 +955,10 @@ inferLambda lam =
               _      -> check (body lam) retTy `tcBind` \_ -> tcPure retTy
           ) `tcBind` \bodyTy ->
             let paramTys = Prelude.map snd paramBindings
-            in tcPure (Prelude.foldr TArrow bodyTy paramTys)
+                funcTy = Prelude.foldr TArrow bodyTy paramTys
+            in tcTry (unify selfTy funcTy) `tcBind` \_ ->
+                 tcPure funcTy
+    )
 
 -- | Infer the type of an action statement
 inferActionStmt :: ActionStmt -> TC Ty
@@ -851,6 +975,15 @@ inferLetBinds ((v, e):rest) =
       inferLetBinds rest
     )
 
+-- | Infer let bindings with body — keeps bindings in scope for body
+inferLetBindsAndBody :: [(Var, Expr)] -> Expr -> TC Ty
+inferLetBindsAndBody [] bodyExpr = infer bodyExpr
+inferLetBindsAndBody ((v, e):rest) bodyExpr =
+  infer e `tcBind` \ty ->
+    tcLocal (\env -> env { varTypes = Map.insert (name v) ty (varTypes env) }) (
+      inferLetBindsAndBody rest bodyExpr
+    )
+
 -- | Check that an expression has the expected type
 check :: Expr -> Ty -> TC ()
 -- Function definition: check body against expected return type
@@ -859,7 +992,11 @@ check (Function lam) expectedTy =
     tcTry (unify inferredTy expectedTy) `tcBind` \result ->
       case result of
         Just _ -> tcPure ()
-        Nothing -> tcWarn (Mismatch expectedTy inferredTy)
+        Nothing ->
+          tcTry (subtype inferredTy expectedTy) `tcBind` \subResult ->
+            case subResult of
+              Just _  -> tcPure ()
+              Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy)
 
 -- Pattern matches: check each branch
 check (PatternMatches cases) expectedTy =
@@ -876,13 +1013,17 @@ check (CaseOf pats bodyExpr si) expectedTy =
 -- ExpandedCase: check the body
 check (ExpandedCase _checks bodyExpr _si) expectedTy = check bodyExpr expectedTy
 
--- Subsumption: infer and unify
+-- Subsumption: infer, try unify, then try subtype
 check expr expectedTy =
   infer expr `tcBind` \inferredTy ->
     tcTry (unify inferredTy expectedTy) `tcBind` \result ->
       case result of
         Just _  -> tcPure ()
-        Nothing -> tcWarn (Mismatch expectedTy inferredTy)
+        Nothing ->
+          tcTry (subtype inferredTy expectedTy) `tcBind` \subResult ->
+            case subResult of
+              Just _  -> tcPure ()  -- subtype match (Dog <: Animal), no runtime coercion needed
+              Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy)
 
 -- ============================================================================
 -- Pipeline Integration
@@ -990,6 +1131,76 @@ checkTopLevel (Repr _ _ _ _ _) = tcPure ()
 checkTopLevel Intrinsic = tcPure ()
 checkTopLevel Derive = tcPure ()
 
+-- Type check a class declaration: validate fields, check method bodies, overrides, implements
+checkTopLevel (ClassDecl lam cinfo) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Nothing -> tcPure ()
+      Just cenv ->
+        let className = lamName lam
+        in tcWithContext ("class " ++ className) (
+        -- 1. Validate field types are well-formed
+        tcMapM_ (\(Var _ tp _) ->
+          tcTry (exprToTy tp) `tcBind` \_ -> tcPure ()
+          ) (params lam) `tcBind` \_ ->
+        -- 2. Check each method body
+        let methods = case body lam of
+              DeclBlock exs -> [l | Function l <- exs]
+              _ -> []
+            selfTy = TCon className
+        in tcMapM_ (\methodLam ->
+             let methodEnv envT = envT { varTypes =
+                   Map.insert "self" selfTy (varTypes envT) }
+             in tcLocal methodEnv (
+                  tcWithContext ("method '" ++ lamName methodLam ++ "'") (
+                    inferLambda methodLam `tcBind` \_ -> tcPure ()
+                  ))
+             ) methods `tcBind` \_ ->
+        -- 3. Validate override signatures match parent
+        (case classParent cinfo of
+          Nothing -> tcPure ()
+          Just (parentName, _) ->
+            case lookupType parentName cenv of
+              Just (ClassDecl parentLam _) ->
+                let parentMethods = case body parentLam of
+                      DeclBlock exs -> [l | Function l <- exs]
+                      _ -> []
+                    overrideNames = [n | (n, MOverride) <- classMethodMods cinfo]
+                in tcMapM_ (\overrideName ->
+                     case (findLam overrideName methods, findLam overrideName parentMethods) of
+                       (Just child, Just parent) ->
+                         lamToTy child `tcBind` \childTy ->
+                           lamToTy parent `tcBind` \parentTy ->
+                             tcTry (unify childTy parentTy) `tcBind` \result ->
+                               case result of
+                                 Just _ -> tcPure ()
+                                 Nothing -> tcWarnOrFail (OtherError $
+                                   "override '" ++ overrideName ++ "' in " ++ className
+                                   ++ " has incompatible type with " ++ parentName)
+                       _ -> tcPure ()
+                   ) overrideNames
+              _ -> tcPure ()
+        ) `tcBind` \_ ->
+        -- 4. Validate implements contracts
+        let implNames = [n | Id n <- classImplements cinfo]
+            methodNames = [lamName l | l <- methods]
+        in tcMapM_ (\algName ->
+             case lookupType algName cenv of
+               Just (Structure structLam structInf) ->
+                 let reqFuncs = case body structLam of
+                       DeclBlock exs -> [lamName l | Function l <- exs]
+                       _ -> []
+                     missing = Prelude.filter (`Prelude.notElem` methodNames) reqFuncs
+                 in if Prelude.null missing || not (Prelude.null (structDerive structInf))
+                    then tcPure ()
+                    else tcWarnOrFail (OtherError $
+                      "class " ++ className ++ " implements " ++ algName
+                      ++ " but missing: " ++ intercalate ", " missing)
+               _ -> tcPure ()
+           ) implNames `tcBind` \_ ->
+        resolveConstraints
+        )
+
 -- For any other top-level expression, just infer its type
 checkTopLevel expr = infer expr `tcBind` \_ -> resolveConstraints
 
@@ -1006,6 +1217,8 @@ showTCError (MissingField n) = "[TC] Missing record field: " ++ n
 showTCError (ArityMismatch e a) = "[TC] Arity mismatch: expected " ++ show e ++ " arguments, got " ++ show a
 showTCError (ConstraintUnsolved c) = "[TC] Unsolved constraint: " ++ showConstraint c ++ " — no matching instance found"
 showTCError (OtherError s) = "[TC] " ++ s
+showTCError (WithContext ctx inner) = showTCError inner ++ "\n    in " ++ ctx
+showTCError (SubtypeMismatch t1 t2) = "[TC] Subtype mismatch: " ++ showTy t1 ++ " is not a subtype of " ++ showTy t2
 
 showConstraint :: Constraint -> String
 showConstraint (CStructure n tys) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")"
@@ -1041,3 +1254,11 @@ showRow (RExtend l t REmpty) = l ++ ":" ++ showTy t
 showRow (RExtend l t r) = l ++ ":" ++ showTy t ++ ", " ++ showRow r
 showRow (RVar v) = ".." ++ showTyVar v
 showRow (RRigid n) = ".." ++ n
+
+-- | Truncated show for expressions (for error messages)
+showExprBrief :: Expr -> String
+showExprBrief e = let s = show e in if length s > 80 then take 77 s ++ "..." else s
+
+-- | Find a lambda by name in a list
+findLam :: Name -> [Lambda] -> Maybe Lambda
+findLam n lams = case [l | l <- lams, lamName l == n] of { (l:_) -> Just l; [] -> Nothing }

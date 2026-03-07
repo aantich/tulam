@@ -198,7 +198,7 @@ instance Show InterpreterState where
         ++ " }"
 
 emptyIntState = InterpreterState {
-    currentFlags = CurrentFlags False True False False False defaultOptFlags,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -230,6 +230,7 @@ data CurrentFlags = CurrentFlags {
   , tracing   :: Bool -- whether to trace execution steps
   , strictTypes :: Bool -- true if type errors are fatal, false for warnings
   , verbose   :: Bool -- verbose pass logging and timing
+  , newStrings :: Bool -- true if string literals desugar to fromStringLiteral
   , optSettings :: OptFlags -- optimization pass settings
 } deriving Show
 
@@ -242,7 +243,7 @@ maxEvalDepth = 1000
 
 initializeInterpreter :: IO InterpreterState
 initializeInterpreter = return $ InterpreterState {
-    currentFlags = CurrentFlags False True False False False defaultOptFlags,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -539,6 +540,19 @@ findMorphismInstances funcNm env =
         _   -> []
 
 -- Repr map helpers
+
+-- | Build a repr map key from a user type expression.
+-- Simple types: Id "Nat" → "Nat"
+-- Parameterized types: App (Id "Array") [Id "Byte"] → "Array\0Byte"
+mkReprKey :: Expr -> Name
+mkReprKey (Id n) = n
+mkReprKey (App (Id n) args) = Data.List.intercalate "\0" (n : Prelude.map exprToKeyPart args)
+  where
+    exprToKeyPart (Id nm) = nm
+    exprToKeyPart (App (Id nm) as) = nm ++ "(" ++ Data.List.intercalate "," (Prelude.map exprToKeyPart as) ++ ")"
+    exprToKeyPart _ = "_"
+mkReprKey _ = "_unknown_"
+
 addRepr :: Name -> Name -> Bool -> Lambda -> Lambda -> Maybe Expr -> Environment -> Environment
 addRepr userType reprType isDefault toR fromR inv env =
     let existing = maybe [] id (Map.lookup userType (reprMap env))

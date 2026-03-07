@@ -876,7 +876,19 @@ action main() = {
 
 ---
 
-## 17. Relation to Existing Design Documents
+## 17. Algebra-Based Interop Pattern
+
+The general interop mechanism is formalized as a three-part pattern: **algebra** (contract) + **repr** (data bridge) + **target-qualified extern instances** (native method binding). This pattern applies to strings, collections, IO, date/time, concurrency, and any domain where native platforms have optimized implementations.
+
+The string library (`lib/String/`) serves as the first complete worked example:
+- `StringLike` algebra defines universal string operations
+- `Str` type provides pure tulam reference implementation
+- Target-specific instances (future) will map to native strings (.NET `System.String`, JS `string`, C++ `std::string`)
+- `repr Str as System.String target dotnet` (future) bridges data between representations
+
+See [doc/InteropPattern.md](InteropPattern.md) for the full design document describing this pattern in detail.
+
+## 18. Relation to Existing Design Documents
 
 | Document | Relationship |
 |----------|-------------|

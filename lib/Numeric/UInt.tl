@@ -10,6 +10,7 @@ import Algebra.Absolute;
 import Algebra.Bits;
 import Algebra.Eq;
 import Algebra.Ord;
+import Morphism.Convertible;
 
 // --- UInt (platform-width) ---
 /// UInt arithmetic.
@@ -72,3 +73,9 @@ instance Bits(Byte) = intrinsic;
 instance Eq(Byte) = intrinsic;
 /// Byte ordering.
 instance Ord(Byte) = intrinsic;
+
+// --- Byte conversions ---
+/// Int to Byte (truncating).
+instance Convertible(Int, Byte) = intrinsic;
+/// Byte to Int (widening).
+instance Convertible(Byte, Int) = intrinsic;

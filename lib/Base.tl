@@ -85,3 +85,16 @@ export Mutable.MutArray;
 
 // Repr
 export Repr.Nat;
+// Repr.Char disabled: fromRepr keyed by ["Int"] collides with Repr.Nat.
+// Char<->Int conversion available via fromEnum/toEnum.
+// TODO: fix repr dispatch to support multiple fromRepr instances (type-directed)
+// export Repr.Char;
+
+// String library
+export Algebra.StringLike;
+export String.Utf8;
+export String.Str;
+export String.Algebras;
+export String.Instances;
+export String.Ops;
+export String.FromString;

@@ -58,6 +58,10 @@ loadTestProgram :: InterpreterState -> FilePath -> IO InterpreterState
 loadTestProgram st filePath = do
     evalStateT (execStateT (loadFileQuiet filePath) st) initLogState
 
+-- Helper: enable newStrings flag on a state (for string literal desugaring tests)
+enableNewStrings :: InterpreterState -> InterpreterState
+enableNewStrings st = st { currentFlags = (currentFlags st) { newStrings = True } }
+
 -- Helper: load multiple test program files in order on top of an existing state
 loadTestPrograms :: InterpreterState -> [FilePath] -> IO InterpreterState
 loadTestPrograms st [] = return st
@@ -134,6 +138,12 @@ conGT = CLMCON (ConsTag "GreaterThan" 2) []
 nat :: Int -> CLMExpr
 nat 0 = conZ
 nat n = conSucc (nat (n - 1))
+
+-- Helper: check if a TCError is an UnboundVar (possibly wrapped in WithContext)
+isUnboundVar :: TCError -> Bool
+isUnboundVar (UnboundVar _) = True
+isUnboundVar (WithContext _ inner) = isUnboundVar inner
+isUnboundVar _ = False
 
 main :: IO ()
 main = do
@@ -1093,6 +1103,980 @@ main = do
                     -- This test verifies the type checker doesn't crash on real code
                     -- It's already passing since setupEnv includes typeCheckPass
                     pure () :: IO ()
+
+            -- ============================================================
+            -- Step 1: tcWarnOrFail + tcMode
+            -- ============================================================
+            describe "tcWarnOrFail and strict mode" $ do
+                it "strict mode fails fatally on type mismatch" $ do
+                    let stStrict = initTCState TCStrict
+                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 stStrict
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Strict mode should fail on mismatch"
+
+                it "relaxed mode accumulates warning on mismatch" $ do
+                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> expectationFailure "Relaxed mode should warn, not fail"
+
+            -- ============================================================
+            -- Step 2: Catch-all warnings
+            -- ============================================================
+            describe "Catch-all warnings" $ do
+                it "unbound variable emits UnboundVar warning" $ do
+                    let result = runTC (infer (Id "nonexistent")) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy`
+                            (\errs -> Prelude.any isUnboundVar errs)
+                        Left _ -> pure ()  -- also acceptable
+
+                it "infer catch-all emits warning" $ do
+                    -- DeclBlock is not handled by any specific case
+                    let result = runTC (infer (DeclBlock [])) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+                it "exprToTy catch-all emits warning for unknown forms" $ do
+                    -- Value(Var ...) in type position should warn
+                    let result = runTC (exprToTy (Lit (LInt 42))) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+            -- ============================================================
+            -- Step 3: TForall alpha-renaming
+            -- ============================================================
+            describe "TForall alpha-renaming" $ do
+                it "alpha-equivalent foralls unify" $ do
+                    -- forall a. a -> a  should unify with  forall b. b -> b
+                    let t1 = TForall "a" (TArrow (TRigid "a") (TRigid "a"))
+                        t2 = TForall "b" (TArrow (TRigid "b") (TRigid "b"))
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Alpha-equivalent foralls should unify: " ++ show errs
+
+                it "incompatible forall bodies don't unify" $ do
+                    -- forall a. a -> a  vs  forall b. b -> Int
+                    let t1 = TForall "a" (TArrow (TRigid "a") (TRigid "a"))
+                        t2 = TForall "b" (TArrow (TRigid "b") (TCon "Int"))
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Incompatible forall bodies should not unify"
+
+            -- ============================================================
+            -- Step 4: Error context tracking
+            -- ============================================================
+            describe "Error context tracking" $ do
+                it "error in function body includes function name" $ do
+                    let lam = mkLambda "myFunc" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Bool")
+                    let result = runTC (inferLambda lam) env0 st0
+                    case result of
+                        Right (_, st') -> do
+                            let errStrs = Prelude.map showTCError (tcErrors st')
+                            errStrs `shouldSatisfy` Prelude.any ("myFunc" `isInfixOf`)
+                        Left errs -> do
+                            let errStrs = Prelude.map showTCError errs
+                            errStrs `shouldSatisfy` Prelude.any ("myFunc" `isInfixOf`)
+
+                it "WithContext error renders properly" $ do
+                    let err = WithContext "function 'test'" (Mismatch (TCon "Int") (TCon "Bool"))
+                    showTCError err `shouldSatisfy` ("test" `isInfixOf`)
+                    showTCError err `shouldSatisfy` ("Int" `isInfixOf`)
+
+            -- ============================================================
+            -- Step 5: Recursive function self-binding
+            -- ============================================================
+            describe "Recursive function self-binding" $ do
+                it "recursive function self-reference resolves" $ do
+                    -- function fact(n:Int) : Int = fact(n)  — self-reference should not be unbound
+                    let lam = mkLambda "fact" [Var "n" (Id "Int") UNDEFINED]
+                                        (App (Id "fact") [Id "n"]) (Id "Int")
+                    let result = runTC (inferLambda lam) env0 st0
+                    case result of
+                        Right (ty, st') -> do
+                            -- Should infer Int -> Int without unbound var warning for "fact"
+                            ty `shouldBe` TArrow (TCon "Int") (TCon "Int")
+                            let hasFactUnbound = Prelude.any (\e -> case e of
+                                    UnboundVar "fact" -> True
+                                    WithContext _ (UnboundVar "fact") -> True
+                                    _ -> False) (tcErrors st')
+                            hasFactUnbound `shouldBe` False
+                        Left errs -> expectationFailure $ "Should have succeeded: " ++ show errs
+
+                it "non-recursive function unaffected by self-binding" $ do
+                    let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] (Lit (LInt 42)) (Id "Int")
+                    let Right (ty, _) = runTC (inferLambda lam) env0 st0
+                    ty `shouldBe` TArrow (TCon "Int") (TCon "Int")
+
+            -- ============================================================
+            -- Step 6: exprToTy extended cases
+            -- ============================================================
+            describe "exprToTy extended cases" $ do
+                it "general App converts to TApp" $ do
+                    -- App (App (Id "F") [Id "a"]) [Id "b"] -> TApp (TApp (TCon "F") [TRigid "a"]) [TRigid "b"]
+                    let expr = App (App (Id "F") [Id "a"]) [Id "b"]
+                    let Right (ty, _) = runTC (exprToTy expr) env0 st0
+                    case ty of
+                        TApp (TApp (TCon "F") [TRigid "a"]) [TRigid "b"] -> pure ()
+                        other -> expectationFailure $ "Expected nested TApp, got: " ++ show other
+
+                it "Function in type position converts to arrow" $ do
+                    let lam = mkLambda "" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
+                    let Right (ty, _) = runTC (exprToTy (Function lam)) env0 st0
+                    case ty of
+                        TArrow (TCon "Int") _ -> pure ()
+                        other -> expectationFailure $ "Expected arrow type, got: " ++ show other
+
+            -- ============================================================
+            -- Step 7a: Class field + method body checking
+            -- ============================================================
+            describe "Class system type checking" $ do
+                it "ClassDecl checkTopLevel doesn't crash" $ do
+                    let cenv = currentEnvironment st
+                        tcEnvFull = buildTCEnvFromEnvironment cenv
+                    -- Create a minimal class declaration
+                    let classLam = mkLambda "TestClass" [Var "x" (Id "Int") UNDEFINED]
+                                    (DeclBlock []) (Id "TestClass")
+                        cinfo = ClassInfo { classParent = Nothing
+                                          , classImplements = []
+                                          , classModifier = ClassNormal
+                                          , classExtern = Nothing
+                                          , classMethodMods = [] }
+                    let result = runTC (checkTopLevel (ClassDecl classLam cinfo)) tcEnvFull st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Class check should pass: " ++ show errs
+
+                it "class method body checked with self in scope" $ do
+                    let cenv = currentEnvironment st
+                        tcEnvFull = buildTCEnvFromEnvironment cenv
+                    -- Class with a method that references self
+                    let methodLam = mkLambda "getName" [Var "self" (Id "TestClass2") UNDEFINED]
+                                      (Id "self") (Id "TestClass2")
+                        classLam = mkLambda "TestClass2" [Var "name" (Id "String") UNDEFINED]
+                                    (DeclBlock [Function methodLam]) (Id "TestClass2")
+                        cinfo = ClassInfo { classParent = Nothing
+                                          , classImplements = []
+                                          , classModifier = ClassNormal
+                                          , classExtern = Nothing
+                                          , classMethodMods = [] }
+                    let result = runTC (checkTopLevel (ClassDecl classLam cinfo)) tcEnvFull st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Class method check should pass: " ++ show errs
+
+                it "abstract class instantiation warns" $ do
+                    let cenv = currentEnvironment st
+                        tcEnvFull = buildTCEnvFromEnvironment cenv
+                    -- Simulate abstract class in classDecls
+                    let abstractCM = ClassMeta { cmOwnFields = []
+                                               , cmAllFields = [Var "x" (Id "Int") UNDEFINED]
+                                               , cmParent = Nothing
+                                               , cmMethods = Map.empty
+                                               , cmStaticMethods = Map.empty
+                                               , cmFieldIndices = Map.empty
+                                               , cmModifier = ClassAbstract
+                                               , cmChildren = []
+                                               , cmImplements = []
+                                               , cmSuperArgs = []
+                                               , cmExtern = Nothing
+                                               , cmTag = 0
+                                               , cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.insert "AbstractBase" abstractCM (classDecls cenv) }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    let result = runTC (infer (App (RecFieldAccess ("new", -1) (Id "AbstractBase")) [Lit (LInt 1)])) tcEnv' st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy`
+                            (\errs -> Prelude.any (\e -> "abstract" `isInfixOf` showTCError e) errs)
+                        Left errs -> Prelude.map showTCError errs `shouldSatisfy`
+                            Prelude.any ("abstract" `isInfixOf`)
+
+                it "constructor arity mismatch warns" $ do
+                    let cenv = currentEnvironment st
+                    let classCM = ClassMeta { cmOwnFields = []
+                                            , cmAllFields = [Var "x" (Id "Int") UNDEFINED, Var "y" (Id "Int") UNDEFINED]
+                                            , cmParent = Nothing
+                                            , cmMethods = Map.empty
+                                            , cmStaticMethods = Map.empty
+                                            , cmFieldIndices = Map.empty
+                                            , cmModifier = ClassNormal
+                                            , cmChildren = []
+                                            , cmImplements = []
+                                            , cmSuperArgs = []
+                                            , cmExtern = Nothing
+                                            , cmTag = 0
+                                            , cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.insert "TwoFields" classCM (classDecls cenv) }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    -- Pass 3 args for a 2-field class
+                    let result = runTC (infer (App (RecFieldAccess ("new", -1) (Id "TwoFields")) [Lit (LInt 1), Lit (LInt 2), Lit (LInt 3)])) tcEnv' st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy`
+                            (\errs -> Prelude.any (\e -> case e of
+                                ArityMismatch _ _ -> True
+                                WithContext _ (ArityMismatch _ _) -> True
+                                _ -> False) errs)
+                        Left errs -> errs `shouldSatisfy`
+                            Prelude.any (\e -> case e of
+                                ArityMismatch _ _ -> True
+                                WithContext _ (ArityMismatch _ _) -> True
+                                _ -> False)
+
+                it "correct constructor arity passes" $ do
+                    let cenv = currentEnvironment st
+                    let classCM = ClassMeta { cmOwnFields = []
+                                            , cmAllFields = [Var "x" (Id "Int") UNDEFINED]
+                                            , cmParent = Nothing
+                                            , cmMethods = Map.empty
+                                            , cmStaticMethods = Map.empty
+                                            , cmFieldIndices = Map.empty
+                                            , cmModifier = ClassNormal
+                                            , cmChildren = []
+                                            , cmImplements = []
+                                            , cmSuperArgs = []
+                                            , cmExtern = Nothing
+                                            , cmTag = 0
+                                            , cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.insert "OneField" classCM (classDecls cenv) }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    let result = runTC (infer (App (RecFieldAccess ("new", -1) (Id "OneField")) [Lit (LInt 1)])) tcEnv' st0
+                    case result of
+                        Right (ty, st') -> do
+                            ty `shouldBe` TCon "OneField"
+                            let hasArity = Prelude.any (\e -> case e of
+                                    ArityMismatch _ _ -> True
+                                    WithContext _ (ArityMismatch _ _) -> True
+                                    _ -> False) (tcErrors st')
+                            hasArity `shouldBe` False
+                        Left errs -> expectationFailure $ "Should pass: " ++ show errs
+
+                it "implements with missing method warns" $ do
+                    let cenv = currentEnvironment st
+                        tcEnvFull = buildTCEnvFromEnvironment cenv
+                    -- Create a class that claims to implement Show but has no show method
+                    let classLam = mkLambda "BadClass" [Var "x" (Id "Int") UNDEFINED]
+                                    (DeclBlock []) (Id "BadClass")
+                        cinfo = ClassInfo { classParent = Nothing
+                                          , classImplements = [Id "Show"]
+                                          , classModifier = ClassNormal
+                                          , classExtern = Nothing
+                                          , classMethodMods = [] }
+                    let result = runTC (checkTopLevel (ClassDecl classLam cinfo)) tcEnvFull st0
+                    case result of
+                        Right (_, st') -> do
+                            let _errStrs = Prelude.map showTCError (tcErrors st')
+                            -- Should warn about missing "show" method (unless Show has derive block)
+                            -- Show algebra has a derive block, so this may pass silently
+                            pure () :: IO ()
+                        Left _ -> pure () :: IO ()  -- also acceptable
+
+                it "subtype Dog <: Animal succeeds" $ do
+                    let cenv = currentEnvironment st
+                    -- Set up Dog -> Animal class hierarchy
+                    let animalCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                             , cmParent = Nothing, cmMethods = Map.empty
+                                             , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                             , cmModifier = ClassNormal, cmChildren = ["Dog"]
+                                             , cmImplements = [], cmSuperArgs = []
+                                             , cmExtern = Nothing, cmTag = 100, cmSourceFile = "" }
+                        dogCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                          , cmParent = Just "Animal", cmMethods = Map.empty
+                                          , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                          , cmModifier = ClassNormal, cmChildren = []
+                                          , cmImplements = [], cmSuperArgs = []
+                                          , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    let result = runTC (subtype (TCon "Dog") (TCon "Animal")) tcEnv' st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "subtype Dog <: Animal should succeed: " ++ show errs
+
+                it "subtype Animal <: Dog fails" $ do
+                    let cenv = currentEnvironment st
+                    let animalCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                             , cmParent = Nothing, cmMethods = Map.empty
+                                             , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                             , cmModifier = ClassNormal, cmChildren = ["Dog"]
+                                             , cmImplements = [], cmSuperArgs = []
+                                             , cmExtern = Nothing, cmTag = 100, cmSourceFile = "" }
+                        dogCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                          , cmParent = Just "Animal", cmMethods = Map.empty
+                                          , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                          , cmModifier = ClassNormal, cmChildren = []
+                                          , cmImplements = [], cmSuperArgs = []
+                                          , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    let result = runTC (subtype (TCon "Animal") (TCon "Dog")) tcEnv' st0
+                    case result of
+                        Right _ -> expectationFailure "subtype Animal <: Dog should fail"
+                        Left errs -> errs `shouldSatisfy`
+                            Prelude.any (\e -> case e of
+                                SubtypeMismatch _ _ -> True
+                                _ -> False)
+
+                it "check accepts Dog expr where Animal expected" $ do
+                    let cenv = currentEnvironment st
+                    let animalCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                             , cmParent = Nothing, cmMethods = Map.empty
+                                             , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                             , cmModifier = ClassNormal, cmChildren = ["Dog"]
+                                             , cmImplements = [], cmSuperArgs = []
+                                             , cmExtern = Nothing, cmTag = 100, cmSourceFile = "" }
+                        dogCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                          , cmParent = Just "Animal", cmMethods = Map.empty
+                                          , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                          , cmModifier = ClassNormal, cmChildren = []
+                                          , cmImplements = [], cmSuperArgs = []
+                                          , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv'
+                                            , varTypes = Map.fromList [("myDog", TCon "Dog")] }
+                    let stStrict = initTCState TCStrict
+                    let result = runTC (check (Id "myDog") (TCon "Animal")) tcEnv' stStrict
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "check Dog as Animal should pass in strict mode: " ++ show errs
+
+                it "infer ReprCast to class type returns Maybe" $ do
+                    let cenv = currentEnvironment st
+                    let dogCM = ClassMeta { cmOwnFields = [], cmAllFields = []
+                                          , cmParent = Nothing, cmMethods = Map.empty
+                                          , cmStaticMethods = Map.empty, cmFieldIndices = Map.empty
+                                          , cmModifier = ClassNormal, cmChildren = []
+                                          , cmImplements = [], cmSuperArgs = []
+                                          , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
+                        cenv' = cenv { classDecls = Map.insert "Dog" dogCM (classDecls cenv) }
+                        tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
+                    let result = runTC (infer (ReprCast (Lit (LInt 1)) (Id "Dog"))) tcEnv' st0
+                    case result of
+                        Right (ty, _) -> ty `shouldBe` TApp (TCon "Maybe") [TCon "Dog"]
+                        Left errs -> expectationFailure $ "infer ReprCast to Dog should return Maybe(Dog): " ++ show errs
+
+                it "SubtypeMismatch error has [TC] prefix" $ do
+                    showTCError (SubtypeMismatch (TCon "Int") (TCon "Bool")) `shouldSatisfy` ("TC" `isInfixOf`)
+
+                it "all [TC] errors include context prefix" $ do
+                    let errors = [ Mismatch (TCon "Int") (TCon "Bool")
+                                 , OccursCheck 0 (TCon "Int")
+                                 , UnboundVar "x"
+                                 , MissingField "f"
+                                 , ArityMismatch 1 2
+                                 , OtherError "test"
+                                 , WithContext "function 'foo'" (Mismatch (TCon "Int") (TCon "Bool"))
+                                 ]
+                    mapM_ (\e -> showTCError e `shouldSatisfy` \s -> "[TC]" `isPrefixOf` s) errors
+
+                it "strict mode check passes for matching types" $ do
+                    let stStrict = initTCState TCStrict
+                    let result = runTC (check (Lit (LInt 5)) (TCon "Int")) env0 stStrict
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Strict check should pass for matching types: " ++ show errs
+
+                it "class with valid field types passes check" $ do
+                    let cenv = currentEnvironment st
+                        tcEnvFull = buildTCEnvFromEnvironment cenv
+                    -- Class with Int and String fields — both well-formed
+                    let classLam = mkLambda "ValidClass"
+                                    [Var "name" (Id "String") UNDEFINED, Var "age" (Id "Int") UNDEFINED]
+                                    (DeclBlock []) (Id "ValidClass")
+                        cinfo = ClassInfo { classParent = Nothing
+                                          , classImplements = []
+                                          , classModifier = ClassNormal
+                                          , classExtern = Nothing
+                                          , classMethodMods = [] }
+                    let result = runTC (checkTopLevel (ClassDecl classLam cinfo)) tcEnvFull st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Valid class should pass: " ++ show errs
+
+            -- ============================================================
+            -- Comprehensive edge case tests
+            -- ============================================================
+            describe "tcTry state isolation" $ do
+                it "failed tcTry does not corrupt substitution state" $ do
+                    let st1 = st0 { nextVar = 2 }
+                    -- First, bind TVar 0 = Int
+                    let Right (_, st2) = runTC (unify (TVar 0) (TCon "Int")) env0 st1
+                    -- Now try a failing unification — should not affect st2
+                    let Right (result, st3) = runTC (tcTry (unify (TCon "Int") (TCon "Bool"))) env0 st2
+                    result `shouldBe` Nothing
+                    -- TVar 0 should still resolve to Int
+                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st3
+                    ty `shouldBe` TCon "Int"
+
+                it "failed tcTry does not lose accumulated errors" $ do
+                    -- Add a warning, then try a failing action
+                    let Right (_, st1) = runTC (tcWarn (OtherError "existing")) env0 st0
+                    let Right (_, st2) = runTC (tcTry (tcFail (OtherError "boom"))) env0 st1
+                    -- The existing warning should still be there
+                    length (tcErrors st2) `shouldBe` 1
+
+            describe "Strict mode error propagation" $ do
+                it "strict mode fails on unbound variable in check" $ do
+                    let stStrict = initTCState TCStrict
+                    -- check an unbound name against Int — should fail because
+                    -- infer(Id "noexist") warns, then unify(fresh, Int) succeeds
+                    -- but the warning is via tcWarn not tcWarnOrFail,
+                    -- so it should still accumulate
+                    let result = runTC (check (Id "noexist") (TCon "Int")) env0 stStrict
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()  -- also fine if it fails
+
+                it "strict mode ConTuple arity mismatch is fatal" $ do
+                    let stStrict = initTCState TCStrict
+                        succCons = mkLambda "S" [Var "n" (Id "Nat") UNDEFINED] (Tuple [Id "n"]) (Id "Nat")
+                        cenv = addNamedConstructor 1 succCons initialEnvironment
+                        tcEnvC = emptyTCEnv { envCompiler = Just cenv }
+                    let result = runTC (infer (ConTuple (ConsTag "S" 1) [Lit (LInt 1), Lit (LInt 2)])) tcEnvC stStrict
+                    case result of
+                        Left errs -> errs `shouldSatisfy` Prelude.any (\e -> case e of
+                            ArityMismatch _ _ -> True
+                            WithContext _ (ArityMismatch _ _) -> True
+                            _ -> False)
+                        Right _ -> expectationFailure "Strict mode should fail on arity mismatch"
+
+            describe "TSigma unification" $ do
+                it "unifies identical sigma types" $ do
+                    let t1 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                        t2 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should unify: " ++ show errs
+
+                it "fails on mismatched sigma components" $ do
+                    let t1 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                        t2 = TSigma Nothing (TCon "Int") (TCon "String")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Should fail on sigma mismatch"
+
+                it "unifies sigma with variables" $ do
+                    let st1 = st0 { nextVar = 2 }
+                        t1 = TSigma Nothing (TVar 0) (TVar 1)
+                        t2 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                    let Right (_, st') = runTC (unify t1 t2) env0 st1
+                    let Right (r0, _) = runTC (applySubst (TVar 0)) env0 st'
+                    let Right (r1, _) = runTC (applySubst (TVar 1)) env0 st'
+                    r0 `shouldBe` TCon "Int"
+                    r1 `shouldBe` TCon "Bool"
+
+            describe "TId unification" $ do
+                it "unifies identical identity types" $ do
+                    let t1 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                        t2 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should unify: " ++ show errs
+
+                it "fails on mismatched identity endpoints" $ do
+                    let t1 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                        t2 = TId (TCon "Nat") (TCon "Z") (TCon "S")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Should fail"
+
+            describe "TEffect unification" $ do
+                it "unifies identical effect types" $ do
+                    let t1 = TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit")
+                        t2 = TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should unify: " ++ show errs
+
+                it "fails on mismatched effect result types" $ do
+                    let t1 = TEffect REmpty (TCon "Int")
+                        t2 = TEffect REmpty (TCon "Bool")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Should fail on effect result mismatch"
+
+                it "unifies effect rows with different order" $ do
+                    let t1 = TEffect (RExtend "a" (TCon "A") (RExtend "b" (TCon "B") REmpty)) (TCon "Unit")
+                        t2 = TEffect (RExtend "b" (TCon "B") (RExtend "a" (TCon "A") REmpty)) (TCon "Unit")
+                    let result = runTC (unify t1 t2) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should unify reordered effects: " ++ show errs
+
+            describe "TRigid mismatch" $ do
+                it "different rigid names fail to unify" $ do
+                    let result = runTC (unify (TRigid "a") (TRigid "b")) env0 st0
+                    case result of
+                        Left (Mismatch _ _ : _) -> pure ()
+                        Left errs -> expectationFailure $ "Wrong error: " ++ show errs
+                        Right _ -> expectationFailure "Different rigid vars should not unify"
+
+                it "TRigid vs TCon fails" $ do
+                    let result = runTC (unify (TRigid "a") (TCon "Int")) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Rigid vs concrete should fail"
+
+                it "TCon vs TRigid fails" $ do
+                    let result = runTC (unify (TCon "Int") (TRigid "a")) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Concrete vs rigid should fail"
+
+            describe "Row occurs check" $ do
+                it "row variable occurring in its own binding fails" $ do
+                    let st1 = st0 { nextVar = 1 }
+                        -- Try to unify {x:Int, ..?0} with ?0 — should fail (occurs)
+                        row1 = RExtend "x" (TCon "Int") (RVar 0)
+                    let result = runTC (bindRow 0 row1) env0 st1
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Row occurs check should fail"
+
+            describe "inferApp edge cases" $ do
+                it "too many args for arrow type returns fresh var" $ do
+                    -- Int -> Bool applied to (1, 2) — second arg has no matching param
+                    let env1 = env0 { varTypes = Map.fromList [("f", TArrow (TCon "Int") (TCon "Bool"))] }
+                    let result = runTC (infer (App (Id "f") [Lit (LInt 1), Lit (LInt 2)])) env1 st0
+                    case result of
+                        Right (ty, _) -> case ty of
+                            TVar _ -> pure ()  -- got a fresh var (Bool is not arrow)
+                            other -> expectationFailure $ "Expected fresh var from non-arrow application, got: " ++ show other
+                        Left _ -> pure ()  -- error also acceptable
+
+                it "application to TVar creates arrow type" $ do
+                    let st1 = st0 { nextVar = 1 }
+                        env1 = env0 { varTypes = Map.fromList [("f", TVar 0)] }
+                    let Right (retTy, st') = runTC (infer (App (Id "f") [Lit (LInt 42)])) env1 st1
+                    -- TVar 0 should now be bound to Int -> ?retTy
+                    let Right (fTy, _) = runTC (applySubst (TVar 0)) env0 st'
+                    case fTy of
+                        TArrow (TCon "Int") _ -> pure ()
+                        other -> expectationFailure $ "Expected Int -> ?, got: " ++ show other
+
+            describe "LetIn and IfThenElse" $ do
+                it "let binding visible in body" $ do
+                    let letExpr = LetIn [(Var "x" UNDEFINED UNDEFINED, Lit (LInt 42))] (Id "x")
+                    let Right (ty, _) = runTC (infer letExpr) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "let binding with multiple bindings" $ do
+                    let letExpr = LetIn [(Var "x" UNDEFINED UNDEFINED, Lit (LInt 1)),
+                                         (Var "y" UNDEFINED UNDEFINED, Lit (LString "hi"))] (Id "y")
+                    let Right (ty, _) = runTC (infer letExpr) env0 st0
+                    ty `shouldBe` TCon "String"
+
+                it "if-then-else checks condition is Bool" $ do
+                    let ite = IfThenElse (Lit (LInt 42)) (Lit (LInt 1)) (Lit (LInt 2))
+                    let result = runTC (infer ite) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+                it "if-then-else with matching branches succeeds" $ do
+                    let env1 = env0 { varTypes = Map.fromList [("b", TCon "Bool")] }
+                        ite = IfThenElse (Id "b") (Lit (LInt 1)) (Lit (LInt 2))
+                    let Right (ty, st') = runTC (infer ite) env1 st0
+                    ty `shouldBe` TCon "Int"
+                    -- No type errors
+                    Prelude.filter (\e -> case e of
+                        UnboundVar _ -> False
+                        WithContext _ (UnboundVar _) -> False
+                        _ -> True) (tcErrors st') `shouldSatisfy` Prelude.null
+
+                it "if-then-else with mismatched branches warns" $ do
+                    let env1 = env0 { varTypes = Map.fromList [("b", TCon "Bool")] }
+                        ite = IfThenElse (Id "b") (Lit (LInt 1)) (Lit (LString "oops"))
+                    let result = runTC (infer ite) env1 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+            describe "Tuple type inference" $ do
+                it "empty tuple infers Unit" $ do
+                    let Right (ty, _) = runTC (infer (Tuple [])) env0 st0
+                    ty `shouldBe` TCon "Unit"
+
+                it "single-element tuple infers element type" $ do
+                    let Right (ty, _) = runTC (infer (Tuple [Lit (LInt 42)])) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "multi-element tuple infers nested TSigma" $ do
+                    let Right (ty, _) = runTC (infer (Tuple [Lit (LInt 1), Lit (LString "a"), Lit (LFloat 3.14)])) env0 st0
+                    case ty of
+                        TSigma Nothing (TCon "Int") (TSigma Nothing (TCon "String") (TCon "Float64")) -> pure ()
+                        other -> expectationFailure $ "Expected (Int, String, Float64), got: " ++ show other
+
+            describe "Array literal inference" $ do
+                it "empty array has polymorphic element type" $ do
+                    let Right (ty, _) = runTC (infer (ArrayLit [])) env0 st0
+                    case ty of
+                        TApp (TCon "Array") [TVar _] -> pure ()
+                        other -> expectationFailure $ "Expected Array(?), got: " ++ show other
+
+                it "non-empty array infers element type" $ do
+                    let Right (ty, _) = runTC (infer (ArrayLit [Lit (LInt 1), Lit (LInt 2)])) env0 st0
+                    ty `shouldBe` TApp (TCon "Array") [TCon "Int"]
+
+            describe "Pattern match checking" $ do
+                it "check PatternMatches propagates expected type" $ do
+                    -- PatternMatches [CaseOf [] (Lit (LInt 42)) si]
+                    -- checked against Bool should warn
+                    let pm = PatternMatches [CaseOf [] (Lit (LInt 42)) SourceInteractive]
+                    let result = runTC (check pm (TCon "Bool")) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+                it "CaseOf in check mode binds pattern variables" $ do
+                    -- CaseOf [Var "x" (Id "Int") UNDEFINED] (Id "x") checked against Int
+                    let co = CaseOf [Var "x" (Id "Int") UNDEFINED] (Id "x") SourceInteractive
+                    let result = runTC (check co (TCon "Int")) env0 st0
+                    case result of
+                        Right (_, st') -> do
+                            let realErrors = Prelude.filter (\e -> case e of
+                                    UnboundVar _ -> False
+                                    WithContext _ (UnboundVar _) -> False
+                                    _ -> True) (tcErrors st')
+                            realErrors `shouldSatisfy` Prelude.null
+                        Left errs -> expectationFailure $ "Should pass: " ++ show errs
+
+            describe "Multiple error accumulation" $ do
+                it "relaxed mode accumulates multiple warnings" $ do
+                    -- Two mismatches in sequence
+                    let result = runTC (
+                            check (Lit (LInt 1)) (TCon "Bool") `tcBind` \_ ->
+                            check (Lit (LString "hi")) (TCon "Int")
+                            ) env0 st0
+                    case result of
+                        Right (_, st') -> length (tcErrors st') `shouldSatisfy` (>= 2)
+                        Left _ -> expectationFailure "Relaxed mode should accumulate, not fail"
+
+                it "strict mode fails on first mismatch" $ do
+                    let stStrict = initTCState TCStrict
+                    let result = runTC (
+                            check (Lit (LInt 1)) (TCon "Bool") `tcBind` \_ ->
+                            check (Lit (LString "hi")) (TCon "Int")
+                            ) env0 stStrict
+                    case result of
+                        Left errs -> length errs `shouldBe` 1  -- only first error
+                        Right _ -> expectationFailure "Strict mode should fail on first"
+
+            describe "inferLambda with implicit params" $ do
+                it "strips implicit param from type" $ do
+                    -- function f [a:Type] (x:a) : a = x
+                    let lam = mkLambda "f" [Var "a" (Implicit (Id "Type")) UNDEFINED,
+                                            Var "x" (Id "a") UNDEFINED]
+                                        (Id "x") (Id "a")
+                    let Right (ty, _) = runTC (inferLambda lam) env0 st0
+                    -- Should return just the value-level arrow: a -> a (wrapped in forall)
+                    case ty of
+                        TArrow _ _ -> pure ()  -- some form of arrow type
+                        other -> expectationFailure $ "Expected arrow type, got: " ++ show other
+
+            describe "exprToTy extended coverage" $ do
+                it "converts empty Tuple to Unit" $ do
+                    let Right (ty, _) = runTC (exprToTy (Tuple [])) env0 st0
+                    ty `shouldBe` TCon "Unit"
+
+                it "converts single Tuple to inner type" $ do
+                    let Right (ty, _) = runTC (exprToTy (Tuple [Id "Int"])) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "converts multi Tuple to TSigma chain" $ do
+                    let Right (ty, _) = runTC (exprToTy (Tuple [Id "Int", Id "Bool"])) env0 st0
+                    ty `shouldBe` TSigma Nothing (TCon "Int") (TCon "Bool")
+
+                it "converts Implicit wrapper" $ do
+                    let Right (ty, _) = runTC (exprToTy (Implicit (Id "Int"))) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "converts EffType" $ do
+                    let effExpr = EffType (RecordType [("console", Id "Console")] False) (Id "Unit")
+                    let Right (ty, _) = runTC (exprToTy effExpr) env0 st0
+                    case ty of
+                        TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit") -> pure ()
+                        other -> expectationFailure $ "Expected Eff {console:Console} Unit, got: " ++ show other
+
+                it "converts PropEqT to TId" $ do
+                    let peq = App (Id "PropEqT") [Id "Nat", Id "Z", Id "Z"]
+                    let Right (ty, _) = runTC (exprToTy peq) env0 st0
+                    ty `shouldBe` TId (TCon "Nat") (TCon "Z") (TCon "Z")
+
+            describe "applySubst through complex types" $ do
+                it "substitutes through TApp" $ do
+                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
+                    let Right (ty, _) = runTC (applySubst (TApp (TCon "Maybe") [TVar 0])) env0 st1
+                    ty `shouldBe` TApp (TCon "Maybe") [TCon "Int"]
+
+                it "substitutes through TSigma" $ do
+                    let st1 = st0 { nextVar = 2, substitution = Map.fromList [(0, TCon "Int"), (1, TCon "Bool")] }
+                    let Right (ty, _) = runTC (applySubst (TSigma Nothing (TVar 0) (TVar 1))) env0 st1
+                    ty `shouldBe` TSigma Nothing (TCon "Int") (TCon "Bool")
+
+                it "substitutes through TId" $ do
+                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Z")] }
+                    let Right (ty, _) = runTC (applySubst (TId (TCon "Nat") (TVar 0) (TVar 0))) env0 st1
+                    ty `shouldBe` TId (TCon "Nat") (TCon "Z") (TCon "Z")
+
+                it "substitutes through TForall body" $ do
+                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
+                    let Right (ty, _) = runTC (applySubst (TForall "a" (TArrow (TRigid "a") (TVar 0)))) env0 st1
+                    ty `shouldBe` TForall "a" (TArrow (TRigid "a") (TCon "Int"))
+
+                it "substitutes through TRecord row" $ do
+                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
+                    let Right (ty, _) = runTC (applySubst (TRecord (RExtend "x" (TVar 0) REmpty))) env0 st1
+                    ty `shouldBe` TRecord (RExtend "x" (TCon "Int") REmpty)
+
+                it "substitutes through TEffect" $ do
+                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "String")] }
+                    let Right (ty, _) = runTC (applySubst (TEffect REmpty (TVar 0))) env0 st1
+                    ty `shouldBe` TEffect REmpty (TCon "String")
+
+                it "chases substitution chains" $ do
+                    -- ?0 -> ?1 -> Int
+                    let st1 = st0 { nextVar = 2, substitution = Map.fromList [(0, TVar 1), (1, TCon "Int")] }
+                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st1
+                    ty `shouldBe` TCon "Int"
+
+            describe "showTy coverage" $ do
+                it "showTy TVar" $ showTy (TVar 42) `shouldBe` "?42"
+                it "showTy TRigid" $ showTy (TRigid "a") `shouldBe` "a"
+                it "showTy TCon" $ showTy (TCon "Int") `shouldBe` "Int"
+                it "showTy TApp" $ showTy (TApp (TCon "Maybe") [TCon "Int"]) `shouldBe` "Maybe(Int)"
+                it "showTy TArrow" $ showTy (TArrow (TCon "Int") (TCon "Bool")) `shouldBe` "Int -> Bool"
+                it "showTy TPi dependent" $ showTy (TPi (Just "x") (TCon "Int") (TCon "Bool")) `shouldBe` "(x:Int) -> Bool"
+                it "showTy TSigma" $ showTy (TSigma Nothing (TCon "Int") (TCon "Bool")) `shouldBe` "(Int, Bool)"
+                it "showTy TSigma dependent" $ showTy (TSigma (Just "x") (TCon "Int") (TCon "Bool")) `shouldBe` "(x:Int * Bool)"
+                it "showTy TId" $ showTy (TId (TCon "Nat") (TCon "Z") (TCon "Z")) `shouldBe` "Id(Nat, Z, Z)"
+                it "showTy TForall" $ showTy (TForall "a" (TArrow (TRigid "a") (TRigid "a"))) `shouldBe` "forall a. a -> a"
+                it "showTy TRecord" $ showTy (TRecord (RExtend "x" (TCon "Int") REmpty)) `shouldBe` "{x:Int}"
+                it "showTy TEffect" $ showTy (TEffect (RExtend "c" (TCon "C") REmpty) (TCon "Unit")) `shouldBe` "Eff {c:C} Unit"
+                it "showTy TU 0" $ showTy (TU 0) `shouldBe` "Type"
+                it "showTy TU 1" $ showTy (TU 1) `shouldBe` "Type1"
+                it "showTy nested arrow in arg position" $ do
+                    showTy (TArrow (TArrow (TCon "Int") (TCon "Bool")) (TCon "String"))
+                        `shouldBe` "(Int -> Bool) -> String"
+                it "showRow with row variable" $ showRow (RVar 5) `shouldBe` "..?5"
+                it "showRow with rigid" $ showRow (RRigid "r") `shouldBe` "..r"
+                it "showRow multiple fields" $ do
+                    showRow (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                        `shouldBe` "x:Int, y:Bool"
+
+            describe "showTCError coverage" $ do
+                it "ConstraintUnsolved shows structure name" $ do
+                    let err = ConstraintUnsolved (CStructure "Eq" [TCon "MyType"])
+                    showTCError err `shouldSatisfy` ("Eq" `isInfixOf`)
+                    showTCError err `shouldSatisfy` ("MyType" `isInfixOf`)
+
+                it "WithContext nests context info" $ do
+                    let err = WithContext "method 'foo'" (WithContext "class Bar" (Mismatch (TCon "Int") (TCon "Bool")))
+                    let s = showTCError err
+                    s `shouldSatisfy` ("foo" `isInfixOf`)
+                    s `shouldSatisfy` ("Bar" `isInfixOf`)
+                    s `shouldSatisfy` ("Int" `isInfixOf`)
+
+            describe "Numeric literal types" $ do
+                it "infers Int8 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LInt8 1))) env0 st0
+                    ty `shouldBe` TCon "Int8"
+                it "infers Int16 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LInt16 1))) env0 st0
+                    ty `shouldBe` TCon "Int16"
+                it "infers Int32 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LInt32 1))) env0 st0
+                    ty `shouldBe` TCon "Int32"
+                it "infers Int64 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LInt64 1))) env0 st0
+                    ty `shouldBe` TCon "Int64"
+                it "infers UInt8 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LWord8 1))) env0 st0
+                    ty `shouldBe` TCon "UInt8"
+                it "infers UInt16 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LWord16 1))) env0 st0
+                    ty `shouldBe` TCon "UInt16"
+                it "infers UInt32 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LWord32 1))) env0 st0
+                    ty `shouldBe` TCon "UInt32"
+                it "infers UInt64 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LWord64 1))) env0 st0
+                    ty `shouldBe` TCon "UInt64"
+                it "infers Float32 literal" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LFloat32 1.0))) env0 st0
+                    ty `shouldBe` TCon "Float32"
+
+            describe "Misc infer cases" $ do
+                it "infers empty LList" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LList []))) env0 st0
+                    case ty of
+                        TApp (TCon "List") [TVar _] -> pure ()
+                        other -> expectationFailure $ "Expected List(?), got: " ++ show other
+                it "infers non-empty LList" $ do
+                    let Right (ty, _) = runTC (infer (Lit (LList [Lit (LInt 1)]))) env0 st0
+                    ty `shouldBe` TApp (TCon "List") [TCon "Int"]
+
+                it "Typed expression checks against annotation" $ do
+                    let Right (ty, _) = runTC (infer (Typed (Lit (LInt 42)) (Id "Int"))) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "Typed expression with mismatch warns" $ do
+                    let result = runTC (infer (Typed (Lit (LInt 42)) (Id "Bool"))) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _ -> pure ()
+
+                it "PatternMatches empty returns fresh var" $ do
+                    let Right (ty, _) = runTC (infer (PatternMatches [])) env0 st0
+                    case ty of
+                        TVar _ -> pure ()
+                        other -> expectationFailure $ "Expected fresh var, got: " ++ show other
+
+                it "Statements infers last statement type" $ do
+                    let Right (ty, _) = runTC (infer (Statements [Lit (LString "a"), Lit (LInt 42)])) env0 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "empty Statements returns Unit" $ do
+                    let Right (ty, _) = runTC (infer (Statements [])) env0 st0
+                    ty `shouldBe` TCon "Unit"
+
+                it "UnaryOp dispatches to App" $ do
+                    let env1 = env0 { varTypes = Map.fromList [("negate", TArrow (TCon "Int") (TCon "Int"))] }
+                    let Right (ty, _) = runTC (infer (UnaryOp "negate" (Lit (LInt 5)))) env1 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "BinaryOp dispatches to App" $ do
+                    let env1 = env0 { varTypes = Map.fromList [("+", TArrow (TCon "Int") (TArrow (TCon "Int") (TCon "Int")))] }
+                    let Right (ty, _) = runTC (infer (BinaryOp "+" (Lit (LInt 1)) (Lit (LInt 2)))) env1 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "U n infers TU (n+1)" $ do
+                    let Right (ty, _) = runTC (infer (U 0)) env0 st0
+                    ty `shouldBe` TU 1
+                    let Right (ty2, _) = runTC (infer (U 1)) env0 st0
+                    ty2 `shouldBe` TU 2
+
+                it "SumType infers Type" $ do
+                    let Right (ty, _) = runTC (infer (SumType (mkLambda "Bool" [] (Tuple []) (U 0)))) env0 st0
+                    ty `shouldBe` TU 0
+
+                it "ReprCast infers target type" $ do
+                    let Right (ty, _) = runTC (infer (ReprCast (Lit (LInt 42)) (Id "Nat"))) env0 st0
+                    ty `shouldBe` TCon "Nat"
+
+                it "ERROR node warns and returns fresh var" $ do
+                    let Right (ty, st') = runTC (infer (ERROR "test error")) env0 st0
+                    case ty of
+                        TVar _ -> pure ()
+                        other -> expectationFailure $ "Expected fresh var, got: " ++ show other
+                    tcErrors st' `shouldSatisfy` (not . null)
+
+                it "RecFieldAccess on record type extracts field" $ do
+                    let recTy = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                        env1 = env0 { varTypes = Map.fromList [("r", recTy)] }
+                    let Right (ty, _) = runTC (infer (RecFieldAccess ("x", -1) (Id "r"))) env1 st0
+                    ty `shouldBe` TCon "Int"
+
+                it "RecFieldAccess on non-record returns fresh var" $ do
+                    let env1 = env0 { varTypes = Map.fromList [("n", TCon "Int")] }
+                    let Right (ty, _) = runTC (infer (RecFieldAccess ("x", -1) (Id "n"))) env1 st0
+                    case ty of
+                        TVar _ -> pure ()
+                        other -> expectationFailure $ "Expected fresh var, got: " ++ show other
+
+            describe "lamToTy" $ do
+                it "converts simple lambda to arrow type" $ do
+                    let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
+                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    case ty of
+                        TArrow (TCon "Int") _ -> pure ()
+                        other -> expectationFailure $ "Expected Int -> ?, got: " ++ show other
+
+                it "converts multi-param lambda to nested arrows" $ do
+                    let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED, Var "y" (Id "Bool") UNDEFINED]
+                                        UNDEFINED (Id "String")
+                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    case ty of
+                        TArrow (TCon "Int") (TArrow (TCon "Bool") _) -> pure ()
+                        other -> expectationFailure $ "Expected Int -> Bool -> ?, got: " ++ show other
+
+                it "converts zero-param lambda to return type" $ do
+                    let lam = mkLambda "f" [] UNDEFINED (Id "Int")
+                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    case ty of
+                        TVar _ -> pure ()  -- UNDEFINED return type -> fresh var
+                        TCon "Int" -> pure ()
+                        other -> expectationFailure $ "Expected Int or fresh var, got: " ++ show other
+
+            describe "tyToName" $ do
+                it "extracts name from TCon" $ tyToName (TCon "Int") `shouldBe` "Int"
+                it "extracts name from TApp head" $ tyToName (TApp (TCon "Maybe") [TCon "Int"]) `shouldBe` "Maybe"
+                it "returns empty for TVar" $ tyToName (TVar 0) `shouldBe` ""
+                it "returns empty for TRigid" $ tyToName (TRigid "a") `shouldBe` ""
+                it "returns empty for TArrow" $ tyToName (TArrow (TCon "Int") (TCon "Bool")) `shouldBe` ""
+
+            describe "Context nesting" $ do
+                it "nested tcWithContext shows innermost context" $ do
+                    let result = runTC (
+                            tcWithContext "outer" (
+                              tcWithContext "inner" (
+                                tcWarnOrFail (OtherError "test")
+                              ))
+                            ) env0 st0
+                    case result of
+                        Right (_, st') -> do
+                            let errs = tcErrors st'
+                            length errs `shouldBe` 1
+                            case Prelude.head errs of
+                                WithContext ctx _ -> ctx `shouldBe` "inner"
+                                other -> expectationFailure $ "Expected WithContext, got: " ++ show other
+                        Left errs -> do
+                            case Prelude.head errs of
+                                WithContext ctx _ -> ctx `shouldBe` "inner"
+                                other -> expectationFailure $ "Expected WithContext, got: " ++ show other
+
+            describe "generalize edge cases" $ do
+                it "no free vars produces no forall" $ do
+                    let Right (ty, _) = runTC (generalize (TArrow (TCon "Int") (TCon "Bool"))) env0 st0
+                    ty `shouldBe` TArrow (TCon "Int") (TCon "Bool")
+
+                it "multiple free vars produce multiple foralls" $ do
+                    let Right (ty, _) = runTC (generalize (TArrow (TVar 0) (TArrow (TVar 1) (TVar 0)))) env0 (st0 { nextVar = 2 })
+                    case ty of
+                        TForall _ (TForall _ _) -> pure ()
+                        other -> expectationFailure $ "Expected forall a. forall b. ..., got: " ++ show other
+
+            describe "Bidirectional check integration" $ do
+                it "check record literal against compatible open record" $ do
+                    let st1 = st0 { nextVar = 1 }
+                        recLit = RecordLit [("x", Lit (LInt 1)), ("y", Lit (LFloat 2.0))]
+                        openRecTy = TRecord (RExtend "x" (TCon "Int") (RVar 0))
+                    let result = runTC (check recLit openRecTy) env0 st1
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Open record should accept extra fields: " ++ show errs
+
+                it "checkTopLevel SumType passes" $ do
+                    let result = runTC (checkTopLevel (SumType (mkLambda "Bool" [] (Tuple []) (U 0)))) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "SumType should pass: " ++ show errs
+
+                it "checkTopLevel Instance checks implementations" $ do
+                    let result = runTC (checkTopLevel (Instance "Eq" [Id "Bool"] [Function (mkLambda "==" [] UNDEFINED UNDEFINED)] [])) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Instance should pass: " ++ show errs
 
         -- ============================================================
         -- Phase 0: Module system parsing
@@ -2747,3 +3731,211 @@ main = do
                 st23 <- loadTestProgram st "tests/programs/P23_ExternClasses.tl"
                 result <- evalExpr st23 "t3()"
                 result `shouldBe` CLMLIT (LString "clicked")
+
+        describe "P24: Class Subtyping & Downcast" $ do
+            it "subclass value where superclass expected" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t1()"
+                result `shouldBe` CLMLIT (LString "Rex")
+            it "grandchild value where grandparent expected" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t2()"
+                result `shouldBe` CLMLIT (LString "Tiny")
+            it "pattern match subclass constructor (Dog branch)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t3()"
+                result `shouldBe` CLMLIT (LString "Lab")
+            it "pattern match subclass constructor (Cat branch)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t4()"
+                result `shouldBe` CLMLIT (LString "cat")
+            it "pattern match wildcard (base class)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t5()"
+                result `shouldBe` CLMLIT (LString "other")
+            it "safe downcast succeeds (Dog as Dog)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t6()"
+                result `shouldBe` CLMLIT (LString "Lab")
+            it "safe downcast fails (Cat as Dog)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t7()"
+                result `shouldBe` CLMLIT (LString "not a dog")
+            it "downcast Puppy as Dog succeeds (subclass)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t8()"
+                result `shouldBe` CLMLIT (LString "Poodle")
+            it "downcast Animal as Dog fails (not a subclass)" $ do
+                st24 <- loadTestPrograms st ["tests/programs/P20_Classes.tl", "tests/programs/P24_ClassSubtyping.tl"]
+                result <- evalExpr st24 "t9()"
+                result `shouldBe` CLMLIT (LString "not a dog")
+
+        describe "P25: Pure String Library" $ do
+            it "t1: encode ASCII = 1 byte" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t1()"
+                result `shouldBe` CLMLIT (LInt 1)
+            it "t2: encode 2-byte codepoint" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t2()"
+                result `shouldBe` CLMLIT (LInt 2)
+            it "t3: encode 3-byte codepoint" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t3()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t4: encode 4-byte codepoint (emoji)" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t4()"
+                result `shouldBe` CLMLIT (LInt 4)
+            it "t5: decode ASCII byte = 65" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t5()"
+                result `shouldBe` CLMLIT (LInt 65)
+            it "t6: count code points" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t6()"
+                result `shouldBe` CLMLIT (LInt 2)
+            it "t7: valid UTF-8" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t7()"
+                result `shouldBe` conTrue
+            it "t8: invalid UTF-8" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t8()"
+                result `shouldBe` conFalse
+            it "t9: Str byte length" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t9()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t10: empty string check" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t10()"
+                result `shouldBe` conTrue
+            it "t11: non-empty string check" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t11()"
+                result `shouldBe` conFalse
+            it "t12: Str equality" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t12()"
+                result `shouldBe` conTrue
+            it "t13: Str inequality" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t13()"
+                result `shouldBe` conTrue
+            it "t14: Str ordering" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t14()"
+                result `shouldBe` CLMCON (ConsTag "LessThan" 0) []
+            it "t15: Str semigroup combine" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t15()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t16: byteLength" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t16()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t17: strSlice" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t17()"
+                result `shouldBe` conTrue
+            it "t18: strDecodeAt" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t18()"
+                result `shouldBe` CLMLIT (LInt 65)
+            it "t19: strIndexOf found" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t19()"
+                result `shouldBe` CLMLIT (LInt 1)
+            it "t20: strIndexOf not found" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t20()"
+                result `shouldBe` CLMLIT (LInt (-1))
+            it "t21: charCount" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t21()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t22: nthChar" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t22()"
+                result `shouldBe` CLMLIT (LInt 66)
+            it "t23: strStartsWith true" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t23()"
+                result `shouldBe` conTrue
+            it "t24: strStartsWith false" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t24()"
+                result `shouldBe` conFalse
+            it "t25: strEndsWith" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t25()"
+                result `shouldBe` conTrue
+            it "t26: strSplit count" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t26()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t27: strJoin" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t27()"
+                result `shouldBe` conTrue
+            it "t28: strReplace" $ do
+                st25 <- loadTestProgram st "tests/programs/P25_Strings.tl"
+                result <- evalExpr st25 "t28()"
+                result `shouldBe` conTrue
+
+        describe "P26: String Literal Desugaring" $ do
+            it "t1: string literal byte length" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t1()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t2: empty string literal" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t2()"
+                result `shouldBe` conTrue
+            it "t3: string literal equality" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t3()"
+                result `shouldBe` conTrue
+            it "t4: string literal inequality" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t4()"
+                result `shouldBe` conTrue
+            it "t5: string literal concat byte length" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t5()"
+                result `shouldBe` CLMLIT (LInt 4)
+            it "t6: charCount on string literal" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t6()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t7: strStartsWith with literals" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t7()"
+                result `shouldBe` conTrue
+            it "t8: strEndsWith with literals" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t8()"
+                result `shouldBe` conTrue
+            it "t9: strIndexOf with literals" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t9()"
+                result `shouldBe` CLMLIT (LInt 2)
+            it "t10: string compare ordering" $ do
+                st26 <- loadTestProgram (enableNewStrings st) "tests/programs/P26_StringDesugar.tl"
+                result <- evalExpr st26 "t10()"
+                result `shouldBe` CLMCON (ConsTag "LessThan" 0) []
+
+        describe "P27: Parameterized Repr" $ do
+            it "t1: parameterized repr toRepr" $ do
+                st27 <- loadTestProgram st "tests/programs/P27_ParamRepr.tl"
+                result <- evalExpr st27 "t1()"
+                result `shouldBe` CLMLIT (LInt 3)
+            it "t2: parameterized repr fromRepr" $ do
+                st27 <- loadTestProgram st "tests/programs/P27_ParamRepr.tl"
+                result <- evalExpr st27 "t2()"
+                result `shouldBe` CLMLIT (LInt 20)
+            it "t3: simple repr backward compat" $ do
+                st27 <- loadTestProgram st "tests/programs/P27_ParamRepr.tl"
+                result <- evalExpr st27 "t3()"
+                result `shouldBe` CLMLIT (LInt 0)

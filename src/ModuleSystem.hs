@@ -29,7 +29,7 @@ module ModuleSystem
 
 import Surface (Name, ModulePath, Expr(..), ImportSpec(..), Lambda(..))
 import State
-import Pipeline (afterparserPass, actionDesugarPass, buildEnvPass, recordDesugarPass, lamToCLMPass, timedPass)
+import Pipeline (afterparserPass, actionDesugarPass, stringLiteralDesugarPass, buildEnvPass, recordDesugarPass, lamToCLMPass, timedPass)
 import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness)
 import CLMOptimize (runCLMOptPasses)
 import Parser (parseWholeFile)
@@ -249,6 +249,8 @@ loadFileQuiet nm = do
         Left _err -> liftIO $ putStrLn $ "Error loading " ++ nm ++ ": parse error"
         Right exprs -> do
             timedPass "Pass 0 (desugar)" afterparserPass
+            clearAllLogs
+            timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
             clearAllLogs
             timedPass "Pass 0.5 (action desugar)" actionDesugarPass
             clearAllLogs

@@ -19,6 +19,9 @@ import qualified Data.Text.Lazy as TL
 import Data.List.Index
 import Data.List (intercalate)
 import Data.Maybe (isNothing, listToMaybe)
+import Data.Char (ord)
+import Data.Word (Word8)
+import Data.Bits ((.&.), (.|.), shiftR)
 
 import Util.PrettyPrinting as TC
 import Text.Pretty.Simple (pPrint, pShow)
@@ -162,6 +165,50 @@ desugarActionStmts (ActionExpr e : rest) =
     -- seq(expr, rest) = bind(expr, \_ -> rest)
     App (Id "seq") [e, Function (mkLambda "" [Var "_" UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
 
+--------------------------------------------------------------------------------
+-- PASS 0.25: String literal desugaring
+-- "hello" → fromStringLiteral([0x68, 0x65, 0x6C, 0x6C, 0x6F])
+-- Controlled by `newStrings` flag. When off, string literals pass through
+-- as primitive LString for backward compatibility.
+--------------------------------------------------------------------------------
+stringLiteralDesugarPass :: IntState ()
+stringLiteralDesugarPass = do
+    s <- get
+    let ns = newStrings (currentFlags s)
+    when ns $ do
+        let mod' = Prelude.map (\(e, si) -> (desugarStringLiterals e, si)) (parsedModule s)
+        put (s { parsedModule = mod' })
+        verboseLog "  Pass 0.25: string literal desugaring"
+
+-- Desugar LString literals into fromStringLiteral(Array(Byte)) calls
+desugarStringLiterals :: Expr -> Expr
+desugarStringLiterals = traverseExpr desugarStringLit
+
+desugarStringLit :: Expr -> Expr
+desugarStringLit (Lit (LString s)) =
+    let bytes = encodeUtf8 s
+        byteExprs = Prelude.map (Lit . LWord8) bytes
+        byteLen = Prelude.length bytes
+    in App (Id "Str") [ArrayLit byteExprs, Lit (LInt byteLen)]
+desugarStringLit e = e
+
+-- | Encode a Haskell String to UTF-8 bytes (compile-time)
+encodeUtf8 :: String -> [Word8]
+encodeUtf8 = Prelude.concatMap encodeChar
+  where
+    encodeChar c
+        | cp <= 0x7F    = [fromIntegral cp]
+        | cp <= 0x7FF   = [ fromIntegral (0xC0 .|. (cp `shiftR` 6))
+                          , fromIntegral (0x80 .|. (cp .&. 0x3F)) ]
+        | cp <= 0xFFFF  = [ fromIntegral (0xE0 .|. (cp `shiftR` 12))
+                          , fromIntegral (0x80 .|. ((cp `shiftR` 6) .&. 0x3F))
+                          , fromIntegral (0x80 .|. (cp .&. 0x3F)) ]
+        | otherwise     = [ fromIntegral (0xF0 .|. (cp `shiftR` 18))
+                          , fromIntegral (0x80 .|. ((cp `shiftR` 12) .&. 0x3F))
+                          , fromIntegral (0x80 .|. ((cp `shiftR` 6) .&. 0x3F))
+                          , fromIntegral (0x80 .|. (cp .&. 0x3F)) ]
+      where cp = ord c
+
 -- Resolve spread fields (..Name) in a constructor lambda's params
 -- by looking up the source record/type's constructor fields from the environment
 resolveSpreadFields :: Environment -> Lambda -> Lambda
@@ -199,6 +246,13 @@ processBinding (Function lam, si) env
             opBody = CaseOf [] (Function lam) si
             wrapper = (mkLambda (lamName lam) implParams (PatternMatches [opBody]) (Function lam)) { lamSrcInfo = si }
         in pure $ addNamedLambda wrapper env
+    | hasImplicit lam =
+        -- Standalone function with implicit type params (e.g., function foo [s:Type] (x:s) : Int = ...)
+        -- Type params are erased at compile time; register as regular function with value params only.
+        -- Inner calls to algebra methods handle their own dispatch through CLMIAP.
+        let valueParams = Prelude.dropWhile isImplicitVar (params lam)
+            lam' = lam { params = valueParams }
+        in pure $ addLambda (lamName lam') lam' env
     | otherwise = pure $ addLambda (lamName lam) lam env
 -- treating actions the same way - they will have some proper type eventually anyway
 processBinding (Action lam, si) env = pure $ addLambda (lamName lam) lam env
@@ -455,8 +509,10 @@ processBinding (Instance structName typeArgs impls reqs, si) env = do
         _ -> do
             -- for each function in the instance, store a specialized lambda
             env' <- foldM (addInstanceFunc typeNames) env impls
+            -- propagate default methods from the structure itself
+            env'a <- propagateDefaults typeNames env' structName
             -- propagate instance functions to parent structures
-            env'' <- propagateToParent env' structName typeNames impls si
+            env'' <- propagateToParent env'a structName typeNames impls si
             -- auto-compose morphism instances (for 2-param morphisms)
             env''' <- composeMorphismInstances env'' structName typeNames si
             pure env'''
@@ -475,7 +531,8 @@ processBinding (Instance structName typeArgs impls reqs, si) env = do
             pure env1
 
 -- repr declaration: register toRepr/fromRepr as instance lambdas + store in reprMap
-processBinding (Repr userTypeName reprTypeExpr isDefault fns maybeInv, si) env = do
+processBinding (Repr userTypeExpr reprTypeExpr isDefault fns maybeInv, si) env = do
+    let userTypeName = mkReprKey userTypeExpr
     let reprTypeName = case reprTypeExpr of { Id nm -> nm; App (Id nm) _ -> nm; _ -> "unknown" }
     let findFn fname = listToMaybe [lam | Function lam <- fns, lamName lam == fname]
     case (findFn "toRepr", findFn "fromRepr") of
@@ -1047,21 +1104,21 @@ exprToCLM _ (U n) = CLMU n
 -- ReprCast: resolve direction based on repr map
 -- If targetType is a user type (key in reprMap) → use fromRepr
 -- If targetType is a repr type (value in reprMap) → use toRepr
-exprToCLM env (ReprCast e (Id targetType)) =
-    let clmE = exprToCLM env e
-    in if Map.member targetType (reprMap env)
-       then CLMIAP (CLMID "fromRepr") [clmE]  -- target is user type, convert from repr
-       else if isReprTarget targetType env
-            then CLMIAP (CLMID "toRepr") [clmE]  -- target is repr type, convert to repr
-            else CLMERR ("[CLM] no repr found for cast to " ++ targetType) SourceInteractive
+-- Uses mkReprKey for parameterized type support (e.g., Array(Byte) as PackedBytes)
 exprToCLM env (ReprCast e tp) =
-    let targetType = case tp of { App (Id nm) _ -> nm; _ -> "" }
+    let reprKey = mkReprKey tp
+        simpleName = case tp of { Id nm -> nm; App (Id nm) _ -> nm; _ -> "" }
         clmE = exprToCLM env e
-    in if Map.member targetType (reprMap env)
-       then CLMIAP (CLMID "fromRepr") [clmE]
-       else if isReprTarget targetType env
-            then CLMIAP (CLMID "toRepr") [clmE]
-            else CLMERR ("[CLM] no repr found for cast to " ++ show tp) SourceInteractive
+    in if Map.member reprKey (reprMap env)
+       then CLMIAP (CLMID "fromRepr") [clmE]  -- target is user type, convert from repr
+       else if isReprTarget reprKey env || isReprTarget simpleName env
+            then CLMIAP (CLMID "toRepr") [clmE]  -- target is repr type, convert to repr
+            else if not (Prelude.null simpleName) && Map.member simpleName (classDecls env)
+                 then CLMIAP (CLMID "__downcast") [CLMLIT (LString simpleName), clmE]
+                 -- fallback: try simple name in reprMap (backward compat)
+                 else if Map.member simpleName (reprMap env)
+                      then CLMIAP (CLMID "fromRepr") [clmE]
+                      else CLMERR ("[CLM] no repr or class found for cast to " ++ show tp) SourceInteractive
 exprToCLM _ (ArrowType _ _) = CLMEMPTY  -- type-level, erased at runtime
 exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
 -- Record literal: convert to a constructor-like tuple of values (field order preserved)

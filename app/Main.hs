@@ -240,6 +240,14 @@ processSet "verbose" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { verbose = False} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose off"
 
+processSet "newstrings" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { newStrings = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "newstrings on" ++ " (string literals desugar to fromStringLiteral)"
+
+processSet "newstrings" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { newStrings = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "newstrings off" ++ " (string literals pass through as primitive)"
+
 processSet "optimize" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { optSettings = defaultOptFlags } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "optimization on (all passes)"
@@ -318,6 +326,10 @@ loadFileNew nm = do
                 liftIO (putStrLn $ "Received " ++ show (length (parsedModule st)) ++ " statements.")
                 liftIO (putStrLn $ "Executing pass 0: " ++ TC.as [TC.bold, TC.underlined] "after parser desugaring")
                 timedPass "Pass 0 (desugar)" afterparserPass
+                showAllLogsWSource
+                clearAllLogs
+                liftIO (putStrLn $ "Executing pass 0.25: " ++ TC.as [TC.bold, TC.underlined] "string literal desugaring")
+                timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
                 showAllLogsWSource
                 clearAllLogs
                 liftIO (putStrLn $ "Executing pass 0.5: " ++ TC.as [TC.bold, TC.underlined] "action block desugaring")
