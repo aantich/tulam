@@ -33,6 +33,7 @@ dependencies:
 - pretty-simple
 - haskeline
 - directory
+- filepath
 - ilist
 - indexed-traversable
 
@@ -61,6 +62,25 @@ executables:
     dependencies:
     - tulam
 
+  tldoc:
+    main:                Main.hs
+    source-dirs:         tools/tldoc
+    dependencies:
+    - base >= 4.7 && < 5
+    - time
+    - directory
+    - filepath
+
+  tulam-bench:
+    main:                Main.hs
+    source-dirs:         tools/tulam-bench
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - tulam
+
 tests:
   tulam-test:
     main:                Spec.hs
@@ -71,3 +91,4 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - tulam
+    - hspec

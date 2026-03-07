@@ -7,8 +7,9 @@ module State where
 
 import qualified Data.HashTable.IO as H
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.State.Strict 
+import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
+import Data.IORef
 
 import Data.Text as L
 
@@ -17,6 +18,8 @@ import Data.Sequence as S
 import Surface
 import CLM
 import Data.HashMap.Strict as Map
+import qualified Data.Set as Set
+import qualified Data.List
 -- import Core.Environment
 
 import Util.IOLogger as Log
@@ -25,6 +28,86 @@ import Logs as Logs
 
 type NameMap = HashMap Name
 type LTProgram = [(Expr, SourceInfo)]
+
+-- Module environment: tracks module-level information
+data ModuleEnv = ModuleEnv {
+    moduleName     :: ModulePath,                         -- current module's path
+    publicNames    :: Set.Set Name,                       -- public (default) names
+    privateNames   :: Set.Set Name,                       -- private names
+    moduleImports  :: [(ModulePath, ImportSpec, Maybe Name)], -- imports
+    moduleExports  :: [(ModulePath, Maybe [Name])],       -- re-exports
+    loadedModules  :: HashMap String ModuleEnv            -- loaded sub-modules
+} deriving Show
+
+emptyModuleEnv :: ModuleEnv
+emptyModuleEnv = ModuleEnv {
+    moduleName    = [],
+    publicNames   = Set.empty,
+    privateNames  = Set.empty,
+    moduleImports = [],
+    moduleExports = [],
+    loadedModules = Map.empty
+}
+
+-- | Get all names currently defined in the environment
+allEnvNames :: Environment -> Set.Set Name
+allEnvNames env = Set.unions
+    [ Set.fromList (Map.keys (types env))
+    , Set.fromList (Map.keys (constructors env))
+    , Set.fromList (Map.keys (topLambdas env))
+    , Set.fromList (Map.keys (instanceLambdas env))
+    ]
+
+-- | Remove names from the environment (for visibility enforcement)
+removeNames :: Set.Set Name -> Environment -> Environment
+removeNames names env = env
+    { types = Map.filterWithKey (\k _ -> not (Set.member k names)) (types env)
+    , constructors = Map.filterWithKey (\k _ -> not (Set.member k names)) (constructors env)
+    , topLambdas = Map.filterWithKey (\k _ -> not (Set.member k names)) (topLambdas env)
+    , topBindings = Map.filterWithKey (\k _ -> not (Set.member k names)) (topBindings env)
+    , clmLambdas = Map.filterWithKey (\k _ -> not (Set.member k names)) (clmLambdas env)
+    , clmBindings = Map.filterWithKey (\k _ -> not (Set.member k names)) (clmBindings env)
+    }
+
+-- | Merge one environment into another (restore hidden names)
+mergeEnvironment :: Environment -> Environment -> Environment
+mergeEnvironment base overlay = Environment
+    { types = Map.union (types overlay) (types base)
+    , constructors = Map.union (constructors overlay) (constructors base)
+    , topLambdas = Map.union (topLambdas overlay) (topLambdas base)
+    , topBindings = Map.union (topBindings overlay) (topBindings base)
+    , clmLambdas = Map.union (clmLambdas overlay) (clmLambdas base)
+    , clmBindings = Map.union (clmBindings overlay) (clmBindings base)
+    , instanceLambdas = Map.union (instanceLambdas overlay) (instanceLambdas base)
+    , clmInstances = Map.union (clmInstances overlay) (clmInstances base)
+    , structInheritance = Map.union (structInheritance overlay) (structInheritance base)
+    , reprMap = Map.union (reprMap overlay) (reprMap base)
+    , effectDecls = Map.union (effectDecls overlay) (effectDecls base)
+    , effectHandlers = Map.union (effectHandlers overlay) (effectHandlers base)
+    , classDecls = Map.union (classDecls overlay) (classDecls base)
+    , classTagCounter = max (classTagCounter overlay) (classTagCounter base)
+    , targetImports = targetImports overlay ++ targetImports base
+    , outProgram = Map.union (outProgram overlay) (outProgram base)
+    , rawCLMLambdas = Map.union (rawCLMLambdas overlay) (rawCLMLambdas base)
+    , rawCLMInstances = Map.union (rawCLMInstances overlay) (rawCLMInstances base)
+    }
+
+-- Class metadata for OOP class declarations
+data ClassMeta = ClassMeta {
+    cmParent        :: Maybe Name,             -- parent class name
+    cmAllFields     :: [Var],                  -- ALL fields: inherited then own
+    cmOwnFields     :: [Var],                  -- this class's new fields only
+    cmMethods       :: NameMap CLMLam,          -- ALL methods (inherited + overridden + new)
+    cmStaticMethods :: NameMap CLMLam,          -- static methods
+    cmFieldIndices  :: NameMap Int,             -- field name -> positional index
+    cmModifier      :: ClassModifier,           -- Normal | Abstract | Sealed
+    cmChildren      :: [Name],                  -- direct subclass names (for sealed checking)
+    cmImplements    :: [Name],                  -- algebra names
+    cmSuperArgs     :: [Expr],                  -- super constructor argument expressions
+    cmExtern        :: Maybe Name,              -- target name if extern, Nothing if tulam-native
+    cmTag           :: Int,                      -- unique class tag for ConsTag
+    cmSourceFile    :: String                    -- file where class was declared
+} deriving (Show, Eq)
 
 -- structure keeping our current environment
 data Environment = Environment {
@@ -41,7 +124,21 @@ data Environment = Environment {
     clmInstances    :: NameMap CLMLam,
     -- structure inheritance: maps child structure name to list of parent names
     structInheritance :: NameMap [Name],
-    outProgram   :: NameMap String
+    -- repr map: user type -> list of (reprTypeName, isDefault, toReprLam, fromReprLam, maybeInvariant)
+    reprMap :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)],
+    -- effect declarations: effect name -> (params, operations)
+    effectDecls :: NameMap ([Var], [Lambda]),
+    -- effect handlers: handler name -> (effect name, implementations)
+    effectHandlers :: NameMap (Name, [Expr]),
+    -- Class hierarchy
+    classDecls :: NameMap ClassMeta,
+    classTagCounter :: !Int,
+    -- Target imports for extern class metadata resolution (codegen-time)
+    targetImports :: [(ModulePath, Name)],
+    outProgram   :: NameMap String,
+    -- Pre-optimization CLM snapshots (for :clm-raw comparison)
+    rawCLMLambdas  :: NameMap CLMLam,
+    rawCLMInstances :: NameMap CLMLam
 } deriving Show
 
 initialEnvironment = Environment {
@@ -54,7 +151,15 @@ initialEnvironment = Environment {
     instanceLambdas = Map.empty,
     clmInstances = Map.empty,
     structInheritance = Map.empty,
-    outProgram   = Map.empty
+    reprMap = Map.empty,
+    effectDecls = Map.empty,
+    effectHandlers = Map.empty,
+    classDecls = Map.empty,
+    classTagCounter = 1000,
+    targetImports = [],
+    outProgram   = Map.empty,
+    rawCLMLambdas = Map.empty,
+    rawCLMInstances = Map.empty
 }
 
 
@@ -72,29 +177,91 @@ data InterpreterState = InterpreterState {
     -- this is being filled by the parser as we go, so last line in the file will be first here!
     parsedModule :: LTProgram,
     currentSource :: Text,
-    currentEnvironment :: Environment
-} deriving Show
+    currentEnvironment :: Environment,
+    currentModuleEnv :: ModuleEnv,
+    libSearchPaths :: [FilePath],
+    -- | Source text per loaded file, for error display
+    loadedSources :: HashMap FilePath Text,
+    -- Managed mutability: IORef-backed mutable references
+    refTable       :: HashMap Int (IORef CLMExpr),
+    nextRefId      :: !Int,
+    -- Managed mutability: mutable arrays (IORef-wrapped list for simplicity)
+    mutArrayTable  :: HashMap Int (IORef [CLMExpr]),
+    nextMutArrayId :: !Int
+}
+
+instance Show InterpreterState where
+    show st = "InterpreterState { currentFlags = " ++ show (currentFlags st)
+        ++ ", parsedModule = " ++ show (Prelude.length (parsedModule st)) ++ " items"
+        ++ ", refs = " ++ show (nextRefId st) ++ " allocated"
+        ++ ", mutArrays = " ++ show (nextMutArrayId st) ++ " allocated"
+        ++ " }"
 
 emptyIntState = InterpreterState {
-    currentFlags = CurrentFlags False True False,
+    currentFlags = CurrentFlags False True False False False defaultOptFlags,
     parsedModule = [],
     currentSource = "",
-    currentEnvironment = initialEnvironment
+    currentEnvironment = initialEnvironment,
+    currentModuleEnv = emptyModuleEnv,
+    libSearchPaths = ["lib/"],
+    loadedSources = Map.empty,
+    refTable = Map.empty,
+    nextRefId = 0,
+    mutArrayTable = Map.empty,
+    nextMutArrayId = 0
 }
+
+-- | Per-pass optimization flags
+data OptFlags = OptFlags {
+    optimizeEnabled   :: Bool  -- master toggle
+  , optEtaReduce      :: Bool
+  , optConstantFold   :: Bool
+  , optKnownConstructor :: Bool
+  , optDeadCodeElim   :: Bool
+  , optInlineSmall    :: Bool  -- Phase 2
+} deriving Show
+
+defaultOptFlags :: OptFlags
+defaultOptFlags = OptFlags True True True True True True
 
 data CurrentFlags = CurrentFlags {
     strict    :: Bool -- true if strict, false if lazy
   , pretty    :: Bool -- pretty print or raw output
   , tracing   :: Bool -- whether to trace execution steps
+  , strictTypes :: Bool -- true if type errors are fatal, false for warnings
+  , verbose   :: Bool -- verbose pass logging and timing
+  , optSettings :: OptFlags -- optimization pass settings
 } deriving Show
+
+-- Safety limits for evaluation
+maxEvalIterations :: Int
+maxEvalIterations = 10000
+
+maxEvalDepth :: Int
+maxEvalDepth = 1000
 
 initializeInterpreter :: IO InterpreterState
 initializeInterpreter = return $ InterpreterState {
-    currentFlags = CurrentFlags False True False,
+    currentFlags = CurrentFlags False True False False False defaultOptFlags,
     parsedModule = [],
     currentSource = "",
-    currentEnvironment = initialEnvironment
+    currentEnvironment = initialEnvironment,
+    currentModuleEnv = emptyModuleEnv,
+    libSearchPaths = ["lib/"],
+    loadedSources = Map.empty,
+    refTable = Map.empty,
+    nextRefId = 0,
+    mutArrayTable = Map.empty,
+    nextMutArrayId = 0
 }
+
+-- | Apply a pure lambda transformation to both topLambdas and instanceLambdas.
+-- Common pattern used by multiple passes (record desugaring, CLM conversion, etc.)
+transformLambdaMaps :: (Lambda -> Lambda) -> Environment -> Environment
+transformLambdaMaps f env = env
+    { topLambdas = Map.map f (topLambdas env)
+    , instanceLambdas = Map.map f (instanceLambdas env)
+    }
 
 ------------------ Monadic traversal of the Expr tree ---------------------
 -- needed for optimizations, error checking etc
@@ -120,9 +287,69 @@ traverseExprM f (Typed e1 e2) = Typed <$> (f e1) <*> (f e2)
 traverseExprM f (App e exs) = App <$> (f e) <*> (mapM f exs)
 traverseExprM f (PatternMatches exs) = PatternMatches <$> (mapM f exs)
 traverseExprM f (Tuple exs) = Tuple <$> (mapM f exs)
+traverseExprM f (DeclBlock exs) = DeclBlock <$> (mapM f exs)
 traverseExprM f (Statements exs) = Statements <$> (mapM f exs)
 traverseExprM f (UnaryOp nm e) = UnaryOp <$> (pure nm) <*> (f e)
+traverseExprM _ (Primitive lam) = pure (Primitive lam)
+traverseExprM _ Intrinsic = pure Intrinsic
+traverseExprM _ Derive = pure Derive
+traverseExprM f (Repr nm tp def fns inv) = Repr nm <$> f tp <*> pure def <*> mapM f fns <*> traverse f inv
+traverseExprM f (ReprCast e tp) = ReprCast <$> f e <*> f tp
+traverseExprM f (ExprLiteralCheck lit ex) = ExprLiteralCheck lit <$> f ex
+-- Module system nodes
+traverseExprM _ e@(ModuleDecl _) = pure e
+traverseExprM _ e@(Import _ _ _) = pure e
+traverseExprM _ e@(Open _) = pure e
+traverseExprM _ e@(Export _ _) = pure e
+traverseExprM f (PrivateDecl e) = PrivateDecl <$> f e
+traverseExprM _ e@(OpaqueTy _ _) = pure e
+traverseExprM _ e@(TargetBlock _ _) = pure e
+traverseExprM _ e@(TargetSwitch _) = pure e
+traverseExprM f (ArrayLit exs) = ArrayLit <$> mapM f exs
+-- Record system nodes
+traverseExprM f (RecFieldAccess ac e) = RecFieldAccess ac <$> f e
+traverseExprM f (RecordLit fields) = RecordLit <$> mapM (\(n,e) -> (,) n <$> f e) fields
+traverseExprM f (RecordType fields isOpen) = (\fs -> RecordType fs isOpen) <$> mapM (\(n,e) -> (,) n <$> f e) fields
+traverseExprM f (RecordConstruct nm fields) = RecordConstruct nm <$> mapM (\(n,e) -> (,) n <$> f e) fields
+traverseExprM f (RecordUpdate e fields) = RecordUpdate <$> f e <*> mapM (\(n,ex) -> (,) n <$> f ex) fields
+traverseExprM f (RecordPattern nm fields) = RecordPattern nm <$> mapM (\(n,e) -> (,) n <$> f e) fields
+-- Effect system nodes
+traverseExprM _ e@(EffectDecl _ _ _) = pure e
+traverseExprM _ e@(HandlerDecl _ _ _) = pure e
+traverseExprM f (HandleWith e h) = HandleWith <$> f e <*> f h
+traverseExprM f (ActionBlock stmts) = ActionBlock <$> mapM (traverseActionStmtM f) stmts
+traverseExprM f (EffType row res) = EffType <$> f row <*> f res
+-- Remaining expressions
+traverseExprM f (BinaryOp nm e1 e2) = BinaryOp nm <$> f e1 <*> f e2
+traverseExprM f (ConTuple ct exs) = ConTuple ct <$> mapM f exs
+traverseExprM f (ExpandedCase exs e si) = ExpandedCase <$> mapM f exs <*> f e <*> pure si
+traverseExprM f (CaseOf recs e si) = CaseOf recs <$> f e <*> pure si
+traverseExprM f (Function lam) = do
+    b <- f (body lam)
+    pure $ Function (lam { body = b })
+traverseExprM f (Action lam) = do
+    b <- f (body lam)
+    pure $ Action (lam { body = b })
+traverseExprM f (SumType lam) = do
+    b <- f (body lam)
+    pure $ SumType (lam { body = b })
+traverseExprM f (Structure lam si) = do
+    b <- f (body lam)
+    pure $ Structure (lam { body = b }) si
+traverseExprM f (Binding (Var nm tp val)) = Binding <$> (Var nm <$> f tp <*> f val)
+traverseExprM f (Instance nm targs impls reqs) = Instance nm <$> mapM f targs <*> mapM f impls <*> mapM f reqs
+traverseExprM f (IfThenElse c t e) = IfThenElse <$> f c <*> f t <*> f e
+traverseExprM f (LetIn binds bdy) = LetIn <$> mapM (\(v,ex) -> (,) v <$> f ex) binds <*> f bdy
+traverseExprM f (ArrowType e1 e2) = ArrowType <$> f e1 <*> f e2
+traverseExprM f (Implicit e) = Implicit <$> f e
+traverseExprM f (Value v ex) = Value v <$> f ex
+traverseExprM f (Constructors lams) = Constructors <$> mapM (\l -> do { b <- f (body l); pure (l { body = b }) }) lams
 traverseExprM f e = f e
+
+traverseActionStmtM :: (Expr -> IntState Expr) -> ActionStmt -> IntState ActionStmt
+traverseActionStmtM f (ActionBind nm e) = ActionBind nm <$> f e
+traverseActionStmtM f (ActionLet nm e) = ActionLet nm <$> f e
+traverseActionStmtM f (ActionExpr e) = ActionExpr <$> f e
 
 ---------------------------- BASIC FUNCTIONS -----------------------------
 lookupLambda :: Name -> Environment -> Maybe Lambda
@@ -164,6 +391,45 @@ getAllParents name env = go [name] []
           Nothing      -> go ns (visited ++ [n])
           Just parents -> go (parents ++ ns) (visited ++ [n])
 
+-- Class hierarchy helpers
+lookupClass :: Name -> Environment -> Maybe ClassMeta
+lookupClass nm env = Map.lookup nm (classDecls env)
+
+isSubclassOf :: Name -> Name -> Environment -> Bool
+isSubclassOf className targetName env
+    | className == targetName = True
+    | otherwise = case lookupClass className env of
+        Just cm -> case cmParent cm of
+            Just parent -> isSubclassOf parent targetName env
+            Nothing -> False
+        Nothing -> False
+
+lookupParentMethod :: Name -> Name -> Environment -> Maybe CLMLam
+lookupParentMethod className methodName env =
+    case lookupClass className env of
+        Just cm -> case cmParent cm of
+            Just parentName -> case lookupClass parentName env of
+                Just parentMeta -> Map.lookup methodName (cmMethods parentMeta)
+                Nothing -> Nothing
+            Nothing -> Nothing
+        Nothing -> Nothing
+
+isSealedClass :: Name -> Environment -> Bool
+isSealedClass nm env = case lookupClass nm env of
+    Just cm -> cmModifier cm == ClassSealed
+    Nothing -> False
+
+-- Get all transitive subclasses of a class
+getAllSubclasses :: Name -> Environment -> [Name]
+getAllSubclasses nm env = go [nm] []
+  where
+    go [] visited = visited
+    go (n:ns) visited
+        | n `Prelude.elem` visited = go ns visited
+        | otherwise = case lookupClass n env of
+            Just cm -> go (cmChildren cm ++ ns) (visited ++ [n])
+            Nothing -> go ns (visited ++ [n])
+
 addNamedLambda :: Lambda -> Environment -> Environment
 addNamedLambda l env = env { topLambdas = Map.insert (lamName l) l (topLambdas env) }
 
@@ -180,23 +446,24 @@ addManyNamedConstructors i (c:cs) env = addManyNamedConstructors (i+1) cs (addNa
 -- addManyNamedConstructors :: [Lambda] -> Environment -> Environment
 -- addManyNamedConstructors ls env = env { constructors = Prelude.foldl (\acc l1 -> Map.insert (lamName l1) l1 acc) (topLambdas env) ls }
 
--- Instance functions: keyed by "funcName\0typeName"
-mkInstanceKey :: Name -> Name -> Name
-mkInstanceKey funcName typeName = funcName ++ "\0" ++ typeName
+-- Instance functions: keyed by "funcName\0type1\0type2\0..."
+-- For single-param: mkInstanceKey "==" ["Nat"] → "==\0Nat" (backward compatible)
+mkInstanceKey :: Name -> [Name] -> Name
+mkInstanceKey funcName typeNames = funcName ++ "\0" ++ Data.List.intercalate "\0" typeNames
 
-addInstanceLambda :: Name -> Name -> Lambda -> Environment -> Environment
-addInstanceLambda funcNm typeNm lam env =
-    env { instanceLambdas = Map.insert (mkInstanceKey funcNm typeNm) lam (instanceLambdas env) }
+addInstanceLambda :: Name -> [Name] -> Lambda -> Environment -> Environment
+addInstanceLambda funcNm typeNms lam env =
+    env { instanceLambdas = Map.insert (mkInstanceKey funcNm typeNms) lam (instanceLambdas env) }
 
-lookupInstanceLambda :: Name -> Name -> Environment -> Maybe Lambda
-lookupInstanceLambda funcNm typeNm env = Map.lookup (mkInstanceKey funcNm typeNm) (instanceLambdas env)
+lookupInstanceLambda :: Name -> [Name] -> Environment -> Maybe Lambda
+lookupInstanceLambda funcNm typeNms env = Map.lookup (mkInstanceKey funcNm typeNms) (instanceLambdas env)
 
-addCLMInstance :: Name -> Name -> CLMLam -> Environment -> Environment
-addCLMInstance funcNm typeNm clm env =
-    env { clmInstances = Map.insert (mkInstanceKey funcNm typeNm) clm (clmInstances env) }
+addCLMInstance :: Name -> [Name] -> CLMLam -> Environment -> Environment
+addCLMInstance funcNm typeNms clm env =
+    env { clmInstances = Map.insert (mkInstanceKey funcNm typeNms) clm (clmInstances env) }
 
-lookupCLMInstance :: Name -> Name -> Environment -> Maybe CLMLam
-lookupCLMInstance funcNm typeNm env = Map.lookup (mkInstanceKey funcNm typeNm) (clmInstances env)
+lookupCLMInstance :: Name -> [Name] -> Environment -> Maybe CLMLam
+lookupCLMInstance funcNm typeNms env = Map.lookup (mkInstanceKey funcNm typeNms) (clmInstances env)
 
 -- Reverse lookup: given a constructor name, find which type it belongs to
 lookupTypeOfConstructor :: Name -> Environment -> Maybe Name
@@ -204,8 +471,102 @@ lookupTypeOfConstructor consName env =
     case Map.lookup consName (constructors env) of
         Just (lam, _) -> case lamType lam of
             Id nm -> Just nm
+            App (Id nm) _ -> Just nm  -- parameterized types like List(a)
             _     -> Nothing
         Nothing -> Nothing
+
+-- Prefix-based CLM instance lookup: find instances where key starts with funcName\0type1\0type2...
+-- Used for morphism dispatch where we know arg types but not return type.
+-- When multiple matches exist, prefer non-composed instances (those whose body
+-- does NOT re-dispatch via CLMIAP) to avoid infinite recursion from composed
+-- instances that call the same function.
+lookupCLMInstancePrefix :: Name -> [Name] -> Environment -> Maybe CLMLam
+lookupCLMInstancePrefix funcNm typeNms env =
+    let prefix = mkInstanceKey funcNm typeNms ++ "\0"
+        -- try exact match first, then prefix
+        exact = Map.lookup (mkInstanceKey funcNm typeNms) (clmInstances env)
+    in case exact of
+        Just _ -> exact
+        Nothing ->
+            let matches = Map.toList $ Map.filterWithKey
+                    (\k _ -> Prelude.take (Prelude.length prefix) k == prefix) (clmInstances env)
+                -- Partition: direct instances (no CLMIAP in body) vs composed
+                (direct, composed) = Data.List.partition (isDirect . snd) matches
+            in case direct of
+                ((_, v):_) -> Just v
+                [] -> case composed of
+                    ((_, v):_) -> Just v
+                    [] -> Nothing
+  where
+    isDirect (CLMLam _ (CLMIAP _ _)) = False
+    isDirect (CLMLam _ (CLMAPP _ _)) = False
+    isDirect (CLMLamCases _ bodies) = not (Prelude.any isRedispatch bodies)
+    isDirect _ = True
+    isRedispatch (CLMIAP _ _) = True
+    isRedispatch (CLMAPP (CLMIAP _ _) _) = True
+    isRedispatch _ = False
+
+-- Find any CLM instance for a given function name (for nullary dispatch)
+findAnyInstance :: Name -> Environment -> Maybe CLMLam
+findAnyInstance funcNm env =
+    let prefix = funcNm ++ "\0"
+        matches = Map.filterWithKey (\k _ -> Prelude.take (Prelude.length prefix) k == prefix) (clmInstances env)
+    in case Map.elems matches of
+        (x:_) -> Just x
+        []    -> Nothing
+
+-- Find any CLM instance and return its type name (for nullary intrinsic dispatch)
+findAnyInstanceWithType :: Name -> Environment -> Maybe (Name, CLMLam)
+findAnyInstanceWithType funcNm env =
+    let prefix = funcNm ++ "\0"
+        matches = Map.filterWithKey (\k _ -> Prelude.take (Prelude.length prefix) k == prefix) (clmInstances env)
+    in case Map.toList matches of
+        ((k, v):_) -> Just (Prelude.drop (Prelude.length prefix) k, v)
+        []         -> Nothing
+
+-- Find all instances of a morphism's function: given function name prefix "funcName\0",
+-- return all (type1, type2) pairs for 2-param morphisms
+findMorphismInstances :: Name -> Environment -> [(Name, Name)]
+findMorphismInstances funcNm env =
+    let prefix = funcNm ++ "\0"
+        keys = Map.keys (instanceLambdas env)
+        matching = Prelude.filter (\k -> Prelude.take (Prelude.length prefix) k == prefix) keys
+    in Prelude.concatMap parseKey matching
+  where
+    parseKey k = case Prelude.break (== '\0') (Prelude.drop (Prelude.length funcNm + 1) k) of
+        (t1, '\0':t2) | not (Prelude.null t1) && not (Prelude.null t2) && '\0' `Prelude.notElem` t2
+            -> [(t1, t2)]
+        _   -> []
+
+-- Repr map helpers
+addRepr :: Name -> Name -> Bool -> Lambda -> Lambda -> Maybe Expr -> Environment -> Environment
+addRepr userType reprType isDefault toR fromR inv env =
+    let existing = maybe [] id (Map.lookup userType (reprMap env))
+        updated = (reprType, isDefault, toR, fromR, inv) : existing
+    in env { reprMap = Map.insert userType updated (reprMap env) }
+
+lookupRepr :: Name -> Environment -> [(Name, Bool, Lambda, Lambda, Maybe Expr)]
+lookupRepr nm env = maybe [] id (Map.lookup nm (reprMap env))
+
+getDefaultRepr :: Name -> Environment -> Maybe (Name, Lambda, Lambda)
+getDefaultRepr nm env = case lookupRepr nm env of
+    [] -> Nothing
+    xs -> case Prelude.filter (\(_, def, _, _, _) -> def) xs of
+        ((rn, _, toR, fromR, _):_) -> Just (rn, toR, fromR)
+        [] -> case xs of  -- if no default, use first
+            ((rn, _, toR, fromR, _):_) -> Just (rn, toR, fromR)
+            [] -> Nothing
+
+lookupReprPair :: Name -> Name -> Environment -> Maybe (Lambda, Lambda)
+lookupReprPair userType reprType env = case lookupRepr userType env of
+    [] -> Nothing
+    xs -> case Prelude.filter (\(rn, _, _, _, _) -> rn == reprType) xs of
+        ((_, _, toR, fromR, _):_) -> Just (toR, fromR)
+        [] -> Nothing
+
+-- Check if a type name is a repr target (appears as reprType in some repr declaration)
+isReprTarget :: Name -> Environment -> Bool
+isReprTarget nm env = Prelude.any (Prelude.any (\(rn, _, _, _, _) -> rn == nm)) (Map.elems (reprMap env))
 
 addManyLambdas :: [(Name, Lambda)] -> Environment -> Environment
 addManyLambdas ls env = env { topLambdas = Prelude.foldl (\acc (n1,l1) -> Map.insert n1 l1 acc) (topLambdas env) ls }
@@ -220,6 +581,12 @@ trace :: String -> IntState ()
 trace msg = do
     tr <- currentFlags <$> get >>= pure . tracing
     if tr then liftIO (putStrLn msg) else pure ()
+
+-- outputs a message only if verbose is on
+verboseLog :: String -> IntState ()
+verboseLog msg = do
+    v <- currentFlags <$> get >>= pure . verbose
+    if v then liftIO (putStrLn msg) else pure ()
 
 -- lifted versions of the IOLogger monad functions
 logError :: LogPayload -> IntState ()
@@ -237,8 +604,10 @@ logTrace    = lift . Log.logTrace
 
 showAllLogsWSource :: IntState ()
 showAllLogsWSource = do
-    src <- currentSource <$> get
-    lift (Logs.showAllLogsWSource src)
+    st <- get
+    let src = currentSource st
+    let srcMap = loadedSources st
+    lift (Logs.showAllLogsWSourceMap srcMap src)
 
 clearAllLogs :: IntState ()
 clearAllLogs = lift Log.clearAllLogs    

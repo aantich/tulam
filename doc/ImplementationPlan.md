@@ -4,18 +4,94 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 ---
 
-## Current State Summary (Updated after Phase 1 completion)
+## Current State Summary (Updated after Effect System + Safety Limits)
 
-**What works:** Parsing sum types, functions with pattern matching, structures (typeclasses), instance declarations, actions. Environment building extracts types/constructors/lambdas and stores instance-specialized functions. Case optimization expands patterns into constructor tag checks (for both top-level and instance functions). CLM conversion produces simply-typed IR including instance CLM functions. Interpreter evaluates: function application, constructor matching, field access, literals, action sequences, pattern match cases, and **implicit parameter dispatch** (CLMIAP) -- resolving type from constructor tags and dispatching to instance-specific implementations.
+**Package A Syntax Migration (completed):**
+- Sum types now use `type Bool = True | False;` instead of `type Bool = { True, False };` — curly braces freed for records exclusively.
+- Pattern matching now uses `match` keyword: `match | Pat -> expr | ...` instead of `{ {Pat} -> expr, ... }`.
+- Inline match expression supported: `match expr | Pat -> body | ...`.
+- `match` is now a reserved keyword.
 
-**Phase 1 COMPLETE.** Structures and instances work end-to-end. `Z == Z` dispatches through `instance Eq(Nat)` correctly.
+**Module System (completed):**
+- New keywords: `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`
+- New AST nodes: `ModuleDecl`, `Import`, `Open`, `Export`, `PrivateDecl`, `OpaqueTy`, `TargetBlock`, `TargetSwitch`, `ArrayLit`
+- New types: `ImportSpec`, `Visibility`, `ModulePath`
+- New module: `src/ModuleSystem.hs` — path resolution, dependency graph, cycle detection, topological sort
+- `ModuleEnv` added to `State.hs` for tracking module state
+- `lib/` directory created with modular stdlib layout: `Algebra/`, `Core/`, `Numeric/`, `HKT/`, `Morphism/`, `Collection/`, `SIMD/`, `Repr/`
+
+**Separate Compilation — Milestones 1-3 (completed):**
+- Milestone 1: Module loading wired up — `loadModuleTree` recursively resolves dependencies from `lib/`, loads Prelude first, then all 34 modules in topological order
+- Milestone 2: Code dedup — shared loading functions (`loadFileQuiet`, `loadModuleTree`, `resolveAllDeps`, `runParseOnly`) centralized in `src/ModuleSystem.hs`. `Main.hs` and `Spec.hs` import from single source of truth.
+- Milestone 3: Module-scoped environments — per-module `publicNames`/`privateNames` tracking via environment snapshots. `private` keyword removes names from global env after module loading. `filterVisibleNames` implements `ImportAll`, `ImportOnly`, `ImportHiding` filtering. `loadedModules` HashMap stores all module envs for downstream visibility queries.
+- Next: Milestone 4 (`.tli` interface files for faster startup)
+
+**Primitive Type Expansion (completed):**
+- New literal types in AST: `LInt8`, `LInt16`, `LInt32`, `LInt64`, `LWord8`, `LWord16`, `LWord32`, `LWord64`, `LFloat32`
+- New primitive types in `prelude.tl`: `Int8`, `Int16`, `Int32`, `Int64`, `UInt`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float32`, `Byte`, `Array(a:Type)`, `Vec2(a:Type)`, `Vec4(a:Type)`, `Vec8(a:Type)`, `Vec16(a:Type)`
+- `Intrinsics.hs` completely refactored with generic helpers (`mkBinOp`, `mkUnaryOp`, `mkCmpOp`, `mkCompare`, `mkConst`)
+- All numeric types have full operation sets: arithmetic, comparison, bitwise, transcendentals (for floats)
+- `fromInt`/`fromFloat` protocol for polymorphic literals
+- Convertible morphism instances for numeric conversions between all types
+- Array primitive with `length`, `index`, `slice` operations
+- SIMD Vec types with Lane algebra (stubs returning errors — need native compilation)
+- `CLMARRAY` CLM node added for array representation
+
+**What works:** Parsing sum types, functions with pattern matching, structures (typeclasses), instance declarations, actions, records with spread syntax, if/then/else, let/in, algebra/morphism/trait/bridge keywords, structure inheritance (extends), value declarations, law declarations, primitive type declarations, intrinsic instances, **anonymous lambdas** (`\x -> expr`), **first-class functions** (functions as values, passed to/returned from other functions), **common ADTs** (Maybe, Either, List with utility functions and Semigroup/Monoid instances), **combinators** (id, const, apply, compose, flip), **automated morphism composition** (transitive instances auto-derived with cycle detection), **parameterized type instances** (e.g., `Semigroup(List(a))`), **unary minus** (`-3` dispatches to `negate`), **Floating math** (sqrt, sin, cos, tan, exp, log, asin, acos, atan, pow, pi), **Bits algebra** (.&., .|., xor, complement, shiftL, shiftR, bitSize for Int), **String operations** (concat, length, Eq/Ord for String), **Int↔Float64 conversions** (toFloat, toInt, recip), **repr system** (`repr UserType as ReprType [default] where { ... }` + `expr as Type` casting), **higher-kinded types** (Functor, Applicative, Monad algebras on Type1 with instances for Maybe and List — `fmap(not, Just(True))` → `Just(False)`, `bind(Just(x), f)` → `f(x)`, List monad flatMap), **module system** (module/import/export/open/private/opaque with dependency resolution), **expanded numeric primitives** (Int8-64, UInt8-64, Float32 with full intrinsic support), **arrays** (Array(a) with length/index/slice), **SIMD type declarations** (Vec2/4/8/16 with Lane algebra stubs). Environment building handles types, constructors, lambdas, instance-specialized functions, primitive types, intrinsic expansion, morphism composition, repr registration, and module resolution. Case optimization expands patterns into constructor tag checks. CLM conversion produces simply-typed IR, including repr cast direction resolution and CLMARRAY. Interpreter evaluates: function application (including first-class), constructor matching, field access, literals, action sequences, pattern match cases, **implicit parameter dispatch** (CLMIAP) with intrinsic-first lookup (including nullary intrinsics) and partial type inference for HKT dispatch, partial application (CLMPAP), and lambda values (CLMLAM).
+
+**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion COMPLETE.** 449 automated hspec tests all passing.
+
+**Type-Directed Dispatch (Phase 10.3 completed):**
+- `CLMTYPED` wrapper annotates CLMIAP bodies with return type hints during CLM conversion (Pass 4)
+- `maybeAddTypeHint` in Pipeline.hs wraps non-implicit-param function bodies that have concrete return types
+- Interpreter evaluates CLMTYPED with three strategies: (1) fallback when dispatch fails and args are values, (2) result-type-check when dispatch succeeds but return type mismatches hint, (3) passthrough when dispatch succeeds and matches
+- `extractTypeNameFromHint`, `resultMatchesHint`, `tryHintInstance`, `isValue` helpers in Interpreter.hs
+- Enables: `toEnum(0) : Bool` → False, `toEnum(2) : Ordering` → GreaterThan, `fromEnum(True) : Int` → 1
+- Resolves the generic `mapM`/`sequence` base case dispatch limitation (return-type-dependent `pure`)
+- Test file: `tests/programs/P17_TypeDirected.tl` (5 tests)
+
+**Intrinsic Completeness (Phase 9.5 completed):**
+- Char literal parsing (`'A'`, `'\n'`, etc.), Char Eq/Ord intrinsics
+- Show intrinsics for all primitive types (Int, Float64, String, Char, Int8-64, UInt8-64, Float32, Byte)
+- Bounded intrinsics (minBound/maxBound for all fixed-width types, Char, Byte)
+- Enum intrinsics (succ/pred/toEnum/fromEnum for Int and Char)
+- Hashable intrinsics (hash for Int, String, Char)
+- Extended string ops: charAt, substring, indexOf, trim, toUpper, toLower, startsWith, endsWith, replace, parseInt, parseFloat (StringExt algebra)
+- Array ops: set, push, arrayConcat, reverse, range (ArrayOps algebra). `[...]` syntax now creates `ArrayLit`/`CLMARRAY`.
+- error/panic function, FileIO runtime (readFile, writeFile, appendFile, fileExists)
+- CLMAPP IO fallback dispatch for unresolved function IDs
+
+**Effect System (Phase 9 completed):**
+- Row-polymorphic effects with `effect`/`handler`/`handle` keywords
+- Action blocks with `<-` bind syntax, desugared to bind chains (Pass 0.5)
+- `TEffect Row Ty` in type checker, effect rows erased at CLM conversion
+- IO intrinsics: `putStrLn`, `putStr`, `readLine` via `dispatchIOIntrinsic`
+- Standard library: `lib/Effect/Console.tl`, `lib/Effect/FileIO.tl`, `lib/Effect/State.tl`, `lib/Effect/Exception.tl`
+- Record system with dot-access, named construction, record update, named field patterns (Pass 1.5)
+
+**Real Programs (Phase 9.6 completed):**
+- Array HOFs via closure-aware dispatch: `dispatchArrayHOF` in Interpreter.hs handles `fmap`, `filter`, `foldl`, `foldr`, `generate` when args include closures + arrays
+- `Functor(Array)` instance + `ArrayHOF` algebra (filter/foldl/foldr/generate) in `lib/Collection/Array.tl`
+- Universal Show fallback: `show` on any `CLMCON` value reflects constructor name + recursively shows fields; `show` on `CLMARRAY` shows `[elem1, elem2, ...]`
+- Monadic traversal: `mapMMaybe`, `foldMMaybe`, `sequenceMaybe`, `forMMaybe`, `mapM_` in `lib/HKT/Traverse.tl`
+- Note: Generic `mapM`/`foldM`/`sequence` previously needed type-directed dispatch (value-based dispatch can't infer target monad at base case). Phase 10.3 adds CLMTYPED annotations that resolve this. Specialized Maybe versions still available as explicit alternatives.
+
+**Safety & Diagnostics:**
+- `_contEval` capped at 10000 iterations, `evalCLM` at depth 1000, CLMERR propagation
+- Verbose/trace flags: `:s verbose on/off`, `:s trace on/off`, `timedPass` for per-pass timing
+- `betaReduceCLM` respects variable shadowing (fixed nested if/else capture bug)
+- `lookupCLMInstancePrefix` partitions direct vs composed instances (fixed morphism dispatch ambiguity)
 
 **Remaining gaps:**
-1. No `extends` for structure inheritance
-2. No `if/then/else`, `let/in`, `where` -- basic language constructs reserved but not parsed
-3. No `algebra`/`morphism` categorical keywords
-4. No higher-kinded types (needed for Functor, Monad)
-5. No type checker
+1. **No State/Exception effect runtime**: Effect declarations exist but no interpreter handler dispatch
+2. **No Ref/MutArray**: no mutable references or mutable arrays
+3. **Type checker permissive by default**: errors are warnings; `strictTypes` flag makes them fatal
+4. **SIMD Vec operations are stubs** (need native compilation backend)
+5. **No codegen backend**: interpreter only, no JS/.NET/x86 output
+6. **Type-directed dispatch**: needed for generic monadic traversal (mapM/foldM/sequence) and toEnum/range
+7. **Array HOFs for non-Int types**: foldl/filter type signatures use Int; needs polymorphic dispatch
+8. **Missing string ops**: split, join not yet implemented
+9. **Derive for parameterized types**: `derive` currently works for simple sum types; parameterized types (e.g., `Maybe(a)`) need field-level dispatch through Eq/Ord/Show instances of the parameter type
 
 ---
 
@@ -56,7 +132,7 @@ When we encounter `instance Eq(Nat)`:
 
 This is the mechanism already sketched in the structure processing code -- `fixStr` in Pipeline.hs creates the initial `CaseOf [] (Function l)` with empty cases. Instance processing *adds* concrete cases.
 
-**Test:** Load base.tl with uncommented `instance Eq(Nat)`. Check that `==` function in `:list functions` now has a `{Nat} -> ...` case alongside the default.
+**Test:** Load base.tl with uncommented `instance Eq(Nat)`. Check that `==` function in `:list functions` now has a `| Nat -> ...` case alongside the default.
 
 ### Step 1.3: Complete interpreter evaluation
 
@@ -229,7 +305,7 @@ pRecord = do
     tparams <- optionMaybe (parens (sepBy1 pTypeParam (reservedOp ",")))
     reservedOp "="
     fields <- braces (sepBy1 pRecordField (reservedOp ","))
-    -- Desugar: record Foo = { x:A, y:B }  =>  type Foo = { Foo(x:A, y:B) }
+    -- Desugar: record Foo = { x:A, y:B }  =>  type Foo = Foo(x:A, y:B);
     let vars = map fieldToVar fields
     let consLam = Lambda name vars EMPTY (Id name)
     let tpVars = maybe [] id tparams
@@ -282,7 +358,7 @@ When a spread `..Point` is encountered, look up `Point` in the parsed types, ext
 ```tulam
 record Point = { x:Nat, y:Nat };
 record Point3D = { ..Point, z:Nat };
-// expands to: type Point3D = { Point3D(x:Nat, y:Nat, z:Nat) }
+// expands to: type Point3D = Point3D(x:Nat, y:Nat, z:Nat);
 ```
 
 ### Step 2.5: Named record construction syntax
@@ -359,6 +435,8 @@ Steps 2.1 and 2.2 are quick wins. Step 2.3 is the core record feature. Step 2.4 
 
 **Milestone: Language has conditionals, local bindings, records with functions-as-fields, and record extension. Usable for non-trivial programs.**
 
+**STATUS: COMPLETE.** All record features implemented (dot-access, named construction, record update, named field patterns). Record desugaring runs in Pass 1.5. See `tests/programs/P11_Records.tl` for 11 tests covering all features.
+
 ---
 
 ## Phase 3: Structure Inheritance (`extends`)
@@ -409,159 +487,315 @@ instance Ord(Nat) = { ... };
 
 ---
 
-## Phase 4: Categorical Keywords (`algebra`, `morphism`)
+## Phase 4: Primitive Types and Intrinsics
 
-**Goal:** `algebra` and `morphism` work as refined synonyms for `structure` with additional compiler knowledge.
+**Goal:** Machine-level types (Int, Float64, String) work with native performance. `3 + 4` evaluates to `7`.
 
-### Step 4.1: Add keywords
+See `doc/PrimitiveDesign.md` for full design rationale.
+
+### Step 4.1: Parse `primitive` declarations
 
 **Files:** Lexer.hs, Parser.hs, Surface.hs
 
-Add `algebra` and `morphism` to reserved words. Parse them identically to `structure` but tag the resulting Expr differently. Options:
-- Add `| Algebra Lambda [Name]` and `| Morphism Lambda [Name]` to Expr
-- Or add a classification field to Structure: `Structure Lambda [Name] StructKind` where `data StructKind = SGeneral | SAlgebra | SMorphism`
+- Add `primitive` to reserved words in Lexer.hs
+- Add `| Primitive Lambda` to Expr (Lambda carries type name + optional type params)
+- Parse: `primitive Int;` → `Primitive (Lambda "Int" [] UNDEFINED (U 0))`
+- Parse: `primitive Array(a:Type);` → `Primitive (Lambda "Array" [Var "a" Type UNDEFINED] UNDEFINED (U 1))`
+- Add to traverseExpr (identity), ppr
 
-The second approach is simpler and avoids duplicating code.
+### Step 4.2: Process `primitive` in Pass 1
 
-### Step 4.2: Validate parameter counts
+**Files:** Pipeline.hs, State.hs
 
-In Pass 1, when processing an algebra, verify exactly one type parameter. When processing a morphism, verify two or more type parameters. Emit warnings (not errors) if violated -- the categorical classification is advisory.
+- Add `primitiveTypes :: Map Name Lambda` to InterpreterState
+- When processing a Primitive declaration, register the type name in primitiveTypes
+- Primitive types have no constructors (unlike SumType)
+- The type name is added to the type environment so it can be referenced in type positions
 
-### Step 4.3: Automatic morphism composition
+### Step 4.3: Parse `intrinsic` as function/instance body
 
-When two morphism instances exist -- `Convertible(A,B)` and `Convertible(B,C)` -- the compiler can automatically derive `Convertible(A,C)`. This is an environment-building step in Pass 1.
+**Files:** Lexer.hs, Parser.hs, Surface.hs
 
-**Test:**
-```tulam
-morphism Convertible(a:Type, b:Type) = { function convert(x:a):b };
-instance Convertible(Nat, Bool) = { function convert(x) = not(eq(x,Z)) };
-instance Convertible(Bool, Nat) = { function convert(x) = { {True} -> Succ(Z), {False} -> Z } };
--- compiler could derive Convertible(Nat, Nat) via Bool (optional, can defer)
-```
+- Add `intrinsic` to reserved words
+- Add `| Intrinsic` to Expr
+- In function body position: `function foo(x:Int) : Int = intrinsic;` → body is `Intrinsic`
+- In instance body position: `instance Num(Int) = intrinsic;` → functions get `Intrinsic` body
+- Add to traverseExpr (identity), ppr
 
-**Milestone: Categorical vocabulary exists in the surface language. Structures, algebras, and morphisms are distinguished.**
+### Step 4.4: Intrinsic registry
 
----
+**Files:** new src/Intrinsics.hs
 
-## Phase 5: Higher-Kinded Types
-
-**Goal:** Type constructors (`Maybe`, `List`) can be passed as parameters to structures. Required for Functor, Monad, etc.
-
-### Step 5.1: Parse type-constructor parameters
-
-**Files:** Parser.hs
-
-Currently `a:Type` parses the type as `U 0`. We need `f:Type1` to mean "f is a type constructor" (a function from Type to Type).
-
-```tulam
-algebra Functor(f:Type1) = {
-    function fmap(g: a -> b, x:f(a)) : f(b)
-};
-```
-
-The parser already handles `Type1` via `parseUniverse`. The new part is parsing `f(a)` in type positions -- type-level application. This requires `concreteType` to handle `TypeApp`:
+Create a module mapping `(functionName, typeName)` to Haskell evaluation functions:
 
 ```haskell
--- in type positions, allow: Name(Type, Type, ...)
-concreteType = try parseUniverse
-           <|> try typeApp     -- NEW: Maybe(a), f(a), etc.
-           <|> (Id <$> identifier)
+type IntrinsicFn = [CLMExpr] -> Maybe CLMExpr
 
-typeApp = do
-    nm <- identifier
-    args <- parens (sepBy concreteType (reservedOp ","))
-    return $ App (Id nm) args
+intrinsicRegistry :: Map (Name, Name) IntrinsicFn
+intrinsicRegistry = Map.fromList
+    [ (("+", "Int"),  \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ CLMLIT (LInt (a + b)))
+    , (("-", "Int"),  \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ CLMLIT (LInt (a - b)))
+    , (("*", "Int"),  \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ CLMLIT (LInt (a * b)))
+    , (("div", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ CLMLIT (LInt (a `div` b)))
+    , (("mod", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ CLMLIT (LInt (a `mod` b)))
+    , (("==", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a == b))
+    , (("<",  "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a < b))
+    , ((">",  "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a > b))
+    , (("<=", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a <= b))
+    , ((">=", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a >= b))
+    , (("!=", "Int"), \[CLMLIT (LInt a), CLMLIT (LInt b)] -> Just $ boolToCLM (a /= b))
+    -- Float64
+    , (("+", "Float64"), \[CLMLIT (LFloat a), CLMLIT (LFloat b)] -> Just $ CLMLIT (LFloat (a + b)))
+    , (("*", "Float64"), \[CLMLIT (LFloat a), CLMLIT (LFloat b)] -> Just $ CLMLIT (LFloat (a * b)))
+    -- etc.
+    ]
 ```
 
-### Step 5.2: Represent HKT in the environment
+### Step 4.5: CLM representation and interpreter evaluation
 
-**Files:** State.hs, Pipeline.hs
+**Files:** CLM.hs, Interpreter.hs, Pipeline.hs
 
-When `Functor(f:Type1)` is declared, `f` is a type variable of kind `Type -> Type`. The implicit parameter function generated is:
+- Add `| CLMINTRINSIC Name Name [CLMExpr]` to CLMExpr (funcName, typeName, args)
+- When `intrinsic` body is encountered during CLM conversion (Pass 4), emit CLMINTRINSIC
+- In evalCLM: evaluate args, look up in intrinsic registry, apply
+- For `instance Num(Int) = intrinsic`: each function in the Num algebra generates a separate CLMINTRINSIC entry
 
+### Step 4.6: Create prelude.tl
+
+**Files:** new prelude.tl, Main.hs
+
+- Create prelude.tl:
+  ```tulam
+  primitive Int;
+  primitive Float64;
+  primitive String;
+  primitive Char;
+  primitive Byte;
+  ```
+- Load prelude.tl before base.tl in the REPL
+- Add Num, Integral, Eq, Ord intrinsic instances for Int in prelude.tl (or a new numeric.tl)
+
+### Step 4.7: Literal type inference for dispatch
+
+**Files:** Interpreter.hs
+
+- `inferTypeFromExpr` already returns `"Int"` for `CLMLIT (LInt _)` and `"Float"` for `CLMLIT (LFloat _)` — rename Float to Float64 for consistency
+- CLMIAP dispatch for `+` applied to `[3, 4]` → infers type "Int" → looks up instance → finds CLMINTRINSIC
+
+**Test milestone:**
 ```
-fmap [f:Type1] (g: a -> b, x: f(a)) : f(b)
+> 3 + 4
+7
+> 10 * 5 + 2
+52
+> 3 > 2
+True
+> 3 == 3
+True
 ```
 
-When `instance Functor(Maybe)` is declared, `f` is instantiated to `Maybe`, and the case is added.
+**Milestone: Machine integers and floats work with native performance. Arithmetic expressions evaluate correctly.**
 
-### Step 5.3: Type application in CLM
+### Phase 4 Learnings & Implementation Notes
 
-**Files:** CLM.hs, Pipeline.hs
+**Completed.** Key decisions and discoveries:
 
-Type-level application (`f(a)` where `f` is a type variable) needs representation in CLM for the transition period before type erasure. This may just be `CLMAPP` applied to type arguments, which get erased later.
+1. **No new CLM node needed**: The plan proposed `CLMINTRINSIC` as a new CLM node, but intrinsic dispatch was implemented directly in the CLMIAP evaluator by checking `lookupIntrinsic` before normal instance lookup. This is simpler — intrinsic instances register as CLMLam with `CLMPRIMCALL` body (same as existing primitives), but the interpreter short-circuits them via the intrinsic registry.
 
-**Test:**
-```tulam
-algebra Functor(f:Type1) = { function fmap(g: a -> b, x:f(a)) : f(b) };
-instance Functor(Maybe) = {
-    function fmap(g, x) = { {g, Nothing} -> Nothing, {g, Just(v)} -> Just(g(v)) }
-};
-```
+2. **Intrinsic registry**: `src/Intrinsics.hs` maps `"funcName\0typeName"` keys to `[CLMExpr] -> Maybe CLMExpr` functions. Covers Int and Float64 arithmetic (`+`, `-`, `*`, `div`, `mod`, `/`), comparison (`==`, `!=`, `<`, `>`, `<=`, `>=`, `compare`), and utility functions (`negate`, `abs`, `fromInt`).
 
-**Milestone: Higher-kinded types work. Functor can be defined and instantiated.**
+3. **Loading order matters**: `prelude.tl` (primitive types + Num/Integral/Fractional algebras + their intrinsic instances) loads before `base.tl` (Nat, Bool, Eq, Ord + their Nat/Bool instances + Eq/Ord intrinsic instances for Int/Float64). Intrinsic instances for Eq/Ord must be in `base.tl` because Eq and Ord are defined there.
+
+4. **Intrinsic instance expansion**: When `instance Num(Int) = intrinsic` is encountered in Pass 1, the compiler looks up the Num structure, extracts all function/value names, and creates placeholder `Lambda fn [] Intrinsic UNDEFINED` entries for each. These are then propagated to parents via the existing `propagateToParent` mechanism.
+
+5. **Bool/Ordering constructor tags**: Intrinsic comparison functions must produce `CLMCON (ConsTag "True" 0) []` / `CLMCON (ConsTag "False" 1) []` matching base.tl's `type Bool = True | False;` tag ordering (True=0, False=1). Similarly, `compare` returns `LessThan`=0, `Equal`=1, `GreaterThan`=2.
+
+6. **CLMPAP handler added**: Partial application evaluation was missing from the interpreter. Added as part of this phase since it's needed for some numeric expression evaluation paths.
+
+7. **Float type name fix**: `inferTypeFromExpr` returned `"Float"` for float literals but the intrinsic registry uses `"Float64"`. Fixed to return `"Float64"`.
+
+8. **Num standalone for MVP**: The plan considered `Num extends Eq, Ord` but this creates a circular dependency between prelude.tl and base.tl. For now, Num is a standalone algebra without extends.
+
+### Phase 4 Expanded Intrinsics (Completed)
+
+Extended the intrinsic registry and prelude with additional algebras:
+
+1. **Unary minus fix**: `afterparse (UnaryOp "-" e)` now desugars to `App (Id "negate") [afterparse e]` instead of `App (Id "-") [e]`. This maps `-3` to `negate(3)` which dispatches through the existing `negate` intrinsic.
+
+2. **Floating algebra**: `Floating(a) extends Fractional(a)` in prelude.tl with `sqrt`, `exp`, `log`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `pow`, and `value pi`. Intrinsic instance for Float64. All use `floatUnaryOp` / `floatBinOp` helpers.
+
+3. **Bits algebra**: `Bits(a)` in prelude.tl with `.&.`, `.|.`, `xor`, `complement`, `shiftL`, `shiftR`, `value bitSize`. Intrinsic instance for Int. Uses `Data.Bits` import in Intrinsics.hs. Note: `.&.` and `.|.` must NOT be reserved operators — they need to parse as regular operators via `parens operator` for function declarations.
+
+4. **StringOps algebra**: `StringOps(a)` in prelude.tl with `concat` and `length`. Plus `Eq(String)` and `Ord(String)` intrinsic instances in base.tl (since Eq/Ord are defined there). String comparison and ordering intrinsics added to registry.
+
+5. **Nullary intrinsic dispatch fix**: `findAnyInstanceWithType` added to State.hs — returns both the type name and CLM lambda for nullary instance lookup. Interpreter's nullary CLMIAP branch now checks `lookupIntrinsic funcNm typNm` before applying the CLM lambda. This fixes `pi` and `bitSize` which are nullary `value` declarations with intrinsic bodies.
+
+6. **Conversion intrinsics**: `toFloat` (Int→Float64), `toInt` (Float64→Int via truncate), `recip` (Float64) added to registry.
 
 ---
 
-## Phase 6: Arrow Types and Function Type Syntax
+## Phase 4+: Parallel Features (Anonymous Lambdas, ADTs, Tests, Morphism Composition)
 
-**Goal:** Parse `a -> b` as a type, required for Functor's `fmap` signature and for expressing function types in general.
+**Goal:** Fill in practical language features independent of the primitive types work: anonymous lambdas, first-class functions, common ADTs, automated tests, and morphism auto-composition.
 
-### Step 6.1: Parse arrow types
+### Completed Features
 
-**Files:** Parser.hs
+**A. Anonymous Lambdas + First-Class Functions** ✅
+- Parser: `pAnonLambda` parses `\x -> expr` (and `\x:Type, y -> expr`), added to `pFactor`
+- Pipeline: Unknown function IDs in `exprToCLM` produce `CLMAPP (CLMID nm) args` (fallthrough, not error), enabling first-class function application
+- Interpreter: Generic `CLMAPP` eval checks if function resolved to `CLMLAM` and applies it
+- base.tl combinators: `id`, `const`, `apply`, `compose`, `flip`
 
-In type positions, `a -> b` should parse to a function type. This is the standard Pi type (non-dependent case):
+**B. Automated Test Suite** ✅
+- hspec dependency added to `package.yaml`
+- 45 tests in `test/Spec.hs`: parser (3), pipeline integration (8), end-to-end evaluation (23), combinators (4), ADTs (11)
+- Tests cover: Nat ops, Bool, Monoid, morphisms, if/else, let/in, Int intrinsics, Maybe/List operations
 
-```tulam
-function apply(f: Nat -> Bool, x:Nat) : Bool = f(x);
-```
+**C. Common ADTs (Maybe, List, Either)** ✅
+- Types: `Maybe(a)`, `Either(a,b)`, `List(a)` with constructors
+- Utilities: `isNothing`, `fromMaybe`, `head`, `tail`, `isEmpty`
+- Instances: `Semigroup(List(a))`, `Monoid(List(a))`
+- Fix: `lookupTypeOfConstructor` and `extractTypeName` now handle parameterized types like `List(a)`
 
-Parser needs `concreteType` to handle `->` as an infix type operator.
+**D. Automated Morphism Composition** ✅
+- `composeMorphismInstances` in Pipeline.hs auto-derives transitive morphism instances for 2-param morphisms
+- `findMorphismInstances` in State.hs finds all existing instance pairs
+- Cycle detection: skips identity loops and prefers direct instances over composed ones
+- e.g., given `Convertible(Nat, Bool)` + `Convertible(Bool, Nat)`, auto-derives `Convertible(Nat, Nat)` and `Convertible(Bool, Bool)`
 
-### Step 6.2: Represent function types
+### Phase 4+ Learnings
 
-**Files:** Surface.hs
+1. **First-class functions require fallthrough**: The `exprToCLM` error for unknown function names must become a `CLMAPP (CLMID nm) args` to allow variables bound to functions to be applied.
 
-Function types are already representable as `Function (Lambda "" [Var "x" A UNDEFINED] UNDEFINED B)` but that's verbose. We may want a dedicated `ArrowType Expr Expr` constructor or just use `App (Id "->") [A, B]` as a convention.
+2. **Parameterized type instances**: Instance registration needed `extractTypeName` to handle `App (Id "List") [Id "a"]` (not just `Id "Nat"`). Similarly, `lookupTypeOfConstructor` needed to match `App (Id nm) _` for constructors whose return type is parameterized (e.g., `Cons` returns `List(a)`).
 
-**Test:** `function compose(f: b -> c, g: a -> b) : a -> c = ...;`
+3. **Morphism composition is Surface-level**: Composed lambdas are generated as `Lambda funcNm [Var "__x" ...] (App (Id funcNm) [App (Id funcNm) [Id "__x"]]) ...` — normal Surface AST that flows through the standard pipeline passes.
 
-**Milestone: Function types expressible in type positions. Functor's fmap signature is parseable.**
+4. **Test infrastructure**: Tests use `evalStateT (execStateT setup emptyIntState) initLogState` to run the full monad stack, and `evalStateT (evalStateT (evalExprM input) st) initLogState` for evaluation. The `loadFileQuiet` helper suppresses stdout output.
 
 ---
 
-## Phase 7: Do-Notation / Action Desugaring
+## Phase 5: Repr System ✅ COMPLETE
 
-**Goal:** `action` bodies desugar into monadic `bind` chains when a `Monad` instance is in scope.
+**Goal:** User-defined types can declare representation mappings to primitives for optimization.
 
-### Step 7.1: Parse `<-` in action bodies
+See `doc/PrimitiveDesign.md` §5 for full design.
 
-**Files:** Parser.hs
+### Step 5.1: Parse `repr` declarations ✅
 
-```tulam
-action main : IO(Unit) = {
-    name <- readLine(),        -- bind
-    greeting = concat#("Hello, ", name),  -- let
-    putStrLn(greeting)         -- then (bind with ignored result)
-};
+**Files:** Lexer.hs, Parser.hs, Surface.hs
+
+- Added `repr`, `invariant`, `as`, `default` to reserved words in Lexer.hs
+- Added `| Repr Name Expr Bool [Expr] (Maybe Expr)` to Expr in Surface.hs
+  - Name: user type name
+  - Expr: repr type
+  - Bool: is default
+  - [Expr]: toRepr and fromRepr function definitions
+  - Maybe Expr: optional invariant expression
+- Parse: `repr Nat as Int default where { ... };`
+- Added traverseExpr and ppr cases for Repr
+
+### Step 5.2: Process `repr` in Pass 1 ✅
+
+**Files:** Pipeline.hs, State.hs
+
+- Added `reprMap :: Map Name [(Name, Bool, Lambda, Lambda, Maybe Expr)]` to InterpreterState
+  - Key: user type name
+  - Value: list of (repr type name, isDefault, toRepr, fromRepr, invariant)
+- Added helper functions: `addRepr`, `lookupRepr`, `getDefaultRepr`, `lookupReprPair`, `isReprTarget`
+- `processBinding (Repr ...)` in Pipeline.hs: registers toRepr/fromRepr as implicit-param wrapper lambdas + instance lambdas keyed by `[userTypeName]` (toRepr) and `[reprTypeName]` (fromRepr)
+
+### Step 5.3: `as` expression for explicit repr casts ✅
+
+**Files:** Lexer.hs, Parser.hs, Surface.hs, Pipeline.hs
+
+- Added `| ReprCast Expr Expr` to Expr; added traverseExpr and ppr cases
+- `as` added as a reserved word; postfix parsing: `pExpr` tries `reserved "as" >> concreteType` after reading the base expression
+- `exprToCLM env (ReprCast e (Id targetType))` resolves direction:
+  - if `targetType` is a key in `reprMap` (user type) → emit `CLMIAP "fromRepr" [clmE]`
+  - if `targetType` is a value in `reprMap` (repr type) → emit `CLMIAP "toRepr" [clmE]`
+  - otherwise → `CLMERR` with message
+
+### Step 5.4: Repr-aware optimizations (future)
+
+Deferred to codegen. When the compiler knows `repr Nat as Int`:
+- Pattern `| Z` compiles to `== 0`
+- Pattern `| Succ(n)` compiles to `let n = x - 1 in ...`
+- Operations forwarded through repr to intrinsic implementations
+
+### Phase 5 Learnings & Implementation Notes
+
+**Completed.** Key decisions and discoveries:
+
+1. **Instance lambda keying**: `toRepr` is keyed by the user type name (so `CLMIAP "toRepr" [natValue]` dispatches correctly), `fromRepr` by the repr type name (so `CLMIAP "fromRepr" [intValue]` dispatches correctly).
+
+2. **Implicit-param wrapper**: Both `toRepr` and `fromRepr` are registered as top-level implicit-param lambdas (`Lambda nm [Var "a" (Implicit Type) UNDEFINED] (PatternMatches [...]) ...`) so CLMIAP dispatch is triggered. Only the first registration is kept if multiple repr declarations define the same function name.
+
+3. **Direction resolution at CLM time**: `ReprCast` does not desugar in `afterparse` (it only recurses into children). Direction is resolved in `exprToCLM` using `reprMap` — no ambiguity because a type cannot simultaneously be a user-type key and a repr-type value (they are distinct sets).
+
+4. **`as` is a postfix operator**: In `pExpr`, after parsing the base expression, an optional `try (reserved "as" >> concreteType)` creates `ReprCast` if present. This keeps it lower precedence than function application.
+
+5. **base.tl repr declaration**:
+   ```tulam
+   repr Nat as Int default where {
+       function toRepr(n:Nat) : Int = match
+           | Z -> 0
+           | Succ(m) -> 1 + toRepr(m),
+       function fromRepr(i:Int) : Nat = if i == 0 then Z else Succ(fromRepr(i - 1))
+   };
+   ```
+
+6. **7 new tests**: toRepr(Z)=0, toRepr(Succ(Succ(Z)))=2, fromRepr(0)=Z, fromRepr(3)=Succ(Succ(Succ(Z))), cast `Succ(Succ(Z)) as Int`=2, cast `5 as Nat`=Succ(Succ(Succ(Succ(Succ(Z))))), roundtrip fromRepr(toRepr(Succ(Succ(Z))))=Succ(Succ(Z)). Total: 52 tests.
+
+**Milestone: Representation mappings declared and usable. Bridge between user types and machine types.**
+
+---
+
+## Phase 6: Categorical Keywords and Morphism Composition ✅ COMPLETE
+
+**Goal:** `algebra` and `morphism` work as refined synonyms for `structure` with additional compiler knowledge. `Convertible` morphism enables type conversions.
+
+All steps completed across Phases 3 and 4+:
+- **Step 6.1** ✅: algebra/morphism parameter count validation (Phase 3)
+- **Step 6.2** ✅: `Convertible` morphism with `Convertible(Nat, Bool)` and `Convertible(Bool, Nat)` instances (Phase 3)
+- **Step 6.3** ✅: Automatic morphism composition with cycle detection (Phase 4+)
+
+**Milestone: Categorical vocabulary validated. Type conversions work through morphisms. Auto-composition derives transitive instances.**
+
+---
+
+## Phase 7: Higher-Kinded Types
+
+**Goal:** Type constructors (`Maybe`, `List`) can be passed as parameters to structures. Required for Functor, Monad, Bulk, etc.
+
+**Key discovery:** The existing dispatch mechanism *almost already works*. When `instance Functor(Maybe)` stores key `"fmap\0Maybe"`, and `fmap(f, Just(3))` is called, `Just(3)` evaluates to `CLMCON (ConsTag "Just" 1) [...]`, `lookupTypeOfConstructor "Just"` returns `"Maybe"`, and the key matches. The parser already handles `Type1`, arrow types (`a -> b`), and type application (`f(a)`).
+
+**There is exactly one critical blocker:** `inferTypeNames` in Interpreter.hs requires ALL args to have inferable types. For `fmap(f, Just(3))`, arg `f` is a function — its type can't be inferred. So `inferTypeNames` returns `Nothing` and dispatch fails.
+
+### Step 7.1: Fix `inferTypeNames` for partial type inference
+
+**Files:** Interpreter.hs (lines 250-253)
+
+Change from requiring ALL args to collecting whatever types are inferable:
+```haskell
+inferTypeNames env exs =
+    let types = catMaybes $ Prelude.map (inferTypeFromExpr env) exs
+    in if Prelude.null types then Nothing else Just types
 ```
 
-`<-` binds the result of a monadic computation. `=` is a local let. Plain expressions are sequenced.
+For `fmap(f, Just(3))`: types = `["Maybe"]` (from second arg only). Key `"fmap\0Maybe"` matches. Safe because dispatch tries keys in order — multi-param exact, prefix, single-param fallback.
 
-### Step 7.2: Desugar to bind chains
+### Step 7.2: Handle `ArrowType` and `Implicit` in `exprToCLM`
 
-**Files:** Pipeline.hs (Pass 0 or new pass)
-
-```tulam
--- name <- readLine()   =>  bind(readLine(), \name -> ...)
--- greeting = expr      =>  let greeting = expr in ...
--- putStrLn(greeting)   =>  bind(putStrLn(greeting), \_ -> pure(Unit))
+**Files:** Pipeline.hs — add before catch-all:
+```haskell
+exprToCLM _ (ArrowType _ _) = CLMEMPTY  -- type-level, erased at runtime
+exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
 ```
 
-This is a straightforward syntactic transformation. The key decision is whether to desugar in the parser (immediate) or in a pipeline pass (deferred). Deferred is better because it can use environment information to verify Monad instances exist.
+### Step 7.3: Define Functor/Applicative/Monad + instances in base.tl
 
-### Step 7.3: Define Monad in base.tl
+**Files:** base.tl
 
 ```tulam
 algebra Functor(f:Type1) = { function fmap(g: a -> b, x:f(a)) : f(b) };
@@ -570,29 +804,263 @@ algebra Applicative(f:Type1) extends Functor(f) = {
     function ap(ff:f(a -> b), fa:f(a)) : f(b)
 };
 algebra Monad(m:Type1) extends Applicative(m) = {
-    function bind(x:m(a), f:a -> m(b)) : m(b)
+    function bind(x:m(a), f: a -> m(b)) : m(b),
+    function then(x:m(a), y:m(b)) : m(b)
 };
+
+instance Functor(Maybe) = { ... };
+instance Functor(List) = { ... };
+instance Monad(Maybe) = { pure, bind, ap, then };
+instance Monad(List) = { pure, bind, ap, then };
 ```
 
-**Test:** Define `Maybe` monad, write an action that chains Maybe computations, verify it works.
+### Step 7.4: Future — Array and Bulk algebra instances
 
-**Milestone: Monadic programming works. Actions desugar into bind chains.**
+With HKT, we can define Functor/Foldable instances for Array and the Bulk algebra (deferred until Array is implemented).
+
+**Test:**
+```
+> fmap(not, Just(True))                  # → Just(False)
+> fmap(not, Nothing)                     # → Nothing
+> bind(Just(3), \x -> Just(x))           # → Just(3)
+> fmap(not, Cons(True, Cons(False, Nil)))  # → Cons(False, Cons(True, Nil))
+```
+
+**Milestone: Higher-kinded types work. Functor, Applicative, Monad defined and instantiated for Maybe and List.**
+
+### Phase 7 Learnings
+
+- The existing dispatch mechanism needed only a 3-line change to `inferTypeNames` — collect whatever types are inferable instead of requiring ALL args
+- `ArrowType` and `Implicit` Surface AST nodes needed `CLMEMPTY` cases in `exprToCLM` to avoid hitting the error catch-all
+- `then` is a reserved word (from if/then/else) — renamed monadic sequencing to `seq`
+- When intrinsic dispatch finds the intrinsic but args aren't fully evaluated (fewer inferred types than args), must defer (return CLMIAP unevaluated) rather than error — allows re-evaluation once args resolve
+- Extracted `dispatchInstance` helper in Interpreter.hs for reuse from both intrinsic-fallback and non-intrinsic paths
+- `CLMPatternCheck` type replaced old `CLMConsTagCheck` tuples — `consTagCheckToCLM` became `patternCheckToCLM` returning `CLMCheckTag`/`CLMCheckLit`
+- `pure(True)` can't dispatch without type context (no constructor arg to infer monad from) — expected without type checker
 
 ---
 
-## Phase 8: Standard Library and Category/Arrow
+## Phase 8: Arrow Types and Function Type Syntax
 
-**Goal:** Rich standard library with categorical structures.
+**Goal:** Parse `a -> b` as a type, required for Functor's `fmap` signature and for expressing function types in general.
 
-### Step 8.1: Core algebras
+### Step 8.1: Parse arrow types
+
+**Files:** Parser.hs
+
+In type positions, `a -> b` should parse to a function type:
 
 ```tulam
-algebra Semigroup(a:Type) = { function combine(x:a, y:a) : a };
-algebra Monoid(a:Type) extends Semigroup(a) = { function empty() : a };
-algebra Group(a:Type) extends Monoid(a) = { function inverse(x:a) : a };
+function apply(f: Nat -> Bool, x:Nat) : Bool = f(x);
 ```
 
-### Step 8.2: Category and Arrow as library structures
+Parser needs `concreteType` to handle `->` as an infix type operator.
+
+### Step 8.2: Represent function types
+
+ArrowType Expr Expr already exists in Surface.hs. Ensure it's usable in all type positions.
+
+**Milestone: Function types expressible in type positions. Functor's fmap signature is parseable.**
+
+---
+
+## Phase 9: Row-Polymorphic Effect System ✅ COMPLETE
+
+**Goal:** Side effects tracked via row-polymorphic effect types. `action` blocks desugar into monadic `bind` chains. Effects are inferred, composable, and erased at runtime.
+
+See `doc/EffectDesign.md` for the full design document.
+
+**Status:** All 6 steps completed. Effect declarations, action blocks, type checking with `TEffect Row Ty`, handlers, standard library effects (Console, FileIO, State, Exception). IO intrinsics (`putStrLn`, `putStr`, `readLine`) working via `dispatchIOIntrinsic`. 10 P12 effect tests passing.
+
+### Step 9.1: Effect Declaration Parsing (Phase A)
+
+Add `effect`, `handler`, `handle` to reserved words. Parse effect declarations:
+
+```tulam
+effect Console = {
+    function readLine() : String,
+    function putStrLn(s:String) : Unit
+};
+```
+
+- New AST node: `EffectDecl Name [(Name, [Expr], Expr)]`
+- Store in `effectDecls :: HashMap Name EffectDecl` in Environment
+- Effect operations registered as available functions
+
+### Step 9.2: Action Block Desugaring (Phase B)
+
+Parse `action` blocks with `<-` for monadic bind:
+
+```tulam
+action main() = {
+    name <- readLine(),
+    greeting = "Hello, " ++ name,
+    putStrLn(greeting)
+};
+// Desugars to: bind(readLine(), \name -> let greeting = ... in bind(putStrLn(greeting), \_ -> pure(())))
+```
+
+- New AST nodes: `ActionBlock [ActionStmt]`, `ActionStmt = ActionBind Name Expr | ActionLet Name Expr | ActionExpr Expr`
+- New pipeline pass (Pass 0.5): `ActionBlock` → nested `bind`/`let` applications
+- `<-` operator parsed in action block context
+
+### Step 9.3: Effect Type Checking (Phase C)
+
+Add `TEffect Row Ty` to internal type representation. Reuse existing row machinery (`RExtend`, `REmpty`, `RVar`, `rowExtract`, `unifyRows`, `rowSubst`):
+
+```tulam
+Eff { console: Console, fileio: FileIO } Unit     // closed row
+Eff { console: Console | r } Unit                  // open row (effect-polymorphic)
+```
+
+- Infer effect rows from function bodies (each effect operation adds its label)
+- Merge effect rows via `unifyRows` when composing effectful expressions
+- Open rows (`| r`) enable subsumption — fewer effects usable where more expected
+- Effect rows erased in Pass 4 (CLM conversion) — zero runtime overhead
+
+### Step 9.4: Effect Handlers (Phase D)
+
+```tulam
+handler StdConsole : Console = {
+    function readLine() = intrinsic,
+    function putStrLn(s) = intrinsic
+};
+
+let result = handle greet() with StdConsole;
+// Removes console from effect row
+```
+
+- v1: Built-in effects have implicit default handlers (just execute)
+- v2: Explicit `handle...with` for testing/mocking
+- Handler application removes one effect label from the row
+
+### Step 9.5: Interop Effect Inference (Phase E)
+
+Auto-assign effect labels from extern metadata namespaces:
+
+| Extern Source | Effect Label |
+|---|---|
+| `System.IO.*`, `stdio.h` | `fileio: FileIO` |
+| `System.Net.*`, `fetch` | `net: NetworkIO` |
+| `System.Console` | `console: Console` |
+
+Sandboxing: `import UntrustedLib with { deny NetworkIO }` — type checker rejects functions with denied effect labels.
+
+### Step 9.6: Standard Library Effects (Phase F)
+
+Create `lib/Effect/` modules: Console, FileIO, State, Exception, Random, NetworkIO, Async. Add intrinsic implementations for core effect operations. Update `lib/Base.tl`.
+
+**Milestone: Full effect system works. Side effects are tracked, composable, testable, and erased at runtime. Monad transformers not needed.**
+
+---
+
+## Phase 10: Standard Library, Deriving, and Category/Arrow
+
+**Goal:** Rich standard library with categorical structures and a language-native deriving mechanism.
+
+### Step 10.1: Core algebras ✅ COMPLETE
+
+Semigroup, Monoid, Group already exist (Phase 3). Instances for primitive types use `intrinsic`.
+
+### Step 10.2: Reflection Primitives and Derive System ✅ COMPLETE
+
+**Key design insight:** `deriving` is NOT compiler magic — it's pure tulam code powered by reflection primitives. The `derive { }` block lives inside algebra definitions, and `instance X(T) = derive;` instantiates it.
+
+#### 10.2.1: Reflection Primitives (6 intrinsics in `lib/Core/Reflect.tl`)
+
+**Value reflection** (runtime, operates on any value):
+- `tag(x:a) : Int` — constructor tag index (0-based), primitives return 0
+- `tagName(x:a) : String` — constructor name, primitives return type name
+- `arity(x:a) : Int` — number of fields, primitives return 0
+- `field(x:a, i:Int) : b` — get i-th field (0-indexed)
+
+**Type reflection** (operates on type name strings):
+- `numConstructors(T:String) : Int` — number of constructors in a sum type
+- `constructorByIndex(T:String, i:Int) : a` — create nullary constructor by tag index
+
+**Structural helpers** (pure tulam functions built on primitives):
+- `structuralEq(x, y)`, `structuralCompare(x, y)`, `structuralShow(x)`, `structuralHash(x)`
+
+Implementation: `dispatchReflectionIntrinsic` in `src/Interpreter.hs`, wired into CLMIAP dispatch chain after IO intrinsics and before array HOFs.
+
+#### 10.2.2: Derive Blocks in Algebras
+
+**Chosen syntax:** `derive { }` block inside algebra definitions + `instance X(T) = derive;` + `type T = ... deriving A, B;`
+
+```tulam
+algebra Eq(a:Type) = {
+    function (==)(x:a, y:a) : Bool,
+    function (!=)(x:a, y:a) : Bool = not(x == y),
+
+    derive {
+        function (==)(x, y:a) : Bool = structuralEq(x, y),
+        function (!=)(x, y:a) : Bool = not(structuralEq(x, y))
+    }
+};
+
+// Usage:
+instance Eq(Color) = derive;
+type Direction = North | South | East | West deriving Eq, Show;
+```
+
+**Standard algebras with derive blocks:** Eq, Ord, Show, Hashable.
+
+**Implementation:**
+- `derive`/`deriving` reserved words in Lexer.hs
+- `Derive` expr variant + `structDerive` field on `StructInfo` in Surface.hs
+- `parseStructMembers` custom parser handles comma-separated items + trailing derive block
+- Pipeline processes `[Derive]` instances by looking up algebra's derive block and instantiating functions
+- `pSumTypeWithDeriving` expands to SumType + Instance declarations
+
+**Tests:** 38 new hspec tests (21 reflection primitives, 11 structural helpers, 8 derive system).
+
+#### 10.2.3: (Original design — superseded by 10.2.2)
+
+The original design proposed `deriveFunctor(Type)` compile-time functions. This was superseded by the `derive { }` block approach which keeps derive logic inside algebra definitions — cleaner and more discoverable.
+
+```tulam
+// SUPERSEDED — kept for historical reference
+// This is a compile-time function: it takes a Type1 and produces an instance body
+// The compiler evaluates this during Pass 1 (environment building)
+function deriveFunctor(T:Type1) = {
+    // For each constructor of T:
+    //   - nullary constructors: pass through unchanged
+    //   - fields of type 'a' (the functor param): apply g
+    //   - fields of type T(a) (recursive): apply fmap(g, field)
+    //   - other fields: pass through unchanged
+    // Returns: function fmap(g, x) = match | pattern match cases...
+};
+```
+
+The actual implementation requires compile-time evaluation of type reflection primitives. This means the interpreter needs to handle these intrinsics during Pass 1 when processing `derive` expressions. The key insight is that **this is the same mechanism as intrinsic dispatch** — the compiler already evaluates intrinsics, we just need intrinsics that inspect type structure.
+
+#### 10.2.4: What can be auto-derived?
+
+| Structure | Derivation rule |
+|-----------|----------------|
+| `Eq` | Compare constructor tags, then recursively compare fields (requires `Eq` on field types) |
+| `Ord` | Compare constructor tags (by position), then lexicographic field comparison |
+| `Functor` | Map function over fields of type `a`, recurse on fields of type `F(a)`, pass through others |
+| `Foldable` | Collect fields of type `a`, recurse on fields of type `F(a)` |
+| `Show` | Print constructor name + fields recursively |
+
+#### 10.2.5: Natural Transformations as Library Functions
+
+Natural transformations (e.g., `safeHead : List ~> Maybe`) don't need a keyword. They're just parametrically polymorphic functions:
+
+```tulam
+// This IS a natural transformation — the type signature says it all
+function safeHead(xs:List(a)) : Maybe(a) = match
+    | Nil -> Nothing
+    | Cons(x, rest) -> Just(x);
+
+// When we have a type checker, it can verify parametricity (doesn't inspect 'a')
+// Until then, it's just a regular polymorphic function
+```
+
+The `~>` notation is useful documentation but provides no runtime benefit without a type checker. If desired later, `~>` can be added as a type-level operator that the type checker interprets as "parametrically polymorphic functor morphism."
+
+### Step 10.3: Category and Arrow as library structures
 
 ```tulam
 algebra Category(arr:Type2) = {
@@ -606,95 +1074,429 @@ algebra Arrow(arr:Type2) extends Category(arr) = {
 };
 ```
 
-### Step 8.3: Kleisli derivation
+### Step 10.4: Kleisli derivation
 
-When `Monad(m)` is instantiated, automatically derive `Category(Kleisli(m))` where `Kleisli(m,a,b) = a -> m(b)`.
+Automatically derive `Category(Kleisli(m))` from `Monad(m)`.
 
-### Step 8.4: Natural transformations
+### Step 10.5: SIMD types and Lane algebra
 
-Add `natural` keyword for parametrically polymorphic functor morphisms:
+Declare SIMD primitives and the Lane algebra in standard library:
 
 ```tulam
-natural safeHead : List ~> Maybe = {
-    function transform(xs:List(a)) : Maybe(a) = { ... }
+primitive Vec2(a:Type);
+primitive Vec4(a:Type);
+primitive Vec8(a:Type);
+primitive Vec16(a:Type);
+
+instance Num(Vec4(Float32)) = intrinsic;
+instance Num(Vec8(Float32)) = intrinsic;
+
+algebra Lane(v:Type1) = {
+    function splat(x:a) : v(a),
+    function extract(xs:v(a), i:Int) : a,
+    function hsum(xs:v(a)) : a requires Num(a),
+    function hmin(xs:v(a)) : a requires Ord(a),
+    function hmax(xs:v(a)) : a requires Ord(a),
+    function blend(mask:v(Int32), xs:v(a), ys:v(a)) : v(a),
+    function lanes(xs:v(a)) : Int
 };
+
+instance Lane(Vec4) = intrinsic;
+instance Lane(Vec8) = intrinsic;
 ```
 
-**Milestone: Full categorical vocabulary available. Standard library mirrors the design document.**
+**Milestone: Full standard library. Deriving mechanism, categorical vocabulary, SIMD types, numeric hierarchy all available.**
 
 ---
 
-## Phase 9: Type Checker (Pass 4)
+## Phase 11: Type Checker (Pass 3) ✅ COMPLETE
 
 **Goal:** Actually enforce types, universe levels, and structure laws.
 
-### Step 9.1: Basic bidirectional type checking
+### Step 11.1: Basic bidirectional type checking ✅
 
-Implement type synthesis (infer) and type checking (check) for:
-- Literals (Int, Float, String, etc.)
-- Variables (look up in environment)
-- Function application (check argument types match parameter types)
-- Constructor application (check arity and field types)
+Implemented in new module `src/TypeCheck.hs`. Bidirectional type checking with two modes:
+- **`infer`** (synthesis): given an expression, produce its type
+- **`check`** (verification): given an expression and expected type, verify they match
 
-### Step 9.2: Universe level checking
+Internal type representation (`Ty`):
+- `TVar Name` — type variables (unification variables)
+- `TRigid Name` — rigid type variables (quantified, cannot be unified away)
+- `TCon Name` — type constructors (Int, Bool, Nat, etc.)
+- `TApp Ty Ty` — type application (Maybe Int, List Bool)
+- `TPi Name Ty Ty` — dependent function type (Pi type)
+- `TSigma Name Ty Ty` — dependent pair type (Sigma type)
+- `TId Ty Ty Ty` — identity/equality type (for PropEqT)
+- `TForall Name Ty` — polymorphic type (∀a. T)
+- `TRecord [(Name, Ty)]` — record type with named fields
+- `TU Int` — universe type (U 0 = Type, U 1 = Type1, etc.)
 
-Verify that `U n` values only appear in positions where `U (n+1)` is expected. Enforce cumulativity: `U n` is a subtype of `U (n+1)`.
+Row types for structural record typing:
+- `REmpty` — empty row
+- `RExtend Name Ty Row` — row extension (label:type + rest)
+- `RVar Name` — row variable (for polymorphism)
+- `RRigid Name` — rigid row variable
 
-### Step 9.3: Structure constraint checking
+Covers: literals, variables, function application, constructor application, lambda abstractions, let bindings, if/then/else, pattern matching, repr casts, record literals, record types.
 
-When a function requires `Eq(a)`, verify that an instance exists for the concrete type being used.
+### Step 11.2: Unification engine ✅
 
-### Step 9.4: Implicit parameter resolution
+HashMap-based substitution with occurs check. Unifies:
+- Type variables with concrete types
+- Type constructors (must match)
+- Type application (component-wise)
+- Arrow/Pi types (contravariant in domain, covariant in codomain)
+- Record types (field-wise)
+- Row types (structural matching with extension)
 
-Given `==(x:Nat, y:Nat)`, automatically resolve the implicit parameter `[a:Type]` to `Nat` by unifying parameter types.
+### Step 11.3: Structure constraint checking ✅
 
-**Milestone: Type errors are caught at compile time. Universe levels enforced.**
+`CStructure Name [Ty]` constraints emitted for implicit-parameter functions. Resolved against `instanceLambdas` in the interpreter state. When `(==)(x:Nat, y:Nat)` is called, the checker emits `CStructure "Eq" [TCon "Nat"]` and verifies an `Eq(Nat)` instance exists.
+
+### Step 11.4: Polymorphism ✅
+
+`TForall` for universal quantification. `instantiate` replaces bound variables with fresh unification variables. `generalize` abstracts over free type variables with deduplication (no duplicate `∀` bindings).
+
+### Step 11.5: Pipeline integration ✅
+
+`typeCheckPass` inserted as Pass 3 in the compilation pipeline (between case optimization and CLM conversion). Pipeline order:
+- Pass 0: After-parser desugaring
+- Pass 1: Environment building
+- Pass 2: Case optimization
+- **Pass 3: Type checking** (new)
+- Pass 4: CLM conversion
+- Pass 5: Code generation
+
+**Permissive mode (default):** Type errors are reported as warnings, not fatal errors. The `strictTypes` flag in `InterpreterState` can be set to make type errors fatal. This allows the existing pipeline to continue working while the type checker matures.
+
+### Step 11.6: Record types in Surface AST ✅
+
+Added `RecordLit [(Name, Expr)]` and `RecordType [(Name, Expr)]` to the Surface AST (`Expr`). Parsed with `{name = val}` for literals and `{name:Type}` for type annotations. These integrate with the row-polymorphic type checker.
+
+### Phase 11 Learnings & Implementation Notes
+
+**Completed.** Key decisions and discoveries:
+
+1. **Permissive by default**: Making type errors warnings (not fatal) was essential for incremental adoption. The existing test suite (95 tests) continued passing while the type checker was added. The `strictTypes` flag exists for future strict mode.
+
+2. **Row polymorphism for records**: Record types use row types (`REmpty`, `RExtend`, `RVar`, `RRigid`) for structural subtyping. `{x:Int, y:Bool}` is a closed record; open records use row variables for extensibility.
+
+3. **Constraint generation vs. resolution**: Structure constraints (`CStructure`) are generated during type checking and resolved against the existing instance maps. This reuses the instance infrastructure from Phase 1 rather than building a separate constraint solver.
+
+4. **Surface AST additions**: `RecordLit` and `RecordType` were added to `Expr` in `Surface.hs` for record literal construction and record type annotations. These provide first-class record support beyond the `record` declaration sugar.
+
+5. **Test suite growth**: 141 tests total (up from 95), covering type inference, type checking, constraint resolution, record types, and error reporting. All passing.
+
+**Milestone: Type errors are caught at compile time (as warnings in permissive mode, fatal in strict mode). Bidirectional type checking with row polymorphism and structure constraint resolution.**
 
 ---
 
-## Dependency Graph
+## Phase 9.5: Intrinsic Completeness and Runtime Foundations ✅ COMPLETE
+
+**Goal:** Fill the gap between declared `= intrinsic` instances and actual Haskell backing. Make the interpreter capable of running real programs with I/O, string manipulation, and error handling.
+
+**Completed:** All steps implemented. 47 new tests (387 total). Key additions:
+
+### What was implemented:
+
+1. **Char foundation**: Parser support for char literals (`'A'`, `'\n'`), Eq/Ord intrinsics, `lib/Numeric/Char.tl`
+2. **Show intrinsics**: All primitive types (Int, Float64, String, Char, Int8-64, UInt8-64, Float32, Byte). Show(String) uses Haskell-style quotes.
+3. **Bounded intrinsics**: minBound/maxBound for all fixed-width types, Char, Byte
+4. **Enum intrinsics**: succ/pred/toEnum/fromEnum for Int and Char
+5. **Hashable intrinsics**: hash for Int (identity), String (FNV-1a), Char (ord)
+6. **Extended string ops**: charAt, substring, indexOf, trim, toUpper, toLower, startsWith, endsWith, replace, parseInt, parseFloat. New `StringExt` algebra + instance.
+7. **Array ops (pure)**: set, push, arrayConcat, reverse, range. New `ArrayOps` algebra + instance.
+8. **error/panic**: `error(msg)` → CLMERR, dispatched via `dispatchIOIntrinsic`
+9. **FileIO runtime**: readFile, writeFile, appendFile, fileExists in `dispatchIOIntrinsic`
+10. **CLMAPP IO fallback**: `evalCLM` for CLMAPP tries `dispatchIOIntrinsic` on unresolved function IDs
+11. **Parser**: `[1,2,3]` now creates `ArrayLit` (→ `CLMARRAY`) instead of `Lit (LList ...)`
+
+### Known dispatch limitations (resolved in Phase 10.3):
+- `toEnum` for Char/Bool/Ordering: **resolved** — type-directed dispatch uses return type annotation from CLM conversion
+- `range` for Array: **resolved** — same mechanism (return type hint enables dispatch to correct intrinsic/instance)
+- `pure(Nil)` in Maybe context: **resolved** — CLMTYPED wrapper carries return type, enabling correct monad dispatch
+
+### Files modified:
+- `src/Intrinsics.hs` — charEntries, showEntries, boundedEntries, enumEntries, hashEntries, stringExtEntries, expanded arrayEntries. Exports `boolToCLM`.
+- `src/Interpreter.hs` — error, readFile, writeFile, appendFile, fileExists in dispatchIOIntrinsic. CLMAPP IO fallback.
+- `src/Parser.hs` — charVal parser, ArrayLit for `[...]`, char in pInsideLeftPattern
+- `lib/Numeric/Char.tl` — **new** (Char Eq/Ord instances)
+- `lib/Algebra/StringExt.tl` — **new** (StringExt algebra)
+- `lib/Collection/Array.tl` — ArrayOps algebra + instance
+- `lib/Numeric/String.tl` — StringExt instance
+- `lib/Instances/Show.tl` — Show for fixed-width types
+- `lib/Base.tl` — exports StringExt, Numeric.Char
+- `tests/programs/P13_Intrinsics.tl` — **new** (32 test functions)
+- `test/Spec.hs` — P13 describe block (47 tests)
+
+---
+
+## Phase 9.7: Managed Mutability (Ref/MutArray)
+
+**Goal:** Enable algorithms that need mutable state without exposing raw memory.
+
+**Depends on:** Phase 9 (effect system) — mutation operations return `Eff {state: State} a`.
+
+### Step 9.7.1: Ref Primitive
+
+```tulam
+primitive Ref(a:Type);
+
+// All operations are effectful:
+function newRef(x:a) : Eff {state: State} Ref(a) = intrinsic;
+function readRef(r:Ref(a)) : Eff {state: State} a = intrinsic;
+function writeRef(r:Ref(a), x:a) : Eff {state: State} Unit = intrinsic;
+function modifyRef(r:Ref(a), f:a -> a) : Eff {state: State} Unit = intrinsic;
+```
+
+Interpreter: `Ref` backed by `IORef` via the Haskell runtime. `CLMREF Int` in CLM (index into a ref table in `InterpreterState`).
+
+### Step 9.7.2: MutArray Primitive
+
+```tulam
+primitive MutArray(a:Type);
+
+function newMutArray(n:Int, x:a) : Eff {state: State} MutArray(a) = intrinsic;
+function readAt(xs:MutArray(a), i:Int) : Eff {state: State} a = intrinsic;
+function writeAt(xs:MutArray(a), i:Int, x:a) : Eff {state: State} Unit = intrinsic;
+function freeze(xs:MutArray(a)) : Eff {state: State} Array(a) = intrinsic;
+function thaw(xs:Array(a)) : Eff {state: State} MutArray(a) = intrinsic;
+```
+
+### Step 9.7.3: Raw Memory (native backend only, future)
+
+Only needed for x86/LLVM backend. Not needed for interpreter or JS/.NET targets.
+
+```tulam
+// Only available with `import unsafe Memory;`
+primitive Ptr(a:Type);
+function malloc(n:Int) : Eff {mem: UnsafeMemory} Ptr(Byte) = intrinsic;
+function free(p:Ptr(a)) : Eff {mem: UnsafeMemory} Unit = intrinsic;
+function peek(p:Ptr(a)) : Eff {mem: UnsafeMemory} a = intrinsic;
+function poke(p:Ptr(a), x:a) : Eff {mem: UnsafeMemory} Unit = intrinsic;
+```
+
+Gated by `UnsafeMemory` effect — sandboxable at module boundaries.
+
+---
+
+## Phase 13: First-Class Class System
+
+**Goal:** Native OOP classes with single inheritance, dynamic dispatch, sealed classes, and transparent extern class subclassing. 1-1 mapping to .NET/JS/C++ classes in codegen. See `doc/ClassDesign.md` for the full design.
+
+### Phase 13.1: Core Class System (Milestone 1)
+
+**New keywords:** `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super`
+
+**Files changed:**
+- `Lexer.hs` — reserve keywords
+- `Surface.hs` — `ClassDecl Lambda ClassInfo`, `ClassInfo`, `ClassModifier`, `MethodModifier` types; add `lamMod` to `Lambda` (defaults `MNone`); update `traverseExpr`, `ppr`
+- `Parser.hs` — `pClassDecl` production (fields in header, methods in body, extends, implements)
+- `State.hs` — `ClassMeta` data type, `classDecls :: NameMap ClassMeta` + `classTagCounter :: !Int` in `Environment`; helpers: `lookupClass`, `isSubclassOf`, `lookupParentMethod`, `resolveDot`, `allocClassTag`
+- `Pipeline.hs` Pass 1 — `processBinding (ClassDecl ...)`: resolve parent hierarchy, build `ClassMeta` with merged fields/methods, register constructor + type, update parent's `cmChildren`
+- `CLM.hs` — `CLMMCALL CLMExpr Name [CLMExpr]`, `CLMSCALL CLMExpr Name [CLMExpr]`, `CLMNEW Name [CLMExpr]` nodes; update `traverseCLMExpr`, `descendCLM`, `freeVarsCLM`, `ppr`
+- `Pipeline.hs` Pass 4 — `exprToCLM` rules: `App (RecFieldAccess ...) args` on class type → `CLMMCALL`; `Dog.new(args)` → `CLMNEW`; `super.method(args)` → `CLMSCALL`; field access on class → `CLMFieldAccess` with resolved index
+- `Interpreter.hs` — `evalCLM` for `CLMNEW` (build `CLMCON`, validate not abstract), `CLMMCALL` (tag-based dynamic dispatch via `cmMethods`), `CLMSCALL` (parent method lookup)
+- `CaseOptimization.hs` — iterate over `classDecls` method CLMLams alongside `topLambdas`
+- `CLMOptimize.hs` — update `descendCLM` for new nodes (treat as opaque like `CLMIAP`)
+
+**Object representation:** `CLMCON (ConsTag "Dog" tag) [field0, field1, ...]` — no vtable in object. Fields laid out parent-first, own-last. Method dispatch via `classDecls` lookup on runtime ConsTag.
+
+**Test:** `tests/programs/P20_Classes.tl` — class declaration, construction, field access, method call, single inheritance, override, super calls, abstract method error
+
+### Phase 13.2: Sealed Classes + Implements + Extern Plumbing (Milestone 2) ✅ DONE
+
+**Completed.** 488 tests passing.
+
+**Sealed classes:**
+- `cmSourceFile :: String` added to `ClassMeta` — tracks which file declared each class
+- `isSealedClass`, `getAllSubclasses` helpers in `State.hs`
+- Sealed validation in `processBinding (ClassDecl ...)` step 8.5: child of sealed parent must be in same source file
+- `checkSealedExhaustiveness` in `CaseOptimization.hs`: warns when sealed class pattern match is missing branches
+- **Test:** `tests/programs/P21_SealedClasses.tl` (5 tests)
+
+**Implements clause:**
+- `generateClassAlgebraInstance` in `Pipeline.hs`: matches class methods to algebra function names, registers as instance lambdas
+- Falls back to algebra's derive block if no matching methods found
+- Reuses `propagateToParent` + `composeMorphismInstances` for parent structure inheritance
+- **Test:** `tests/programs/P22_ClassAlgebras.tl` (5 tests)
+
+**Extern class plumbing:**
+- `targetImports :: [(ModulePath, Name)]` in `Environment` — stores `import ... target ...` declarations
+- `processBinding (Import path _ (Just tgt), _)` stores target imports
+- `src/MetadataResolver.hs` — stub interface for codegen-time resolution (no-op in interpreter)
+- Extern classes not available in interpreter (by design); will be populated by codegen backends
+- **Test:** `tests/programs/P23_ExternClasses.tl` (3 tests)
+
+### Phase 13.3: Type-Test Patterns + Downcast (Milestone 3)
+
+- Type-test patterns: `match a | Dog(_, _, breed) -> ... | Cat() -> ... | _ -> ...`
+- Downcast via `as` → `Maybe`: extend `ReprCast` resolution to check `classDecls` hierarchy
+
+### Phase 13.4: Extern Class Resolution (Milestone 4)
+
+- Implement actual metadata resolvers in `MetadataResolver.hs` for each target
+- .NET: read assembly metadata via Mono.Cecil → auto-populate `ClassMeta` in `classDecls`
+- JS: parse `.d.ts` TypeScript declaration files
+- Native: parse C/C++ headers via libclang
+- Subclassing extern classes works automatically (processBinding already handles it)
+- Super calls across tulam/extern boundary
+
+### Phase 13.6: Type Checker Integration
+
+- Subtype judgments in `unify`/`check`: walk `cmParent` chain via `isSubclassOf`
+- Implicit upcast insertion when subtype matches expected supertype
+- Override signature checking (covariant return, parameter compatibility)
+- Sealed exhaustiveness checking
+
+### Key Dependencies
+- Phase 10 (Reflection + Derive) — needed for `derive` on classes
+- Phase 11 (Type Checker) — needed for subtype judgments, sealed exhaustiveness
+- Module System — needed for sealed class validation (same-module constraint)
+
+---
+
+## Phase 14: Interop and Codegen Backends (Future)
+
+**Goal:** Target-specific code generation using the class system for 1-1 OOP mapping.
+
+### Phase 14.1: .NET Backend
+- Assembly metadata reader (Mono.Cecil) → `ClassMeta` entries for imported .NET types
+- CLM → C# source emission (intermediate) or direct IL emission
+- `CLMNEW` → `new`, `CLMMCALL` → virtual call, `CLMSCALL` → `base.method()`
+- Type mapping table (tulam Int → System.Int64, Maybe → Nullable, etc.)
+- Null → Maybe wrapping, exception → Either wrapping at boundaries
+
+### Phase 14.2: JavaScript Backend
+- `.d.ts` parser → `ClassMeta` entries
+- CLM → JS source emission (ES6 classes)
+- Module system (ES modules / CommonJS)
+- Structural subtyping via row polymorphism for duck-typed JS
+
+### Phase 14.3: C++ Backend
+- Header parser (libclang) → `ClassMeta` entries
+- CLM → C++ source emission
+- Memory management strategy (unique_ptr / shared_ptr / GC)
+- Closure conversion for lambdas passed as function pointers
+- Monomorphization for generics
+
+See `doc/InteropDesign.md` for the full interop design (type mapping, null handling, exception handling, callback interop, generics mapping, target-specific code blocks).
+
+---
+
+## Phase 12: GPU Compute Model (Future)
+
+**Goal:** Transparent GPU acceleration for bulk operations on primitive types.
+
+See `doc/PrimitiveDesign.md` §8 for the type-system-level design. A separate `doc/GPUDesign.md` document will detail:
+
+- Memory model: CPU↔GPU data transfer, caching, aliasing rules
+- Kernel generation: how `fmap` over `Array(Float32)` becomes a GPU kernel
+- Law-driven optimization: how algebraic laws license parallelism transformations
+- `@device` and `@parallel` annotation processing
+- Target backends: CUDA, Metal, Vulkan Compute, WebGPU
+
+### Key Dependencies
+- Phase 4 (primitive types, intrinsics) — needed for GPU-friendly types
+- Phase 7 (HKT) — needed for Functor/Bulk algebra definitions
+- Phase 10 (SIMD, Lane algebra) — needed for CPU-side vectorization
+- Phase 11 (type checker) — needed to verify GPU compatibility constraints
+
+---
+
+## Dependency Graph (Updated)
 
 ```
-Phase 1: Structures Work          (CRITICAL PATH - everything depends on this)
+Phase 1: Structures Work             ✅ COMPLETE
     |
     v
-Phase 2: Language Completeness    (if/else, let/in, records - quality of life)
+Phase 2: Language Completeness       ✅ COMPLETE (if/else, let/in, records)
     |
     v
-Phase 3: extends                  (structure inheritance)
+Phase 3: extends + algebra/morphism  ✅ COMPLETE
     |
     v
-Phase 4: algebra/morphism         (categorical keywords - depends on extends)
+Phase 4: Primitives + Intrinsics    ✅ COMPLETE (primitive, intrinsic, Num, 3+4=7)
+    |
+    +---> Phase 4+: Parallel Features  ✅ COMPLETE (lambdas, ADTs, tests, composition)
     |
     v
-Phase 5: Higher-Kinded Types      (f:Type1 - depends on universe hierarchy)
+Phase 5: Repr System                ✅ COMPLETE (repr, as, representation mappings)
     |
-    +---> Phase 6: Arrow Types    (a -> b in type positions - depends on HKT)
+    v
+Phase 6: Convertible Morphism       ✅ COMPLETE (type conversions, morphism composition)
+    |
+    v
+Phase 7: Higher-Kinded Types        ✅ COMPLETE (Functor, Applicative, Monad for Maybe/List)
+    |
+    +---> Phase 8: Arrow Types       ✅ COMPLETE (a -> b in type positions)
     |         |
     |         v
-    +---> Phase 7: Do-Notation    (depends on HKT + arrow types for Monad def)
+    +---> Phase 9: Effect System      (effects, action desugaring, handlers, interop)
               |
               v
-          Phase 8: Std Library    (Category, Arrow, Functor, Monad instances)
+          Phase 10: Std Library      ✅ PARTIAL (Reflection + Derive DONE; Category, Arrow remaining)
               |
               v
-          Phase 9: Type Checker   (can be started in parallel from Phase 3 onward)
+          Phase 11: Type Checker     ✅ COMPLETE (bidirectional, row polymorphism, permissive mode)
+              |
+              v
+          Module System              ✅ COMPLETE (module/import/export/open/private/opaque)
+              |
+              v
+          Primitive Expansion        ✅ COMPLETE (Int8-64, UInt8-64, Float32, Array, Vec2/4/8/16)
+              |
+              v
+          Phase 13: Class System     (first-class OOP: classes, inheritance, extern subclassing)
+              |
+              v
+          Phase 14: Interop + Codegen (metadata resolver, .NET/JS/C++ backends)
+              |
+              v
+          Phase 12: GPU Compute      (requires codegen backend + SIMD activation)
 ```
 
-Phase 2 can run in parallel with Phase 1 (different files, no dependencies). Phase 9 can start as early as Phase 3 -- basic type checking doesn't need HKT.
+Phase 7 (HKT / Kinds) is complete. Functor, Applicative, Monad work for Maybe and List. Phase 8 (Arrow Types) is complete — `a -> b` parses in all type positions, is represented as `ArrowType Expr Expr` in the AST, and is erased to `CLMEMPTY` at CLM conversion (type-level only). Arrow types are used in Functor/Monad signatures in base.tl. Phase 11 (Type Checker) is complete — bidirectional type checking with row polymorphism, permissive mode by default. Module System is complete — `module`, `import`, `open`, `export`, `private`, `opaque` keywords with `ModuleSystem.hs` providing path resolution, dependency graph construction, cycle detection, and topological sort. `lib/` directory contains modular stdlib layout. Primitive Type Expansion is complete — all integer widths (Int8-64, UInt8-64), Float32, Array(a), Vec2/4/8/16(a) with full intrinsic coverage via refactored generic helpers. 226 tests. Phase 9 (Row-Polymorphic Effect System) is the next step — see `doc/EffectDesign.md` for full design.
+
+### Algebraic Hierarchy Refactor (Post-Phase 7)
+
+The numeric hierarchy was refactored to use proper mathematical foundations with **multiple extends**:
+- Generic chain: Semigroup→Monoid→Group→AbelianGroup
+- Additive chain: AdditiveSemigroup(+)→AdditiveMonoid(zero)→AdditiveGroup(negate,-)→AdditiveAbelianGroup
+- Multiplicative chain: MultiplicativeSemigroup(*)→MultiplicativeMonoid(one)→MultiplicativeGroup(recip,/)
+- Composed (multiple extends): Semiring extends AdditiveMonoid+MultiplicativeMonoid, Ring extends AdditiveAbelianGroup+MultiplicativeMonoid, CommutativeRing extends Ring, EuclideanDomain extends CommutativeRing, Field extends CommutativeRing+MultiplicativeGroup, Floating extends Field
+
+New instances: Semiring(Nat), Group(Int), AbelianGroup(Float64). Nat now supports `+` and `*` operators. Interpreter fixed to re-evaluate `applyCLMLam` results (was returning unevaluated nested calls). 90 tests, all passing.
+
+### Vector Literal Design Note (`<1, 2, 3>` syntax)
+
+The `<1, 2, 3>` angle-bracket syntax currently parses to `Lit (LVec [exprs])` but has no CLM representation or interpreter support. The design decision: **vector literals should be overloaded** (like numeric literals), with context determining whether they become:
+
+1. **Array literal** — `Array(a)`, heap-allocated, variable-length bulk data
+2. **SIMD vector literal** — `Vec4(Float32)` etc., register-width, for math-heavy inner loops
+
+This requires the type checker (Phase 11) to resolve. Implementation deferred until then. For now, `LVec` is parsed and stored but not evaluable.
 
 ---
 
-## Effort Estimates
+## Effort Estimates (Updated)
 
-| Phase | Complexity | Key Challenge |
-|-------|-----------|--------------|
-| 1 | Medium-High | Instance processing and CLMIAP evaluation are the hardest parts |
-| 2 | Low-Medium | Straightforward parser additions + desugaring |
-| 3 | Medium | Inheritance resolution in environment building |
-| 4 | Low | Mostly lexer/parser sugar + validation |
-| 5 | High | HKT requires rethinking type representation and application |
-| 6 | Medium | Arrow type parsing interacts with expression parsing |
-| 7 | Medium | Desugaring is mechanical but needs correct scoping |
-| 8 | Low-Medium | Library code, but tests completeness of all prior phases |
-| 9 | Very High | Type checking is the largest single feature |
+| Phase | Status | Complexity | Key Challenge |
+|-------|--------|-----------|--------------|
+| 1 | ✅ COMPLETE | Medium-High | Instance processing and CLMIAP evaluation |
+| 2 | ✅ COMPLETE | Low-Medium | Parser additions + desugaring |
+| 3 | ✅ COMPLETE | Medium | Inheritance resolution, extends, value decls |
+| 4 | ✅ COMPLETE | Medium | Intrinsic registry, CLMIAP dispatch, prelude.tl |
+| 4+ | ✅ COMPLETE | Medium | Lambdas, ADTs, tests, morphism composition |
+| 5 | ✅ COMPLETE | Low-Medium | Parser for repr syntax, `as` expression |
+| 6 | ✅ COMPLETE | Low | Convertible morphism, composition (mostly library code) |
+| 7 | ✅ COMPLETE | Low | Only needed 3-line fix to inferTypeNames + 2-line exprToCLM addition |
+| 8 | ✅ COMPLETE | Medium | Arrow type parsing interacts with expression parsing |
+| 9 | Planned | Medium | Desugaring is mechanical but needs correct scoping |
+| 10 | Partial | Low-Medium | SIMD stubs done, Category/Arrow still needed |
+| 11 | ✅ COMPLETE | Very High | Bidirectional checking, row polymorphism, constraint resolution |
+| Module System | ✅ COMPLETE | High | Module resolution, dependency graph, cycle detection, topological sort, visibility |
+| Prim Expansion | ✅ COMPLETE | High | 15+ new primitive types, refactored intrinsic registry, numeric conversions, 226 tests |
+| 13 | Planned | High | Class hierarchy, dynamic dispatch, extern integration |
+| 14 | Future | Very High | Codegen backends (.NET/JS/C++), metadata readers |
+| 12 | Future | Very High | GPU codegen, memory model, kernel fusion |

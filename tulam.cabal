@@ -25,14 +25,20 @@ source-repository head
 
 library
   exposed-modules:
+      CaseOptimization
       CLM
+      CLMOptimize
       Interpreter
+      Intrinsics
       Lexer
       Logs
+      MetadataResolver
+      ModuleSystem
       Parser
       Pipeline
       State
       Surface
+      TypeCheck
       Util.IOLogger
       Util.Logger
       Util.PrettyPrinting
@@ -45,6 +51,33 @@ library
       base >=4.7 && <5
     , containers
     , directory
+    , filepath
+    , hashtables
+    , haskeline
+    , ilist
+    , indexed-traversable
+    , mtl
+    , parsec
+    , pretty-simple
+    , text
+    , time
+    , transformers
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
+
+executable tldoc
+  main-is: Main.hs
+  other-modules:
+      Paths_tulam
+  hs-source-dirs:
+      tools/tldoc
+  ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , directory
+    , filepath
     , hashtables
     , haskeline
     , ilist
@@ -70,6 +103,34 @@ executable tulam
       base >=4.7 && <5
     , containers
     , directory
+    , filepath
+    , hashtables
+    , haskeline
+    , ilist
+    , indexed-traversable
+    , mtl
+    , parsec
+    , pretty-simple
+    , text
+    , time
+    , transformers
+    , tulam
+    , unordered-containers
+    , vector
+  default-language: Haskell2010
+
+executable tulam-bench
+  main-is: Main.hs
+  other-modules:
+      Paths_tulam
+  hs-source-dirs:
+      tools/tulam-bench
+  ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , directory
+    , filepath
     , hashtables
     , haskeline
     , ilist
@@ -97,8 +158,10 @@ test-suite tulam-test
       base >=4.7 && <5
     , containers
     , directory
+    , filepath
     , hashtables
     , haskeline
+    , hspec
     , ilist
     , indexed-traversable
     , mtl

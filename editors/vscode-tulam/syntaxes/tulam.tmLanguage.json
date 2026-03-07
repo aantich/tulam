@@ -8,11 +8,16 @@
     { "include": "#numbers" },
     { "include": "#type-declaration" },
     { "include": "#record-declaration" },
+    { "include": "#primitive-declaration" },
+    { "include": "#repr-declaration" },
     { "include": "#function-declaration" },
     { "include": "#action-declaration" },
     { "include": "#structure-declaration" },
     { "include": "#instance-declaration" },
     { "include": "#law-declaration" },
+    { "include": "#module-declaration" },
+    { "include": "#import-declaration" },
+    { "include": "#module-keywords" },
     { "include": "#keywords" },
     { "include": "#operators" },
     { "include": "#universe-types" },
@@ -47,6 +52,14 @@
               "match": "\\\\[nrt\\\\\"0]"
             }
           ]
+        },
+        {
+          "name": "string.quoted.single.tulam",
+          "match": "'[^'\\\\]'"
+        },
+        {
+          "name": "string.quoted.single.escape.tulam",
+          "match": "'\\\\[nrt\\\\']'"
         }
       ]
     },
@@ -55,6 +68,10 @@
         {
           "name": "constant.numeric.float.tulam",
           "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.hex.tulam",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
         },
         {
           "name": "constant.numeric.integer.tulam",
@@ -80,6 +97,30 @@
           "captures": {
             "1": { "name": "keyword.declaration.record.tulam" },
             "2": { "name": "entity.name.type.tulam" }
+          }
+        }
+      ]
+    },
+    "primitive-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(primitive)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.primitive.tulam" },
+            "2": { "name": "entity.name.type.tulam" }
+          }
+        }
+      ]
+    },
+    "repr-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(repr)\\s+([A-Z][a-zA-Z0-9_']*)\\s+(as)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.repr.tulam" },
+            "2": { "name": "entity.name.type.tulam" },
+            "3": { "name": "keyword.operator.as.tulam" },
+            "4": { "name": "entity.name.type.tulam" }
           }
         }
       ]
@@ -148,11 +189,49 @@
         }
       ]
     },
+    "module-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(module)\\s+([A-Z][a-zA-Z0-9_'.]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.module.tulam" },
+            "2": { "name": "entity.name.namespace.tulam" }
+          }
+        }
+      ]
+    },
+    "import-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(import)\\s+([A-Z][a-zA-Z0-9_'.]*)",
+          "captures": {
+            "1": { "name": "keyword.control.import.tulam" },
+            "2": { "name": "entity.name.namespace.tulam" }
+          }
+        }
+      ]
+    },
+    "module-keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.module.tulam",
+          "match": "\\b(open|export|private|opaque|hiding|target|extern)\\b"
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
           "name": "keyword.control.tulam",
-          "match": "\\b(if|then|else|let|in|case|of|where)\\b"
+          "match": "\\b(if|then|else|let|in|where|match)\\b"
+        },
+        {
+          "name": "keyword.declaration.tulam",
+          "match": "\\b(primitive|intrinsic|repr|default|invariant|value)\\b"
+        },
+        {
+          "name": "keyword.operator.cast.tulam",
+          "match": "\\b(as)\\b"
         },
         {
           "name": "keyword.other.tulam",
@@ -172,7 +251,7 @@
         },
         {
           "name": "keyword.operator.arrow.tulam",
-          "match": "->|=>"
+          "match": "->|=>|~>"
         },
         {
           "name": "keyword.operator.spread.tulam",
@@ -191,8 +270,12 @@
           "match": "[+\\-*/]#?|%"
         },
         {
+          "name": "keyword.operator.pipe.tulam",
+          "match": "\\|"
+        },
+        {
           "name": "keyword.operator.misc.tulam",
-          "match": "\\||\\?|\\\\|\\."
+          "match": "\\?|\\\\|\\."
         }
       ]
     },

@@ -7,7 +7,6 @@ import System.Exit
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict -- trying state monad transformer to maintain state
-import Data.Functor.Identity
 import State
 import Control.Monad (zipWithM_, void, when)
 
@@ -17,9 +16,14 @@ import qualified Data.Text.Lazy as TL
 
 import Surface
 import Pipeline
+import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness)
+import TypeCheck (typeCheckPass)
+import CLM (pprSummary)
 import Interpreter
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
+import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath)
+import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 
 import Text.Pretty.Simple (pPrint, pShow)
 
@@ -29,12 +33,6 @@ import Parser as Lambda
 
 -- need this 4-monad stack to make sure Haskeline works with our state monad
 type InputTState = InputT IntState
-
--- needs to go to settings!!!
--- baseLibPath = "prog1.fool.hs" -- "base.fool.hs"
---baseLibPath = "base.thask.hs"
-baseLibPath = "base.tl"
--- baseLibPath = "parsertests.fool"
 
 processNew :: T.Text -> IntState ()
 processNew line = do
@@ -73,9 +71,14 @@ showHelp = do
     putStrLn ":q[uit]           -- quit"
     putStrLn ":a[ll]            -- list everything that was parsed, -d - in core format"
     putStrLn ":l[oad] <name>    -- load and interpret file <name>"
-    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off)"
+    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off, :s verbose on/off)"
+    putStrLn ":s optimize on/off      -- toggle all CLM optimization passes"
+    putStrLn ":s opt:list             -- show all passes with status"
+    putStrLn ":s opt:<name> on/off    -- toggle individual pass"
+    putStrLn ":s opt:none             -- disable all passes"
     putStrLn ":e[nv]            -- show current environment"
     putStrLn ":clm              -- show CLM (core list machine) format functions"
+    putStrLn ":clm-raw          -- show pre-optimization CLM (raw)"
     putStrLn ":list <types, functions, constructors> [-d] -- list all global functions / types / constructors"
     -- putStrLn ":i[nfo] <name>    -- find and show a top-level binding with <name>"
     -- putStrLn ":types            -- list all types"
@@ -150,7 +153,20 @@ processCommand (":clm":_) = do
     res <- get >>= \s -> pure ( (clmLambdas . currentEnvironment) s)
     let fkeys = Map.keys res
     liftIO $ mapM_ (fenv1 res) fkeys
-    where fenv1 ts tk = do 
+    where fenv1 ts tk = do
+                        let (Just tt) = Map.lookup tk ts
+                        putStrLn $ (TC.as [bold,green] (tk ++ ":"))
+                        putStrLn $ ppr tt
+
+processCommand (":clm-raw":_) = do
+    liftIO $ putStrLn "\n--------------- RAW CLM LAMBDAS (pre-optimization) ----------------"
+    res <- get >>= \s -> pure ( (rawCLMLambdas . currentEnvironment) s)
+    if Map.null res
+        then liftIO $ putStrLn "(no raw CLM snapshot — optimization may be disabled)"
+        else do
+            let fkeys = Map.keys res
+            liftIO $ mapM_ (fenv1 res) fkeys
+    where fenv1 ts tk = do
                         let (Just tt) = Map.lookup tk ts
                         putStrLn $ (TC.as [bold,green] (tk ++ ":"))
                         putStrLn $ ppr tt
@@ -215,10 +231,71 @@ processSet "trace" ("on":_) = do
 processSet "trace" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { tracing = False} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "tracing off"
-    
 
+processSet "verbose" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { verbose = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose on"
+
+processSet "verbose" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { verbose = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose off"
+
+processSet "optimize" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { optSettings = defaultOptFlags } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "optimization on (all passes)"
+
+processSet "optimize" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { optSettings = (optSettings (currentFlags st)) { optimizeEnabled = False } } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "optimization off"
+
+processSet "opt:list" _ = do
+    flags <- gets (optSettings . currentFlags)
+    liftIO $ putStrLn $ TC.as [TC.bold, TC.underlined] "Optimization passes:"
+    liftIO $ putStrLn $ "  Master toggle: " ++ showOnOff (optimizeEnabled flags)
+    liftIO $ mapM_ (\pass ->
+        putStrLn $ "  " ++ TC.as [TC.bold] (passName pass) ++ ": "
+            ++ showOnOff (isPassEnabledMain (passName pass) flags)
+            ++ " — " ++ passDescr pass
+        ) allCLMPasses
+  where
+    showOnOff True  = TC.as [TC.green] "on"
+    showOnOff False = TC.as [TC.red] "off"
+    isPassEnabledMain nm flags
+        | not (optimizeEnabled flags) = False
+        | otherwise = case nm of
+            "eta-reduce"        -> optEtaReduce flags
+            "constant-fold"     -> optConstantFold flags
+            "known-constructor" -> optKnownConstructor flags
+            "dead-code-elim"    -> optDeadCodeElim flags
+            "inline-small"      -> optInlineSmall flags
+            _                   -> True
+
+processSet "opt:none" _ = do
+    modify (\st -> st { currentFlags = (currentFlags st) { optSettings = OptFlags False False False False False False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "all optimization passes off"
+
+processSet s xs | take 4 s == "opt:" = do
+    let passNm = drop 4 s
+    case xs of
+        ("on":_)  -> setOptPass passNm True
+        ("off":_) -> setOptPass passNm False
+        _         -> liftIO $ putStrLn $ "Usage: :s opt:" ++ passNm ++ " on/off"
 
 processSet _ _ = liftIO $ putStrLn "Unknown :set command. Type :h[elp] to show available list."
+
+-- | Toggle a specific optimization pass by name
+setOptPass :: String -> Bool -> IntState ()
+setOptPass nm val = do
+    modify (\st -> st { currentFlags = (currentFlags st) {
+        optSettings = updatePass nm val (optSettings (currentFlags st)) } })
+    liftIO $ putStrLn $ "Set opt:" ++ TC.as [TC.bold] nm ++ " " ++ if val then "on" else "off"
+  where
+    updatePass "eta-reduce" v f        = f { optEtaReduce = v }
+    updatePass "constant-fold" v f     = f { optConstantFold = v }
+    updatePass "known-constructor" v f = f { optKnownConstructor = v }
+    updatePass "dead-code-elim" v f    = f { optDeadCodeElim = v }
+    updatePass "inline-small" v f      = f { optInlineSmall = v }
+    updatePass _ _ f                   = f
 
 loadFileNew :: String -> IntState ()
 loadFileNew nm = do
@@ -229,7 +306,8 @@ loadFileNew nm = do
     -- liftIO $ print res
     st <- get
     -- liftIO $ print (newParsedModule st)
-    put $ st { currentSource = fileText }
+    let srcs = Map.insert nm fileText (loadedSources st)
+    put $ st { currentSource = fileText, loadedSources = srcs }
     -- liftIO $ print st
     case res of
         Left err -> liftIO ( putStrLn $ "There were " ++ TC.as [TC.red] "parsing errors:") >> liftIO (putStrLn $ showSyntaxError fileText err)
@@ -239,24 +317,42 @@ loadFileNew nm = do
                 liftIO (putStrLn "... successfully loaded.")
                 liftIO (putStrLn $ "Received " ++ show (length (parsedModule st)) ++ " statements.")
                 liftIO (putStrLn $ "Executing pass 0: " ++ TC.as [TC.bold, TC.underlined] "after parser desugaring")
-                afterparserPass
+                timedPass "Pass 0 (desugar)" afterparserPass
+                showAllLogsWSource
+                clearAllLogs
+                liftIO (putStrLn $ "Executing pass 0.5: " ++ TC.as [TC.bold, TC.underlined] "action block desugaring")
+                timedPass "Pass 0.5 (action desugar)" actionDesugarPass
                 showAllLogsWSource
                 clearAllLogs
                 processCommand ([":e"])
                 liftIO (putStrLn $ "Executing pass 1: " ++ TC.as [TC.bold, TC.underlined] "initial top level environment building")
-                buildEnvPass
+                timedPass "Pass 1 (env build)" buildEnvPass
                 showAllLogsWSource
                 processCommand ([":e"])
+                clearAllLogs
+                liftIO (putStrLn $ "Executing pass 1.5: " ++ TC.as [TC.bold, TC.underlined] "record desugaring")
+                timedPass "Pass 1.5 (record desugar)" recordDesugarPass
+                showAllLogsWSource
                 clearAllLogs
                 liftIO (putStrLn $ "Executing pass 2: " ++ TC.as [TC.bold, TC.underlined] "initial optimizations")
-                caseOptimizationPass
+                timedPass "Pass 2 (case opt)" caseOptimizationPass
+                checkSealedExhaustiveness
                 showAllLogsWSource
                 processCommand ([":e"])
                 clearAllLogs
-                liftIO (putStrLn $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM")
-                lamToCLMPass
+                liftIO (putStrLn $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking")
+                timedPass "Pass 3 (typecheck)" typeCheckPass
                 showAllLogsWSource
                 processCommand ([":e"])
+                clearAllLogs
+                liftIO (putStrLn $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM")
+                timedPass "Pass 4 (CLM)" lamToCLMPass
+                showAllLogsWSource
+                processCommand ([":e"])
+                clearAllLogs
+                liftIO (putStrLn $ "Executing pass 4.5: " ++ TC.as [TC.bold, TC.underlined] "CLM optimization")
+                timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
+                showAllLogsWSource
                 clearAllLogs
                 processCommand([":h"])
                 -- liftIO (putStrLn $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "javascript code generation")
@@ -282,11 +378,9 @@ loop = do
 
 runInterpreter :: InputTState ()
 runInterpreter = do
-    -- liftIO $ putStrLn "Building primitive environment..."
-    -- lift $ loadPrimitiveEnv
-    liftIO $ putStrLn "Loading base library..."
-    lift $ loadFileNew baseLibPath
-    -- lift $ processCommand [":all"]
+    liftIO $ putStrLn "Loading standard library..."
+    lift $ loadModuleTree baseModulePath
+    liftIO $ putStrLn "Ready."
     loop
 
 main :: IO ()

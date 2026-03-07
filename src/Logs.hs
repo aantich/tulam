@@ -1,16 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
--- error handling 
+-- error handling
 
 module Logs where
 
-import Data.Text as L
-import Util.IOLogger  
-import Util.PrettyPrinting  
+import Data.Text as L hiding (replicate)
+import qualified Data.HashMap.Strict as HM
+import Util.IOLogger as IOLog
+import Util.PrettyPrinting
 import Control.Monad.IO.Class (liftIO)
 
 -- some info for debugging to attach to initially parsed module expressions
 data SourceInfo = SourceInfo {
-    lineNum :: !Int, colNum :: !Int, notes :: Text
+    lineNum :: !Int, colNum :: !Int, sourceFile :: String, notes :: Text
 } | SourceInteractive deriving Eq
 
 data LogPayload = LogPayload {
@@ -22,30 +23,63 @@ data LogPayload = LogPayload {
 
 -- lambda logger monad is a state monad that lies on top of IO
 type LambdaLoggerMonad = LoggerMonadIO LogPayload
-    
+
+-- | Show all logs using the current file's source text (legacy, single-file)
 showAllLogsWSource :: Text -> LambdaLoggerMonad ()
 showAllLogsWSource src = do
     logs <- getAllLogs
-    -- liftIO $ mapM_ (putStrLn . ppr) logs
     liftIO $ mapM_ (\err -> putStrLn $ showErrorWithSource src err ) logs
-    
 
+-- | Show all logs using a map of filename -> source text (multi-file)
+showAllLogsWSourceMap :: HM.HashMap FilePath Text -> Text -> LambdaLoggerMonad ()
+showAllLogsWSourceMap srcMap currentSrc = do
+    logs <- getAllLogs
+    liftIO $ mapM_ (\err ->
+        let fname = filename (payload err)
+            src = case HM.lookup fname srcMap of
+                    Just s  -> s
+                    Nothing -> currentSrc
+        in putStrLn $ showErrorWithSource src err
+        ) logs
+
+-- | GHC-style error display with filename, gutter line numbers, and caret
 showErrorWithSource :: Text -> LogMessage LogPayload -> String
-showErrorWithSource s err' = L.unpack $ L.unlines [
-      "  ",
-      "  " <> lineContents,
-      "  " <> ((L.replicate col " ") <> "^^^"),
-      (L.pack $ ppr err')
-    ]
-  where
-    err = payload err'
-    lineContents = (L.lines s) !! line
-    line = linePos err - 1
-    col  = colPos err - 1
+showErrorWithSource s err' =
+    let err = payload err'
+        line = linePos err - 1
+        col  = colPos err - 1
+        srcLines = L.lines s
+        lineContents = if line >= 0 && line < Prelude.length srcLines
+                       then srcLines !! line
+                       else "<source line unavailable>"
+        lineNumStr = show (linePos err)
+        gutterW = Prelude.length lineNumStr
+        fname = filename err
+        lvl = case IOLog.level err' of
+                LogError   -> as [bold, red] "Error"
+                LogWarning -> as [bold, yellow] "Warning"
+                _          -> as [bold, cyan] "Info"
+        header = lvl ++ " in " ++ (if Prelude.null fname then "<interactive>" else fname)
+                 ++ ":" ++ show (linePos err) ++ ":" ++ show (colPos err)
+        gutter = replicate gutterW ' ' ++ " |"
+        lineGutter = lineNumStr ++ " | "
+        caret = replicate gutterW ' ' ++ " | " ++ replicate (max 0 col) ' ' ++ as [bold, green] "^^^"
+        msg = "    " ++ message err
+    in Prelude.unlines ["", header, gutter, lineGutter ++ L.unpack lineContents, caret, msg]
+
+-- | Create a LogPayload from a SourceInfo and message string.
+-- Eliminates boilerplate of extracting lineNum/colNum/sourceFile manually.
+mkLogPayload :: SourceInfo -> String -> LogPayload
+mkLogPayload (SourceInfo ln col file _) msg = LogPayload ln col file msg
+mkLogPayload SourceInteractive msg = LogPayload 0 0 "<interactive>" msg
+
+-- | Create a LogPayload with a pass prefix, e.g. "[Env] message"
+mkLogPayloadP :: String -> SourceInfo -> String -> LogPayload
+mkLogPayloadP prefix si msg = mkLogPayload si ("[" ++ prefix ++ "] " ++ msg)
 
 instance Show SourceInfo where
-    show (SourceInfo l c note) = "At line " ++ show l ++ ", column " ++ show c ++ ": " ++ L.unpack note
+    show (SourceInfo l c f note) = (if Prelude.null f then "" else f ++ ":") ++ "At line " ++ show l ++ ", column " ++ show c ++ ": " ++ L.unpack note
     show SourceInteractive = "GENERATED"
 
 instance PrettyPrint LogPayload where
-    ppr (LogPayload lin col fname msg) = "At line " ++ show lin ++ ", column " ++ show col ++ ": " ++ msg
+    ppr (LogPayload lin col fname msg) = (if Prelude.null fname then "" else fname ++ ":") ++ "At line " ++ show lin ++ ", column " ++ show col ++ ": " ++ msg

@@ -7,6 +7,8 @@ import State
 import Surface
 import CLM
 import Logs
+import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness)
+import qualified TypeCheck
 
 import Control.Monad.Trans.State.Strict
 import Control.Monad
@@ -16,14 +18,28 @@ import Data.Text as T hiding (intercalate, map)
 import qualified Data.Text.Lazy as TL
 import Data.List.Index
 import Data.List (intercalate)
+import Data.Maybe (isNothing, listToMaybe)
 
 import Util.PrettyPrinting as TC
 import Text.Pretty.Simple (pPrint, pShow)
 
 import Data.HashMap.Strict as Map
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
+
+-- | Wrap a pass with wall-clock timing when verbose is on
+timedPass :: String -> IntState () -> IntState ()
+timedPass name action = do
+    v <- verbose . currentFlags <$> get
+    if v
+    then do
+        t0 <- liftIO getCurrentTime
+        action
+        t1 <- liftIO getCurrentTime
+        liftIO $ putStrLn $ "  [" ++ name ++ "] " ++ show (diffUTCTime t1 t0)
+    else action
 
 --------------------------------------------------------------------------------
--- PASS 0: initial desugaring and environment building after parsing - 
+-- PASS 0: initial desugaring and environment building after parsing -
 -- combined two passes into 1 for better performance
 --------------------------------------------------------------------------------
 -- this needs to be run right after parsing:
@@ -35,7 +51,7 @@ afterparserPass = do
     s <- get
     let mod = (runExprPassAndReverse (traverseExpr afterparse) (parsedModule s))
     put (s { parsedModule = mod } )
-    -- now for more interesting stuff, initial optimizations with error checks
+    verboseLog $ "  Pass 0: desugared " ++ show (Prelude.length mod) ++ " expressions"
     return ()
 
 -- the only reason we need this is because parser reverses the order of the program while parsing,
@@ -48,21 +64,22 @@ runExprPassAndReverse f l = rev f l []
 
 afterparse :: Expr -> Expr
 afterparse (BinaryOp n e1 e2) = App (Id n) ( e1:e2:[])
+afterparse (UnaryOp "-" e) = App (Id "negate") [afterparse e]
 afterparse (UnaryOp n e) = App (Id n) ( e:[])
 -- if/then/else desugars to a 1-arg lambda with expanded pattern match on Bool
 -- We use a fresh variable name "__cond" and produce ExpandedCase directly
 -- so it doesn't need to go through caseOptimizationPass
 afterparse (IfThenElse cond thenE elseE) =
-    App (Function (Lambda "" [Var "__cond" (Id "Bool") UNDEFINED]
+    App (Function (mkLambda "" [Var "__cond" (Id "Bool") UNDEFINED]
         (PatternMatches
             [ ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "__cond")]  thenE SourceInteractive
             , ExpandedCase [ExprConsTagCheck (ConsTag "False" 1) (Id "__cond")] elseE SourceInteractive
             ]) UNDEFINED)) [cond]
 -- let/in desugars to nested lambda application
 afterparse (LetIn [(v, val)] bdy) =
-    App (Function (Lambda "" [v] bdy UNDEFINED)) [val]
+    App (Function (mkLambda "" [v] bdy UNDEFINED)) [val]
 afterparse (LetIn ((v,val):rest) bdy) =
-    App (Function (Lambda "" [v] (afterparse (LetIn rest bdy)) UNDEFINED)) [val]
+    App (Function (mkLambda "" [v] (afterparse (LetIn rest bdy)) UNDEFINED)) [val]
 -- Law desugaring: law declarations become functions returning PropEqT proof terms
 -- Curry-Howard: propositions are types, proofs are programs
 --   law name(params) = lhs === rhs
@@ -70,6 +87,10 @@ afterparse (LetIn ((v,val):rest) bdy) =
 --   law name(params) = P ==> lhs === rhs
 --     ==> function name(params, __proof0: PropEqT(_, P, True)) : PropEqT(_, lhs, rhs) = Refl
 afterparse (Law lam lawBody) = desugarLaw lam lawBody
+-- value declarations desugar to nullary functions
+afterparse (Value (Var nm tp _) val) = Function (mkLambda nm [] val tp)
+-- repr cast: just recurse into children, resolved in exprToCLM
+afterparse (ReprCast e tp) = ReprCast (afterparse e) tp
 afterparse e = e
 
 -- Desugar a law declaration into a function returning a PropEqT proof term
@@ -103,22 +124,60 @@ mkProofParam i premise =
     in Var ("__proof" ++ show i) proofType UNDEFINED
 
 
+--------------------------------------------------------------------------------
+-- PASS 0.5: Action block desugaring - converts ActionBlock to bind chains
+--------------------------------------------------------------------------------
+actionDesugarPass :: IntState ()
+actionDesugarPass = do
+    s <- get
+    let mod' = Prelude.map (\(e, si) -> (desugarActions e, si)) (parsedModule s)
+    put (s { parsedModule = mod' })
+    verboseLog "  Pass 0.5: action block desugaring"
+
+-- Desugar ActionBlock nodes into bind/let chains throughout the AST
+desugarActions :: Expr -> Expr
+desugarActions = traverseExpr desugarAction
+
+desugarAction :: Expr -> Expr
+desugarAction (ActionBlock stmts) = desugarActionStmts stmts
+desugarAction e = e
+
+-- Convert a list of action statements into nested bind/let applications
+-- name <- expr, rest  =>  bind(expr, \name -> rest)
+-- name = expr, rest   =>  let name = expr in rest
+-- expr, rest          =>  seq(expr, rest)  i.e. bind(expr, \_ -> rest)
+-- expr (last)         =>  expr
+desugarActionStmts :: [ActionStmt] -> Expr
+desugarActionStmts [] = App (Id "pure") [Tuple []]  -- pure(())
+desugarActionStmts [ActionExpr e] = e
+desugarActionStmts [ActionBind nm e] = e  -- last statement is bind — just return the expr
+desugarActionStmts [ActionLet nm e] = e   -- last statement is let — just return the expr
+desugarActionStmts (ActionBind nm e : rest) =
+    -- bind(expr, \name -> rest)
+    App (Id "bind") [e, Function (mkLambda "" [Var nm UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
+desugarActionStmts (ActionLet nm e : rest) =
+    -- let name = expr in rest
+    App (Function (mkLambda "" [Var nm UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)) [e]
+desugarActionStmts (ActionExpr e : rest) =
+    -- seq(expr, rest) = bind(expr, \_ -> rest)
+    App (Id "seq") [e, Function (mkLambda "" [Var "_" UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
+
 -- Resolve spread fields (..Name) in a constructor lambda's params
 -- by looking up the source record/type's constructor fields from the environment
 resolveSpreadFields :: Environment -> Lambda -> Lambda
-resolveSpreadFields env lam@(Lambda nm args ex tp) =
-    let args' = Prelude.concatMap resolveField args
+resolveSpreadFields env lam =
+    let args' = Prelude.concatMap resolveField (params lam)
     in  lam { params = args' }
     where
         resolveField v@(Var fieldNm _ _)
             | Prelude.take 2 fieldNm == ".." =
                 let srcTypeName = Prelude.drop 2 fieldNm
                 in  case lookupType srcTypeName env of
-                        Just (SumType (Lambda _ _ (Constructors cons) _)) ->
-                            -- take fields from the first (or matching) constructor
-                            case cons of
-                                (Lambda _ fields _ _ : _) -> fields
-                                _ -> [v]  -- couldn't resolve, keep marker
+                        Just (SumType stLam) -> case body stLam of
+                            Constructors cons -> case cons of
+                                (c : _) -> params c
+                                _ -> [v]
+                            _ -> [v]
                         _ -> [v]  -- type not found, keep marker
             | otherwise = [v]
 
@@ -129,11 +188,18 @@ buildEnvironmentM x@(e,si) = do
     let env = currentEnvironment s
     env' <- processBinding x env
     put s{currentEnvironment = env'}
-    -- either (\err -> logWarning err { linePos = (lineNum si), colPos = (colNum si) } )
-           
+
 processBinding :: (Expr, SourceInfo) -> Environment -> IntState Environment
 -- function definition
-processBinding (Function lam, si) env = pure $ addLambda (lamName lam) lam env
+-- Standalone intrinsic functions (e.g., reflection primitives) get a dummy implicit param
+-- so they route through CLMIAP dispatch (like effect operations).
+processBinding (Function lam, si) env
+    | body lam == Intrinsic =
+        let implParams = [Var "__refl" (Implicit Type) UNDEFINED]
+            opBody = CaseOf [] (Function lam) si
+            wrapper = (mkLambda (lamName lam) implParams (PatternMatches [opBody]) (Function lam)) { lamSrcInfo = si }
+        in pure $ addNamedLambda wrapper env
+    | otherwise = pure $ addLambda (lamName lam) lam env
 -- treating actions the same way - they will have some proper type eventually anyway
 processBinding (Action lam, si) env = pure $ addLambda (lamName lam) lam env
 -- primitive functions
@@ -141,15 +207,110 @@ processBinding (Prim lam, si) env = pure $ addLambda (lamName lam) lam env
 
 -- now extracting constructors from SumTypes, body is guaranteed to be
 -- a list of Lambdas under Constructors constructor
-processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typTyp)), si) env = do
+processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _)), si) env = do
     -- resolve any spread fields (..Name) in constructor params
     let cons' = Prelude.map (resolveSpreadFields env) cons
     let newCons = imap fixCons cons'
     let newTp = SumType lam { body = Constructors newCons }
     pure $ addManyNamedConstructors 0 newCons (addNamedSumType newTp env)
-    where fixCons i lam@(Lambda nm args ex typ) = if (ex /= UNDEFINED)
+    where fixCons i lam@(Lambda nm args ex typ _) = if (ex /= UNDEFINED)
             then lam
             else lam { body = ConTuple (ConsTag nm i) $ Prelude.map (\v -> Id $ name v) args}
+
+-- CLASS declarations
+processBinding (ClassDecl lam cinfo, si) env = do
+    -- 1. Resolve parent class fields and methods
+    let parentName = fst <$> classParent cinfo
+    let superArgs  = maybe [] snd (classParent cinfo)
+    (parentFields, parentMethods, parentStatics) <- case parentName of
+        Nothing -> pure ([], Map.empty, Map.empty)
+        Just pn -> case lookupClass pn env of
+            Just pm -> pure (cmAllFields pm, cmMethods pm, cmStaticMethods pm)
+            Nothing -> do
+                logError (mkLogPayload si ("Parent class " ++ pn ++ " not found for class " ++ lamName lam))
+                pure ([], Map.empty, Map.empty)
+
+    -- 2. Build field list: inherited + own
+    let ownFields = params lam
+    let allFields = parentFields ++ ownFields
+    let fieldIndices = Map.fromList (Prelude.zip (Prelude.map name allFields) [0..])
+
+    -- 3. Allocate class tag
+    let tag = classTagCounter env
+    let env1 = env { classTagCounter = tag + 1 }
+
+    -- 4. Extract own methods (from DeclBlock) and convert to CLMLam
+    let ownMethods = case body lam of
+            DeclBlock exs -> [(lamName l, l) | Function l <- exs]
+            _ -> []
+    let ownMethodsMap = Map.fromList [(n, lambdaToCLMLambda env1 l) | (n, l) <- ownMethods]
+    let isStatic n = case Prelude.lookup n (classMethodMods cinfo) of
+            Just MStatic -> True
+            _ -> False
+    let ownStaticMap = Map.filterWithKey (\k _ -> isStatic k) ownMethodsMap
+    let ownInstanceMap = Map.filterWithKey (\k _ -> not (isStatic k)) ownMethodsMap
+
+    -- 5. Merge methods: own override parent (Map.union prefers left)
+    let mergedMethods = Map.union ownInstanceMap parentMethods
+    let mergedStatics = Map.union ownStaticMap parentStatics
+
+    -- 6. Build ClassMeta
+    let srcFile = case si of { SourceInfo _ _ sf _ -> sf; _ -> "<interactive>" }
+    let cm = ClassMeta
+            { cmParent        = parentName
+            , cmAllFields     = allFields
+            , cmOwnFields     = ownFields
+            , cmMethods       = mergedMethods
+            , cmStaticMethods = mergedStatics
+            , cmFieldIndices  = fieldIndices
+            , cmModifier      = classModifier cinfo
+            , cmChildren      = []
+            , cmImplements    = [n | Id n <- classImplements cinfo]
+            , cmSuperArgs     = superArgs
+            , cmExtern        = classExtern cinfo
+            , cmTag           = tag
+            , cmSourceFile    = srcFile
+            }
+
+    -- 7. Register ClassMeta in classDecls
+    let env2 = env1 { classDecls = Map.insert (lamName lam) cm (classDecls env1) }
+
+    -- 8. Update parent's children list
+    let env3 = case parentName of
+            Just pn -> env2 { classDecls = Map.adjust (\p -> p { cmChildren = lamName lam : cmChildren p }) pn (classDecls env2) }
+            Nothing -> env2
+
+    -- 8.5 Validate sealed constraint: child of sealed parent must be in same file
+    case parentName of
+        Just pn -> case lookupClass pn env3 of
+            Just pm | cmModifier pm == ClassSealed
+                    , srcFile /= "<interactive>"
+                    , cmSourceFile pm /= "<interactive>"
+                    , srcFile /= cmSourceFile pm ->
+                logError (mkLogPayload si
+                    ("sealed class " ++ pn ++ " cannot be subclassed from a different file ("
+                        ++ srcFile ++ " vs " ++ cmSourceFile pm ++ ")"))
+            _ -> pure ()
+        Nothing -> pure ()
+
+    -- 9. Register constructor (like sum types — enables CLMCON + pattern matching)
+    let consLam = (mkLambda (lamName lam) allFields
+                    (ConTuple (ConsTag (lamName lam) tag)
+                        (Prelude.map (\v -> Id (name v)) allFields))
+                    (Id (lamName lam)))
+    let env4 = env3 { constructors = Map.insert (lamName lam) (consLam, tag) (constructors env3) }
+
+    -- 10. Register type
+    let env5 = env4 { types = Map.insert (lamName lam) (ClassDecl lam cinfo) (types env4) }
+
+    -- 11. Generate algebra instances from implements clause
+    env6 <- foldM (generateClassAlgebraInstance (lamName lam) ownMethods si) env5 (cmImplements cm)
+
+    verboseLog $ "  Registered class " ++ lamName lam ++ " (tag=" ++ show tag
+        ++ ", fields=" ++ show (Prelude.length allFields)
+        ++ ", methods=" ++ show (Map.size mergedMethods) ++ ")"
+
+    pure env6
 
 -- so, structures (typeclasses) are very interesting.
 -- what we do here is extract all the functions inside the typeclass
@@ -180,11 +341,11 @@ processBinding ( st@(Structure lam sinfo), si) env = do
     -- Validate param count for algebra/morphism (warning only)
     case structKind sinfo of
         SAlgebra  -> when (Prelude.length (params lam) /= 1) $
-            logWarning (LogPayload (lineNum si) (colNum si) ""
+            logWarning (mkLogPayload si
                 ("algebra " ++ lamName lam ++ " should have exactly 1 type parameter, has "
                     ++ show (Prelude.length (params lam)) ++ "\n"))
         SMorphism -> when (Prelude.length (params lam) < 2) $
-            logWarning (LogPayload (lineNum si) (colNum si) ""
+            logWarning (mkLogPayload si
                 ("morphism " ++ lamName lam ++ " should have 2+ type parameters, has "
                     ++ show (Prelude.length (params lam)) ++ "\n"))
         SGeneral  -> pure ()
@@ -202,20 +363,27 @@ processBinding ( st@(Structure lam sinfo), si) env = do
     let st' = Structure lam' sinfo
     let env' = addNamedStructure st' env0
     case (body lam') of
-        Tuple exs -> do
+        DeclBlock exs -> do
             -- going over all members of a structure and making needed
             -- bindings / transformations
             env'' <- foldM fixStr env' exs
             pure env''
         _ -> do
-                let lpl = LogPayload
-                            (lineNum si) (colNum si) ""
+                let lpl = mkLogPayload si
                             ("Encountered wrong Structure expressions:\n" ++ (ppr st') ++ "\n")
-                logError lpl { linePos = (lineNum si), colPos = (colNum si) }
+                logError lpl
                 pure env'
-    where fixStr env1 (Function l@(Lambda nm args body tp)) = do
-            let body' = CaseOf [] (Function l) SourceInteractive
-            let res = Lambda nm (params lam) (PatternMatches [body']) (Function l)
+    where fixStr env1 (Function l) = do
+            let body' = CaseOf [] (Function l) (lamSrcInfo l)
+            let res = (mkLambda (lamName l) (params lam) (PatternMatches [body']) (Function l)) { lamSrcInfo = lamSrcInfo l }
+            let env1' = addNamedLambda res env1
+            return env1'
+          -- value declarations are desugared to nullary functions by afterparse,
+          -- so they appear as Function here; but if raw Value slips through:
+          fixStr env1 (Value v ex) = do
+            let l = mkLambda (name v) [] ex (typ v)
+            let body' = CaseOf [] (Function l) si
+            let res = (mkLambda (name v) (params lam) (PatternMatches [body']) (Function l)) { lamSrcInfo = si }
             let env1' = addNamedLambda res env1
             return env1'
           fixStr env1 (Law _ _) = pure env1  -- skip law declarations
@@ -227,66 +395,231 @@ processBinding ( st@(Structure lam sinfo), si) env = do
 processBinding (Instance structName typeArgs impls reqs, si) env = do
     -- Validate requires
     validateRequires env reqs si
-    -- extract the type name from the first type arg (e.g., Id "Nat")
-    let typeName = case typeArgs of
-            (Id nm : _) -> nm
-            _           -> ""
-    if typeName == ""
+    -- extract all type names from type args (e.g., [Id "Nat", Id "Bool"] -> ["Nat", "Bool"])
+    -- also handles parameterized types like List(a) -> "List"
+    let extractTypeName (Id nm) = Just nm
+        extractTypeName (App (Id nm) _) = Just nm
+        extractTypeName _ = Nothing
+    let typeNames = [nm | Just nm <- Prelude.map extractTypeName typeArgs]
+    if Prelude.null typeNames
     then do
-        let lpl = LogPayload (lineNum si) (colNum si) ""
+        let lpl = mkLogPayload si
                 ("Instance declaration has no valid type argument: "
                     ++ structName ++ "\n")
         logError lpl
         pure env
-    else do
-        -- for each function in the instance, store a specialized lambda
-        env' <- foldM (addInstanceFunc typeName) env impls
-        -- propagate instance functions to parent structures
-        env'' <- propagateToParent env' structName typeName impls si
-        pure env''
+    else case impls of
+        [Derive] -> do
+            -- Derive instance: look up algebra's derive block and expand
+            case lookupType structName env of
+                Just (Structure structLam structInfo) -> case structDerive structInfo of
+                    [] -> do
+                        logWarning (mkLogPayload si
+                            ("derive instance: algebra " ++ structName
+                                ++ " has no derive block\n"))
+                        pure env
+                    deriveExprs -> do
+                        -- Register each derive function as an instance lambda
+                        env' <- foldM (addInstanceFunc typeNames) env deriveExprs
+                        -- propagate to parent structures
+                        env'' <- propagateToParent env' structName typeNames deriveExprs si
+                        env''' <- composeMorphismInstances env'' structName typeNames si
+                        pure env'''
+                _ -> do
+                    logWarning (mkLogPayload si
+                        ("derive instance: algebra " ++ structName
+                            ++ " not found in environment\n"))
+                    pure env
+        [Intrinsic] -> do
+            -- Intrinsic instance: generate placeholder lambdas for all structure functions
+            case lookupType structName env of
+                Just (Structure structLam _) -> case body structLam of
+                    DeclBlock exs -> do
+                        let funcNames = [lamName l | Function l <- exs]
+                                     ++ [name v | Value v _ <- exs]
+                        let intrinsicImpls = [Function (mkLambda fn [] Intrinsic UNDEFINED) | fn <- funcNames]
+                        let env' = Prelude.foldl (\e fn ->
+                                addInstanceLambda fn typeNames
+                                    (mkLambda fn [] Intrinsic UNDEFINED) e
+                                ) env funcNames
+                        env'' <- propagateToParent env' structName typeNames intrinsicImpls si
+                        pure env''
+                    _ -> do
+                        logWarning (mkLogPayload si
+                            ("intrinsic instance: structure " ++ structName ++ " body is not a DeclBlock\n"))
+                        pure env
+                _ -> do
+                    logWarning (mkLogPayload si
+                        ("intrinsic instance: structure " ++ structName ++ " not found in environment\n"))
+                    pure env
+        _ -> do
+            -- for each function in the instance, store a specialized lambda
+            env' <- foldM (addInstanceFunc typeNames) env impls
+            -- propagate instance functions to parent structures
+            env'' <- propagateToParent env' structName typeNames impls si
+            -- auto-compose morphism instances (for 2-param morphisms)
+            env''' <- composeMorphismInstances env'' structName typeNames si
+            pure env'''
     where
-        addInstanceFunc typeNm env1 (Function lam) = do
+        addInstanceFunc typeNms env1 (Function lam) = do
             let funcNm = lamName lam
-            pure $ addInstanceLambda funcNm typeNm lam env1
+            pure $ addInstanceLambda funcNm typeNms lam env1
+        -- value declarations are desugared to nullary functions by afterparse
+        addInstanceFunc typeNms env1 (Value v ex) = do
+            let lam = mkLambda (name v) [] ex (typ v)
+            pure $ addInstanceLambda (name v) typeNms lam env1
         addInstanceFunc _ env1 e = do
-            let lpl = LogPayload (lineNum si) (colNum si) ""
+            logWarning (mkLogPayload si
                     ("Invalid expression inside instance declaration, expected function: "
-                        ++ ppr e ++ "\n")
-            logWarning lpl
+                        ++ ppr e ++ "\n"))
             pure env1
 
+-- repr declaration: register toRepr/fromRepr as instance lambdas + store in reprMap
+processBinding (Repr userTypeName reprTypeExpr isDefault fns maybeInv, si) env = do
+    let reprTypeName = case reprTypeExpr of { Id nm -> nm; App (Id nm) _ -> nm; _ -> "unknown" }
+    let findFn fname = listToMaybe [lam | Function lam <- fns, lamName lam == fname]
+    case (findFn "toRepr", findFn "fromRepr") of
+        (Just toR, Just fromR) -> do
+            -- Create implicit-param wrapper lambdas so CLMIAP dispatch is triggered
+            let implParam = Var "a" (Implicit Type) UNDEFINED
+            let toRBody = CaseOf [] (Function toR) si
+            let toRWrapper = (mkLambda "toRepr" [implParam] (PatternMatches [toRBody]) (Function toR)) { lamSrcInfo = si }
+            let fromRBody = CaseOf [] (Function fromR) si
+            let fromRWrapper = (mkLambda "fromRepr" [implParam] (PatternMatches [fromRBody]) (Function fromR)) { lamSrcInfo = si }
+            -- Only add wrapper if no existing toRepr/fromRepr yet
+            let env1 = case lookupLambda "toRepr" env of
+                    Nothing -> addNamedLambda toRWrapper env
+                    Just _  -> env
+            let env2 = case lookupLambda "fromRepr" env1 of
+                    Nothing -> addNamedLambda fromRWrapper env1
+                    Just _  -> env1
+            -- Register as instance lambdas for type-directed dispatch
+            let env3 = addInstanceLambda "toRepr" [userTypeName] toR env2
+            let env4 = addInstanceLambda "fromRepr" [reprTypeName] fromR env3
+            -- Store in repr map
+            pure $ addRepr userTypeName reprTypeName isDefault toR fromR maybeInv env4
+        _ -> do
+            logError (mkLogPayload si "repr declaration must define both toRepr and fromRepr\n")
+            pure env
+
+-- primitive type declaration
+processBinding (Primitive lam, si) env = do
+    let typeName = lamName lam
+    pure $ env { types = Map.insert typeName (Primitive lam) (types env) }
+
+-- Module system declarations: processed for environment building but
+-- main module resolution happens in the module loading pipeline
+processBinding (ModuleDecl _, _) env = pure env  -- module declaration: tracked in loadFileQuiet
+processBinding (Import path _ (Just tgt), _) env =   -- target import: store for codegen metadata resolution
+    pure $ env { targetImports = (path, tgt) : targetImports env }
+processBinding (Import _ _ Nothing, _) env = pure env   -- import: resolved during module loading
+processBinding (Open _, _) env = pure env          -- open: resolved during module loading
+processBinding (Export _ _, _) env = pure env      -- export: resolved during module loading
+processBinding (PrivateDecl inner, si) env = processBinding (inner, si) env  -- private: process inner decl
+processBinding (OpaqueTy lam reprTy, si) env = do
+    -- Opaque type: register as a primitive type (opaque to outside, transparent inside)
+    let typeName = lamName lam
+    pure $ env { types = Map.insert typeName (Primitive lam) (types env) }
+processBinding (TargetBlock _ _, _) env = pure env  -- target blocks: resolved during codegen
+processBinding (TargetSwitch _, _) env = pure env   -- target switches: resolved during codegen
+
+-- Effect declaration: register effect and its operations as implicit-param functions
+processBinding (EffectDecl effName effParams ops, si) env = do
+    -- Store effect declaration
+    let env1 = env { effectDecls = Map.insert effName (effParams, ops) (effectDecls env) }
+    -- Register each operation as a top-level implicit-param function
+    -- so they can be called like regular functions and resolved via CLMIAP
+    let env2 = Prelude.foldl (registerEffectOp effName effParams) env1 ops
+    pure env2
+  where
+    registerEffectOp eName eParams env0 op =
+        let -- Effect type params become implicit params for CLMIAP routing.
+            -- If effect has no type params, add a dummy implicit so hasImplicit = True
+            -- and exprToCLM routes through CLMIAP → dispatchIOIntrinsic.
+            implParams
+                | not (Prelude.null eParams) = Prelude.map (\v -> v { typ = Implicit (typ v) }) eParams
+                | otherwise = [Var "__eff" (Implicit Type) UNDEFINED]
+            opBody = CaseOf [] (Function op) (lamSrcInfo op)
+            wrapper = (mkLambda (lamName op) implParams (PatternMatches [opBody]) (Function op)) { lamSrcInfo = lamSrcInfo op }
+        in addNamedLambda wrapper env0
+
+-- Handler declaration: register handler implementations
+processBinding (HandlerDecl handlerName effName impls, si) env = do
+    let env1 = env { effectHandlers = Map.insert handlerName (effName, impls) (effectHandlers env) }
+    -- Register handler implementations as instance lambdas
+    -- so intrinsic dispatch can find them
+    env2 <- foldM (registerHandlerImpl effName) env1 impls
+    pure env2
+  where
+    registerHandlerImpl eName env0 (Function lam) = do
+        let funcNm = lamName lam
+        case body lam of
+            Intrinsic -> pure $ addInstanceLambda funcNm [eName] lam env0
+            _         -> pure $ addInstanceLambda funcNm [eName] lam env0
+    registerHandlerImpl _ env0 _ = pure env0
+
 processBinding (ex, si) env = do
-    let lpl = LogPayload
-                (lineNum si) (colNum si) ""
-                ("Cannot add the following expression to the Environment during initial Environment Building pass:\n" 
-                    ++ (ppr ex) ++ "\n" 
+    let lpl = mkLogPayload si
+                ("Cannot add the following expression to the Environment during initial Environment Building pass:\n"
+                    ++ (ppr ex) ++ "\n"
                     -- ++ (TL.unpack (pShow ex))
                     ++ "\nThe expression is parsed and stored in LTProgram, but is not in the Environment.")
-    logWarning lpl { linePos = (lineNum si), colPos = (colNum si) } 
+    logWarning lpl
     return env
 
+-- Generate algebra instance from class methods for the implements clause
+generateClassAlgebraInstance :: Name -> [(Name, Lambda)] -> SourceInfo -> Environment -> Name -> IntState Environment
+generateClassAlgebraInstance className ownMethods si env algebraName = do
+    case lookupType algebraName env of
+        Just (Structure structLam structInfo) -> do
+            -- Get algebra function names
+            let algebraFuncNames = case body structLam of
+                    DeclBlock exs -> [lamName l | Function l <- exs]
+                                  ++ [name v | Value v _ <- exs]
+                    _ -> []
+            -- Find matching methods from class body
+            let matchedImpls = [(fn, l) | fn <- algebraFuncNames
+                                        , (mn, l) <- ownMethods
+                                        , mn == fn]
+            if not (Prelude.null matchedImpls)
+            then do
+                -- Register each matched method as an instance lambda
+                let env' = Prelude.foldl (\e (fn, l) ->
+                        addInstanceLambda fn [className] l e
+                        ) env matchedImpls
+                -- Propagate to parent structures and compose morphisms
+                let implExprs = [Function l | (_, l) <- matchedImpls]
+                env'' <- propagateToParent env' algebraName [className] implExprs si
+                env''' <- composeMorphismInstances env'' algebraName [className] si
+                pure env'''
+            else case structDerive structInfo of
+                [] -> do
+                    logWarning (mkLogPayload si
+                        ("class " ++ className ++ " implements " ++ algebraName
+                            ++ " but has no matching methods and no derive block\n"))
+                    pure env
+                deriveExprs -> do
+                    -- Fall back to auto-derive
+                    let env' = Prelude.foldl (\e expr -> case expr of
+                            Function l -> addInstanceLambda (lamName l) [className] l e
+                            _ -> e
+                            ) env deriveExprs
+                    env'' <- propagateToParent env' algebraName [className] deriveExprs si
+                    env''' <- composeMorphismInstances env'' algebraName [className] si
+                    pure env'''
+        _ -> do
+            logWarning (mkLogPayload si
+                ("class " ++ className ++ " implements " ++ algebraName
+                    ++ " but algebra not found in environment\n"))
+            pure env
 
-
--- The pass itself   
+-- The pass itself
 buildEnvPass :: IntState ()
 buildEnvPass = buildPrimitivePass >> get >>= pure . parsedModule >>= mapM_ buildEnvironmentM
 
--- killing primitive bindings for now to test iterative compilation
--- primBindings = []    
-primBindings = [
-        (Prim $ Lambda "print#" [Var "s" UNDEFINED UNDEFINED] PrimCall UNDEFINED )
-    ]
-{-
-primBindings = [
-        Let [(Var "+" ToDerive, Prim PPlus)] EMPTY,
-        Let [(Var "-" ToDerive, Prim PMinus)] EMPTY,
-        Let [(Var "*" ToDerive, Prim PMul)] EMPTY,
-        Let [(Var "/" ToDerive, Prim PDiv)] EMPTY
-    ]
--}
-
+-- No legacy primitive bindings needed — all primitives use the intrinsic system now
 buildPrimitivePass :: IntState ()
-buildPrimitivePass = mapM_ (\b -> buildEnvironmentM (b, SourceInfo 0 0 "")) primBindings
+buildPrimitivePass = pure ()
 
 -- Extract structure name from a structure reference (Id "Eq" or App (Id "Eq") [Id "a"])
 extractStructRefName :: Expr -> Name
@@ -298,56 +631,155 @@ extractStructRefName _             = ""
 resolveExtends :: Environment -> Lambda -> [Expr] -> IntState Lambda
 resolveExtends _   lam [] = pure lam
 resolveExtends env lam extends = do
+    -- Step 2: Validate extends-reference arguments are valid child parameters
+    let childParamNames = [name v | v <- params lam]
+    mapM_ (validateExtendsArgs childParamNames) extends
     parentMembers <- Prelude.concat <$> mapM getParentMembers extends
     case body lam of
-        Tuple childMembers -> do
+        DeclBlock childMembers -> do
             -- Only add parent members that child doesn't override
             let childNames = [lamName l | Function l <- childMembers]
                             ++ [lamName l | Law l _ <- childMembers]
+                            ++ [name v | Value v _ <- childMembers]
             let newMembers = Prelude.filter (notOverridden childNames) parentMembers
-            pure lam { body = Tuple (newMembers ++ childMembers) }
+            pure lam { body = DeclBlock (newMembers ++ childMembers) }
         _ -> pure lam
   where
+    validateExtendsArgs childParamNames ref = do
+        let refArgNames = extractRefArgNames ref
+        let invalid = Prelude.filter (`Prelude.notElem` childParamNames) refArgNames
+        unless (Prelude.null invalid) $
+            logWarning (mkLogPayload SourceInteractive
+                ("extends: unknown type params " ++ show invalid
+                    ++ " in " ++ ppr ref ++ " for structure " ++ lamName lam ++ "\n"))
+    extractRefArgNames (App _ args) = [n | Id n <- args]
+    extractRefArgNames _ = []
     getParentMembers ref = do
         let parentName = extractStructRefName ref
         case lookupType parentName env of
             Just (Structure parentLam _) -> case body parentLam of
-                Tuple exs -> pure exs
-                _         -> pure []
+                DeclBlock exs -> pure exs
+                _             -> pure []
             _ -> do
-                logWarning (LogPayload 0 0 ""
+                logWarning (mkLogPayload SourceInteractive
                     ("extends: parent structure " ++ parentName ++ " not found in environment\n"))
                 pure []
     notOverridden childNames (Function l) = lamName l `Prelude.notElem` childNames
     notOverridden childNames (Law l _)    = lamName l `Prelude.notElem` childNames
+    notOverridden childNames (Value v _)  = name v `Prelude.notElem` childNames
     notOverridden _ _                     = True
 
 -- When instance Child(T) is declared, also register functions for parent structures
-propagateToParent :: Environment -> Name -> Name -> [Expr] -> SourceInfo -> IntState Environment
-propagateToParent env structName typeName impls si = do
+propagateToParent :: Environment -> Name -> [Name] -> [Expr] -> SourceInfo -> IntState Environment
+propagateToParent env structName typeNames impls si = do
     let allParents = getAllParents structName env
     -- filter out the structure itself from parents list
     let parents = Prelude.filter (/= structName) allParents
     if Prelude.null parents then pure env
     else do
         -- For each parent, for each impl function, check if function belongs to parent
-        foldM (propagateOne impls) env parents
+        env' <- foldM (propagateOne impls) env parents
+        -- Step 4: Propagate default methods from parent structures
+        env'' <- foldM (propagateDefaults typeNames) env' parents
+        -- Step 3: Validate parent instances are complete
+        mapM_ (\pn -> validateParentInstance env'' typeNames pn si) parents
+        pure env''
   where
     propagateOne impls' env1 parentName = do
         -- Look up the parent structure to find its function names
         case lookupType parentName env1 of
             Just (Structure parentLam _) -> case body parentLam of
-                Tuple exs -> do
+                DeclBlock exs -> do
                     let parentFuncNames = [lamName l | Function l <- exs]
+                                        ++ [name v | Value v _ <- exs]
                     -- For each impl that's a parent function, also add to parent
                     foldM (addIfParent parentFuncNames) env1 impls'
                 _ -> pure env1
             _ -> pure env1
     addIfParent parentFuncNames env1 (Function lam)
       | lamName lam `Prelude.elem` parentFuncNames =
-          pure $ addInstanceLambda (lamName lam) typeName lam env1
+          pure $ addInstanceLambda (lamName lam) typeNames lam env1
       | otherwise = pure env1
     addIfParent _ env1 _ = pure env1
+
+-- Propagate default methods from parent structure definitions to instances
+propagateDefaults :: [Name] -> Environment -> Name -> IntState Environment
+propagateDefaults typeNames env1 parentName = do
+    case lookupType parentName env1 of
+        Just (Structure parentLam _) -> case body parentLam of
+            DeclBlock exs -> foldM addDefault env1 [(lamName l, l) | Function l <- exs, body l /= UNDEFINED]
+            _ -> pure env1
+        _ -> pure env1
+  where
+    addDefault env2 (fn, defLam)
+      | isNothing (lookupInstanceLambda fn typeNames env2) =
+          pure $ addInstanceLambda fn typeNames defLam env2
+      | otherwise = pure env2
+
+-- Automated morphism composition: when instance M(A, B) is registered,
+-- look for existing M(X, A) to derive M(X, B) and M(B, Y) to derive M(A, Y)
+composeMorphismInstances :: Environment -> Name -> [Name] -> SourceInfo -> IntState Environment
+composeMorphismInstances env structName typeNames si = do
+    -- Only for 2-param morphisms
+    case lookupType structName env of
+        Just (Structure _ sinfo) | structKind sinfo == SMorphism && Prelude.length typeNames == 2 -> do
+            let [tA, tB] = typeNames
+            -- Find all function names in this morphism
+            case lookupType structName env of
+                Just (Structure structLam _) -> case body structLam of
+                    DeclBlock exs -> do
+                        let funcNames = [lamName l | Function l <- exs]
+                        env' <- foldM (composeForFunc tA tB funcNames) env funcNames
+                        pure env'
+                    _ -> pure env
+                _ -> pure env
+        _ -> pure env
+  where
+    composeForFunc tA tB allFuncNames env1 funcNm = do
+        let existing = findMorphismInstances funcNm env1
+        -- For each existing M(X, A), derive M(X, B) via X->A->B
+        env2 <- foldM (composeXAB funcNm tA tB) env1
+            [(x, a) | (x, a) <- existing, a == tA, x /= tB]  -- M(X, A) exists, derive M(X, B)
+        -- For each existing M(B, Y), derive M(A, Y) via A->B->Y
+        env3 <- foldM (composeABY funcNm tA tB) env2
+            [(b, y) | (b, y) <- existing, b == tB, y /= tA]  -- M(B, Y) exists, derive M(A, Y)
+        pure env3
+    -- Compose M(X, B) from M(X, A) + M(A, B)
+    composeXAB funcNm tA tB env1 (tX, _) =
+        -- Check no direct instance exists already and no self-loop
+        case lookupInstanceLambda funcNm [tX, tB] env1 of
+            Just _ -> pure env1  -- direct instance exists, prefer it
+            Nothing | tX == tB -> pure env1  -- avoid identity loops
+            Nothing ->
+                -- Generate: function f(x:X) : B = f_AB(f_XA(x))
+                let composedLam = mkLambda funcNm [Var "__x" (Id tX) UNDEFINED]
+                        (App (Id funcNm) [App (Id funcNm) [Id "__x"]]) (Id tB)
+                in pure $ addInstanceLambda funcNm [tX, tB] composedLam env1
+    -- Compose M(A, Y) from M(A, B) + M(B, Y)
+    composeABY funcNm tA tB env1 (_, tY) =
+        case lookupInstanceLambda funcNm [tA, tY] env1 of
+            Just _ -> pure env1
+            Nothing | tA == tY -> pure env1
+            Nothing ->
+                let composedLam = mkLambda funcNm [Var "__x" (Id tA) UNDEFINED]
+                        (App (Id funcNm) [App (Id funcNm) [Id "__x"]]) (Id tY)
+                in pure $ addInstanceLambda funcNm [tA, tY] composedLam env1
+
+-- Validate that a parent instance has all required functions
+validateParentInstance :: Environment -> [Name] -> Name -> SourceInfo -> IntState ()
+validateParentInstance env typeNames parentName si = do
+    case lookupType parentName env of
+        Just (Structure parentLam _) -> case body parentLam of
+            DeclBlock exs -> do
+                let funcNames = [lamName l | Function l <- exs]
+                                ++ [name v | Value v _ <- exs]
+                let missing = Prelude.filter (\fn -> isNothing (lookupInstanceLambda fn typeNames env)) funcNames
+                unless (Prelude.null missing) $
+                    logWarning (mkLogPayload si
+                        ("instance " ++ parentName ++ "(" ++ intercalate ", " typeNames
+                            ++ ") incomplete: missing " ++ show missing ++ "\n"))
+            _ -> pure ()
+        _ -> pure ()
 
 -- Validate that required structures exist in the environment
 validateRequires :: Environment -> [Expr] -> SourceInfo -> IntState ()
@@ -358,241 +790,113 @@ validateRequires env reqs si = mapM_ checkReq reqs
         let reqName = extractStructRefName ref
         case lookupType reqName env of
             Just (Structure _ _) -> pure ()
-            _ -> logWarning (LogPayload (lineNum si) (colNum si) ""
+            _ -> logWarning (mkLogPayload si
                     ("requires: structure " ++ reqName ++ " not found in environment\n"))
 
 --------------------------------------------------------------------------------
--- PASS 2: Preliminary Optimizations and basic sanity checks
--- now that we have built the environment (so top level lambda and types bidnings)
--- we can start the optimizations
--- This pass includes proper formation of the Case pattern matches inside
--- functions
+-- PASS 1.5: Record Desugaring
+-- Runs after environment building (Pass 1), before case optimization (Pass 2).
+-- Converts RecordConstruct, RecordUpdate, RecordPattern into core forms.
 --------------------------------------------------------------------------------
-caseOptimizationPass :: IntState()
-caseOptimizationPass = do
+
+recordDesugarPass :: IntState ()
+recordDesugarPass = do
     s <- get
     let env = currentEnvironment s
-    let lambdas = topLambdas env
-    lambdas' <- traverseWithKey f lambdas
-    -- also optimize instance lambdas
-    let instLambdas = instanceLambdas env
-    instLambdas' <- traverseWithKey f instLambdas
-    put s{currentEnvironment = env {topLambdas = lambdas', instanceLambdas = instLambdas'} }
-    where f k lam@(Lambda nm args (PatternMatches exs) tp) = do
-                exs' <- mapM (expandCase lam) exs
-                return lam {body = PatternMatches exs'}
-          f k e = return e
+    -- Desugar in parsed module
+    let mod' = Prelude.map (\(e, si) -> (desugarRecordExpr env e, si)) (parsedModule s)
+    -- Desugar in topLambdas and instanceLambdas
+    let env' = transformLambdaMaps (desugarRecordLambda env) env
+    put s { parsedModule = mod', currentEnvironment = env' }
+    verboseLog $ "  Pass 1.5: record desugaring complete"
 
--- choose which function to run
-localMaybeAlt :: Maybe a -> IntState b -> (a -> IntState b) -> IntState b
-localMaybeAlt Nothing  f g = f
-localMaybeAlt (Just x) f g = g x
+desugarRecordLambda :: Environment -> Lambda -> Lambda
+desugarRecordLambda env lam = lam { body = desugarRecordExpr env (body lam) }
 
+desugarRecordExpr :: Environment -> Expr -> Expr
+desugarRecordExpr env expr = f $ traverseExprDeep f expr
+  where
 
-maybeEither :: Maybe a -> b -> (a -> b) -> b
-maybeEither Nothing  d f = d
-maybeEither (Just x) d f = f x
+    f (RecordConstruct consName fields) =
+        case lookupConstructor consName env of
+            Just (cons, _i) ->
+                let paramNames = Prelude.map name (params cons)
+                    reordered = Prelude.map (\pn -> case Prelude.lookup pn fields of
+                        Just e  -> e
+                        Nothing -> ERROR $ "Missing field " ++ pn ++ " in " ++ consName ++ " construction"
+                        ) paramNames
+                in App (Id consName) reordered
+            Nothing -> ERROR $ "Constructor " ++ consName ++ " not found for record construction"
 
--- this one checks for ids that maybe arg=0 constructor applications
--- and fixes the expression properly
-fixEmptyConstructor :: Environment -> Expr -> Expr
-fixEmptyConstructor env ex@(Id name) =
-    let mcons = lookupConstructor name env in 
-    case mcons of
-        Nothing -> ex
-        Just (cons,i) -> ConTuple (ConsTag name i) []
-fixEmptyConstructor env e = e 
+    f (RecordUpdate inner updFields) =
+        case inferConstructorName env inner updFields of
+            Just (consName, cons) ->
+                let paramNames = Prelude.map name (params cons)
+                    args = Prelude.map (\pn -> case Prelude.lookup pn updFields of
+                        Just e  -> e
+                        Nothing -> RecFieldAccess (pn, -1) inner
+                        ) paramNames
+                in App (Id consName) args
+            Nothing -> ERROR "Cannot infer constructor for record update"
 
-fixEmptyConstructors ex = do
-    s <- get
-    let env = currentEnvironment s
-    pure $ traverseExpr (fixEmptyConstructor env) ex
+    f (RecordPattern consName fields) =
+        case lookupConstructor consName env of
+            Just (cons, _i) ->
+                let paramNames = Prelude.map name (params cons)
+                    pats = Prelude.map (\pn -> case Prelude.lookup pn fields of
+                        Just p  -> p
+                        Nothing -> Id "_"  -- wildcard for unspecified fields
+                        ) paramNames
+                in App (Id consName) pats
+            Nothing -> ERROR $ "Constructor " ++ consName ++ " not found for record pattern"
 
--- this function is a mouthful and needs to be refactored A LOT
-expandCase :: Lambda -> Expr -> IntState Expr 
--- First, we expand nested Constructor applications in the pattern
--- matches into the flat list, left to right 
--- Then, we map over all of the case x of val statements,
--- check if val has a top level binding and if yes - keep it,
--- if not - means it's a variable substitution and we need to do a
--- beta reduction
-expandCase lam cs@(CaseOf recs ex si) = do
-    -- liftIO $ putStrLn $ "Analyzing: " ++ ppr cs
-    -- ex111 <- fixEmptyConstructors ex
-    (cases, ex') <- (t recs ex ([]))
-    return $ ExpandedCase cases ex' si
-    where 
-        t [] expr cases = return (cases, expr)
-        -- case nm of val
-        t (v@(Var nm tp val):xs) expr cases = do
-            -- liftIO $ putStrLn $ "Processing case of: " ++ ppVarCaseOf v
-            -- liftIO $ putStrLn $ "Current expr is: " ++ ppr expr
-            s <- get
-            let env = currentEnvironment s
-            case val of 
-                (Id name) -> do 
-                    res <- caseTransformIdTop env (Id nm) name expr
-                    case res of
-                        -- errors are terminating!
-                        Left er -> do
-                                    let lpl = LogPayload 
-                                                (lineNum si) (colNum si) ""
-                                                (er    ++ (ppr v) ++ "\n" )
-                                    logError lpl { linePos = (lineNum si), colPos = (colNum si) }
-                                    return (cases, expr)
-                        Right (cases', expr') -> do t xs expr' (Prelude.concat[cases',cases])
-                    
-                    
-                -- case nm of vval, first level constructor application:
-                -- case x of Succ(n) -> App (Id Succ) [Id n]
-                -- here we need to go deep and beta reduce
-                -- n = tupleField(0,x)
-                vval@(App (Id cons) ex5) -> do
-                    -- (liftIO $ putStrLn $ "App case in t: \n")
-                    -- liftIO $ pPrint vval
+    f e = e
 
-                    res1 <- caseTransformApp1 env (Id nm) cons ex5
-                    case res1 of
-                        -- error case is terminating!!!
-                        Left er -> do
-                                        let lpl = LogPayload 
-                                                    (lineNum si) (colNum si) ""
-                                                    (er    ++ (ppr v) ++ "\n" )
-                                        logError lpl { linePos = (lineNum si), colPos = (colNum si) }
-                                        return (cases, expr)
-                        Right cs -> do
-                            let newBoundVarExpr = (Id nm)
-                            -- liftIO $ putStrLn $ "Created field access on top: " ++ ppr newBoundVarExpr
-                            -- launching next level of recursion:
-                            (cases',expr', errs') <- caseTransformApp2 0 False env newBoundVarExpr cons ex5 expr [] []
-                    
-                            mapM_ (\er -> do
-                                            let lpl = LogPayload 
-                                                        (lineNum si) (colNum si) ""
-                                                        (er    ++ (ppr v) ++ "\n" )
-                                            logError lpl { linePos = (lineNum si), colPos = (colNum si) })
-                                errs'  
-                            t xs expr' (Prelude.concat[cases,cs,cases'])
-                            -- t (i+1) xs expr' (Prelude.concat[cases,cases'])
-                    
+-- Infer constructor name from an expression (for record update)
+inferConstructorName :: Environment -> Expr -> [(Name, Expr)] -> Maybe (Name, Lambda)
+inferConstructorName env (App (Id nm) _) _ =
+    case lookupConstructor nm env of
+        Just (cons, _) -> Just (nm, cons)
+        Nothing -> Nothing
+inferConstructorName env (Id nm) updFields =
+    case lookupConstructor nm env of
+        Just (cons, _) -> Just (nm, cons)
+        Nothing ->
+            -- nm is a variable, try to find constructor by update field names
+            let fieldNames = Prelude.map fst updFields
+            in findConstructorByFields env fieldNames
+inferConstructorName env _ updFields =
+    let fieldNames = Prelude.map fst updFields
+    in findConstructorByFields env fieldNames
 
-        
-expandCase lam e = pure e
+-- Find a constructor that has all the given field names
+findConstructorByFields :: Environment -> [Name] -> Maybe (Name, Lambda)
+findConstructorByFields env fieldNames =
+    let allCons = Map.toList (constructors env)
+        matches = [(consNm, lam) | (consNm, (lam, _)) <- allCons,
+                    let pNames = Prelude.map name (params lam),
+                    Prelude.all (`Prelude.elem` pNames) fieldNames]
+    in case matches of
+        [(consNm, lam)] -> Just (consNm, lam)  -- unique match
+        _ -> Nothing  -- ambiguous or no match
 
--- Case conversion for the pattern match is a sort of "double-recursive"
--- function that does the following:
--- when top-level pattern match check finds a constructor application 
--- Con (a1, a2, Con2(b1, b2...)) it takes its arguments, existing cases
--- array, and iterates from left to right doing:
--- 1) beta-reduce when encountering Id n
--- 2) when encountering App (so a new cons application) - 
---    - add a new case analysis into that array
---    - call itself to go down the tree
+-- Resolve a field name to its index in a constructor's params
+-- Searches all constructors in the environment
+resolveFieldIndex :: Environment -> Name -> Maybe (Name, Int)
+resolveFieldIndex env fieldName =
+    let allCons = Map.toList (constructors env)
+        findField [] = Nothing
+        findField ((consName, (lam, _)):rest) =
+            case findFieldInParams 0 (params lam) of
+                Just idx -> Just (consName, idx)
+                Nothing  -> findField rest
+        findFieldInParams _ [] = Nothing
+        findFieldInParams i (v:vs)
+            | name v == fieldName = Just i
+            | otherwise = findFieldInParams (i+1) vs
+    in findField allCons
 
--- In all of these functions we are working with 2 arguments:
--- 1) list of consTag checks or equality checks that must be
---    folded in order with logical "and" and produce True in order for
--- 2) the right hand expression to be executed
-
--- First, helper pure functions: 
--- case boundVarName of Id name -- difference between top level 
--- and next level is only in how we make the beta-reduce, so
--- this one gets passed different functions as the first argument and that's it
-caseTransformId :: (Expr->Expr) -> Environment -> Expr -> Name -> Expr -> IntState (Either String ([Expr],Expr))
-caseTransformId f env boundVarExpr name expr = do
-    -- liftIO $ putStrLn $ "Inside caseTransformId: name = " ++ name ++ " boundVar = " ++ ppr boundVarExpr
-    maybeEither (lookupConstructor name env)
-            (let vt = Var name UNDEFINED (f boundVarExpr)
-                 expr' = betaReduce vt expr
-             in  do 
-                    -- liftIO $ putStrLn $ "after beta reduce: " ++ ppr expr'
-                    return $ Right ([], expr'))
-            -- ^^^ nothing found in the environment, making beta-reduce
-            -- and returning NOTHING in place of the old case
-            -- otherwise checking if it's a constructor and if it is,
-            -- returning a correct new "case" expression
-            (\(lambda, i) -> pure $ Right ([ExprConsTagCheck (ConsTag name i) boundVarExpr ],expr))
-                
-
--- for top level id, we are passing id as a function
-caseTransformIdTop = caseTransformId id
--- for next level, we need to build a proper field access:
-caseTransformIdInternal i = caseTransformId (mkTupleFieldAccessExpr i)
--- case boundVarName of Id name -- processing id inside constructor applications
--- example:
--- { Cons(a1,a2) } -> g(a1,a2)
--- once we are inside Cons we process a1 as tupleField(0,boundExpr)
--- where boundExpr in our case will be simply Id boundVarName
--- but as we go deeper it will build up as corresponding calls
-
--- now for the more complicated case of App ...
--- it is recursive in itself + requires some additional error checks
--- env: environment, boundVarName - 
--- case boundVar name of (App (Id name) ex) -> expr
--- so name is a constructor name. We need to also do an error check
--- if it's not found in the environment!!!
-
--- so, this first function simply transforms the case statement to the 
--- constructor check, plus checks for errors if there's no such constructor
--- in the environment. Thus we don't need to deal with the RHS of this case here.
-caseTransformApp1 :: Environment -> Expr -> Name -> [Expr] -> IntState (Either String [Expr])
-caseTransformApp1 env boundVarExpr name ex = do
-    -- liftIO $ putStrLn $ "Inside caseTransformApp1m name: " ++ name
-    -- liftIO $ putStrLn $ "Bound var: " ++ ppr boundVarExpr
-    maybeEither (lookupConstructor name env)
-            (return $ Left ("Error: constructor " ++ name ++ " is not found in the environment"))
-            -- ^^^ nothing found in the environment, it's an ERROR!
-            -- otherwise
-            (\(lambda, i) -> 
-                if (arity lambda == Prelude.length ex)  
-                then return $ Right [ExprConsTagCheck (ConsTag name i) boundVarExpr ]
-                else return $ Left ("Error: constructor " ++ name ++ " application expects " ++ show (arity lambda) ++ " arguments and was given " ++ show (Prelude.length ex)))
-                
-
--- case boundVar name of (App (Id name) ex) -> exp)r
--- this one falls inside the "ex" (e.g., Con (a1,a2,...) )
--- and iterates through it while building 
-caseTransformApp2 :: Int -> Bool -> Environment -> Expr -> Name -> [Expr] -> Expr -> [Expr] -> [String] -> IntState ([Expr], Expr, [String])
-caseTransformApp2 i isTop env boundVarExpr name []          expr cases errs = return (cases,expr, errs)
--- case with ids is pretty straightforward
-caseTransformApp2 i isTop env boundVarExpr name ((Id x):xs) expr cases errs = do
-    -- (liftIO $ putStrLn $ "Id case in caseTransformApp2: " ++ x ++ " name: " ++ name) 
-    -- (liftIO $ putStrLn $ "Bound var expr: " ++ ppr boundVarExpr) 
-    res <- if isTop then caseTransformIdTop env boundVarExpr x expr
-           else caseTransformIdInternal i env boundVarExpr x expr
-    case (res) of
-            -- error case is terminating!!!
-            Left er -> return (cases, expr, er:errs)
-            Right (cs, ex) -> caseTransformApp2 (i+1) isTop env boundVarExpr name xs ex (Prelude.concat[cases,cs]) errs
--- case with App is complex
-caseTransformApp2 i isTop env boundVarExpr name ((App (Id cons) exs):xs) expr cases errs = do
-    -- liftIO $ putStrLn $ "App case in caseTransformApp2: " ++ cons
-    -- liftIO $ putStrLn $ "Bound var expr: " ++ ppr boundVarExpr
-    -- first, run basic sanity check plus optional cases array expansion:
-    let bv = if isTop then boundVarExpr else mkTupleFieldAccessExpr i boundVarExpr
-    res1 <- caseTransformApp1 env bv cons exs
-    case res1 of
-            -- error case is terminating!!!
-            Left er -> return (cases, expr, er:errs)
-            -- in case all seems good and we got additional case expressions
-            -- things get trickier - now we need to launch NEW
-            -- caseTransformApp2 and go down a level, gather all 
-            -- expression changes and additional cases, and only then move on
-            -- so it's a recursion inside a recursion. Will it even work???
-            -- for example, we have a case:
-            -- {case x of Cons (a1, Cell (b1, b2) )}
-            -- we moved past a1 and encountered Cell application
-            Right cs -> do
-                let newBoundVarExpr = mkTupleFieldAccessExpr i boundVarExpr
-                -- liftIO $ putStrLn $ "Case #: " ++ show i ++ ", Created field access: " ++ ppr newBoundVarExpr
-                -- launching next level of recursion:
-                (cases',expr', errs') <- caseTransformApp2 0 False env newBoundVarExpr cons exs expr [] []
-                -- once we got results of the next level of recursion in ' vars, continue our current recursion:
-                caseTransformApp2 (i+1) isTop env boundVarExpr name xs expr' (Prelude.concat[cases,cs,cases']) (Prelude.concat[errs',errs])
--- the rest is errors, so terminating
-caseTransformApp2 i isTop env boundVarExpr name eee expr cases errs = 
-    return (cases,expr, ("Error: only constructor applications or ids are allowed inside pattern matches on the left side, and we encountered " ++ ppr eee):errs)
-
+-- Pass 2 (Case Optimization) is in src/CaseOptimization.hs
 
 --------------------------------------------------------------------------------
 -- PASS 3: Type checking
@@ -614,34 +918,103 @@ lamToCLMPass = do
     -- also convert instance lambdas to CLM
     let instLams = instanceLambdas env
     let clmInsts = Map.mapWithKey (\n l -> lambdaToCLMLambda env l) instLams
-    let env' = env { clmLambdas = clms, clmInstances = clmInsts }
+    -- Type-directed dispatch: wrap CLMIAP bodies with CLMTYPED for user functions
+    -- that have a concrete return type. Only for topLambdas, not instanceLambdas.
+    let clms' = Map.mapWithKey (\n clm -> maybeAddTypeHint env n clm) clms
+    let env' = env { clmLambdas = clms', clmInstances = clmInsts }
     let s' = s {currentEnvironment = env'}
     put s'
+    verboseLog $ "  Pass 4: converted " ++ show (Map.size clms') ++ " lambdas, "
+        ++ show (Map.size clmInsts) ++ " instances to CLM"
+
+-- | Wrap CLM body with CLMTYPED if the body is CLMIAP and the lambda has a
+-- concrete return type. This enables type-directed dispatch at runtime.
+-- Only applied to user functions (not structure/instance dispatch templates).
+maybeAddTypeHint :: Environment -> Name -> CLMLam -> CLMLam
+maybeAddTypeHint env lamName clm =
+    case Map.lookup lamName (topLambdas env) of
+        Just lam | not (hasImplicit lam) ->
+            let retTy = lamType lam
+                clmRetTy = exprToCLM env retTy
+            in if isConcreteRetType clmRetTy
+               then wrapClmBody clm clmRetTy
+               else clm
+        _ -> clm
+
+-- | Check if a CLM return type expression is concrete (useful for dispatch)
+isConcreteRetType :: CLMExpr -> Bool
+isConcreteRetType (CLMID name) = not (Prelude.null name) && Prelude.head name >= 'A' && Prelude.head name <= 'Z'
+isConcreteRetType (CLMAPP (CLMID name) _) = not (Prelude.null name) && Prelude.head name >= 'A' && Prelude.head name <= 'Z'
+isConcreteRetType (CLMU _) = True
+isConcreteRetType _ = False
+
+-- | Wrap the body of a CLMLam with CLMTYPED if it's a CLMIAP
+wrapClmBody :: CLMLam -> CLMExpr -> CLMLam
+-- Wrap all CLMLam bodies that have CLMIAP
+wrapClmBody (CLMLam vs bdy@(CLMIAP _ _)) retTy = CLMLam vs (CLMTYPED bdy retTy)
+wrapClmBody clm _ = clm
     
 
 varToCLMVar e v = (name v, exprToCLM e (val v))
 
 varsToCLMVars e vs = Prelude.map (varToCLMVar e) vs
 
-consTagCheckToCLM e (ExprConsTagCheck ct ex) = (ct, exprToCLM e ex)
+patternCheckToCLM :: Environment -> Expr -> CLMPatternCheck
+patternCheckToCLM e (ExprConsTagCheck ct ex) = CLMCheckTag ct (exprToCLM e ex)
+patternCheckToCLM e (ExprLiteralCheck lit ex) = CLMCheckLit lit (exprToCLM e ex)
+patternCheckToCLM e ex = CLMCheckTag (ConsTag "ERROR" (-1)) (CLMERR ("Invalid pattern check: " ++ show ex) SourceInteractive)
 
 exprToCLM :: Environment -> Expr -> CLMExpr
 exprToCLM _ UNDEFINED = CLMEMPTY
 exprToCLM env (Binding v) = CLMBIND (name v) (exprToCLM env $ val v)
 exprToCLM env (Statements exs) = CLMPROG (Prelude.map (exprToCLM env) exs)
+-- Class system: ClassName.new(args) → CLMNEW
+exprToCLM env (App (RecFieldAccess ("new", _) (Id className)) args)
+    | Map.member className (classDecls env) =
+        CLMNEW className (Prelude.map (exprToCLM env) args)
+-- Class system: super.method(args) → CLMSCALL
+exprToCLM env (App (RecFieldAccess (methodName, _) (Id "super")) args) =
+    CLMSCALL (CLMID "self") methodName (Prelude.map (exprToCLM env) args)
+-- Class system: obj.method(args) → CLMMCALL when obj is known class type
+-- We check if the receiver is an Id whose type is a class, or try field access lookup
+exprToCLM env (App (RecFieldAccess (memberName, _) objExpr) args)
+    | Just className <- inferClassFromExpr env objExpr
+    , Just cm <- lookupClass className env
+    , Map.member memberName (cmMethods cm) =
+        CLMMCALL (exprToCLM env objExpr) memberName (Prelude.map (exprToCLM env) args)
+    | Just className <- inferClassFromExpr env objExpr
+    , Just cm <- lookupClass className env
+    , Map.member memberName (cmStaticMethods cm) =
+        CLMAPP (CLMID (className ++ "$" ++ memberName)) (Prelude.map (exprToCLM env) args)
+-- Named field access: resolve name to index at compile time if possible
+exprToCLM env (RecFieldAccess (nm, -1) e) | nm /= "" =
+    let clmE = exprToCLM env e
+    in  -- Class field access: resolve from class field indices
+        case inferClassFromExpr env e of
+            Just className | Just cm <- lookupClass className env
+                           , Just idx <- Map.lookup nm (cmFieldIndices cm)
+                -> CLMFieldAccess (nm, idx) clmE
+            _ -> case resolveFieldIndex env nm of
+                    Just (_, idx) -> CLMFieldAccess (nm, idx) clmE
+                    Nothing       -> CLMFieldAccess (nm, -1) clmE  -- defer to interpreter
 exprToCLM env (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLM env e)
-exprToCLM env (ExpandedCase cases ex si) = CLMCASE (Prelude.map (consTagCheckToCLM env) cases) (exprToCLM env ex)
+exprToCLM env (ExpandedCase cases ex si) = CLMCASE (Prelude.map (patternCheckToCLM env) cases) (exprToCLM env ex)
 exprToCLM env PrimCall = CLMPRIMCALL
+exprToCLM env Intrinsic = CLMPRIMCALL
+exprToCLM env Derive = CLMPRIMCALL
 exprToCLM env (ConTuple cs exs) = CLMCON cs (Prelude.map (exprToCLM env) exs)
 -- have to check for a case when Id in fact refers to an 0-arg constructor call
 -- since we need to change it for a corresponding tuple
-exprToCLM env (Id n) = 
+-- also check for nullary implicit-param functions (e.g., value declarations)
+exprToCLM env (Id n) =
     case (lookupConstructor n env) of
         Just (cons, i) ->
             if ((params cons) == [] )
             then CLMCON (ConsTag n i) []
-            else CLMID n              
-        Nothing -> CLMID n
+            else CLMID n
+        Nothing -> case lookupLambda n env of
+            Just fun | hasImplicit fun -> CLMIAP (CLMID n) []
+            _ -> CLMID n
 -- application of func or cons to an expression: doing a bunch of checks
 -- while converting
 exprToCLM env e@(App (Id nm) exs) = 
@@ -650,7 +1023,7 @@ exprToCLM env e@(App (Id nm) exs) =
     in  case mcons of
             Just (cons, i) -> 
                   if (Prelude.length (params cons) /= (Prelude.length newArgs) )
-                  then CLMERR $ "ERROR: wrong number of arguments in constructor application: " ++ show e
+                  then CLMERR ("[CLM] wrong number of arguments in constructor application: " ++ show e) SourceInteractive
                   else CLMCON (ConsTag nm i) newArgs
             Nothing -> 
                 let mfun = lookupLambda nm env
@@ -663,20 +1036,88 @@ exprToCLM env e@(App (Id nm) exs) =
                                 then CLMPAP (CLMID nm) newArgs
                                 else if (Prelude.length (params fun) == (Prelude.length newArgs) )
                                     then CLMAPP (CLMID nm) newArgs
-                                    else CLMERR $ "ERROR: function is given more arguments than it can handle: " ++ show e
-                        Nothing -> CLMERR $ "ERROR: applied unknown function or constructor: " ++ show e
+                                    else CLMERR ("[CLM] function is given more arguments than it can handle: " ++ show e) SourceInteractive
+                        Nothing -> CLMAPP (CLMID nm) newArgs
             
     
 exprToCLM env (App ex exs) = CLMAPP (exprToCLM env ex) (Prelude.map (exprToCLM env) exs)
 exprToCLM env (Function lam) = CLMLAM $ lambdaToCLMLambda env lam
 exprToCLM env (Lit l) = CLMLIT l
 exprToCLM _ (U n) = CLMU n
-exprToCLM _ e = CLMERR $ "ERROR: cannot convert expr to CLM: " ++ show e
+-- ReprCast: resolve direction based on repr map
+-- If targetType is a user type (key in reprMap) → use fromRepr
+-- If targetType is a repr type (value in reprMap) → use toRepr
+exprToCLM env (ReprCast e (Id targetType)) =
+    let clmE = exprToCLM env e
+    in if Map.member targetType (reprMap env)
+       then CLMIAP (CLMID "fromRepr") [clmE]  -- target is user type, convert from repr
+       else if isReprTarget targetType env
+            then CLMIAP (CLMID "toRepr") [clmE]  -- target is repr type, convert to repr
+            else CLMERR ("[CLM] no repr found for cast to " ++ targetType) SourceInteractive
+exprToCLM env (ReprCast e tp) =
+    let targetType = case tp of { App (Id nm) _ -> nm; _ -> "" }
+        clmE = exprToCLM env e
+    in if Map.member targetType (reprMap env)
+       then CLMIAP (CLMID "fromRepr") [clmE]
+       else if isReprTarget targetType env
+            then CLMIAP (CLMID "toRepr") [clmE]
+            else CLMERR ("[CLM] no repr found for cast to " ++ show tp) SourceInteractive
+exprToCLM _ (ArrowType _ _) = CLMEMPTY  -- type-level, erased at runtime
+exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
+-- Record literal: convert to a constructor-like tuple of values (field order preserved)
+-- Records desugar to product types; at CLM level they're just tagged tuples
+exprToCLM env (RecordLit fields) =
+    let values = Prelude.map (\(_n, e) -> exprToCLM env e) fields
+    in CLMCON (ConsTag "__Record" 0) values
+-- Record type: type-level, erased at runtime
+exprToCLM _ (RecordType _ _) = CLMEMPTY
+-- Module system nodes: erased at runtime
+exprToCLM _ (ModuleDecl _) = CLMEMPTY
+exprToCLM _ (Import _ _ _) = CLMEMPTY
+exprToCLM _ (Open _) = CLMEMPTY
+exprToCLM _ (Export _ _) = CLMEMPTY
+exprToCLM env (PrivateDecl e) = exprToCLM env e
+exprToCLM _ (OpaqueTy _ _) = CLMEMPTY
+exprToCLM _ (TargetBlock _ _) = CLMEMPTY
+exprToCLM _ (TargetSwitch _) = CLMEMPTY
+-- Array literal
+exprToCLM env (ArrayLit exs) = CLMARRAY (Prelude.map (exprToCLM env) exs)
+-- Record system nodes: desugar inline if they reach CLM conversion
+exprToCLM env e@(RecordConstruct _ _) = exprToCLM env (desugarRecordExpr env e)
+exprToCLM env e@(RecordUpdate _ _) = exprToCLM env (desugarRecordExpr env e)
+exprToCLM env e@(RecordPattern _ _) = exprToCLM env (desugarRecordExpr env e)
+-- Effect system nodes: erased at runtime
+exprToCLM _ (EffectDecl _ _ _) = CLMEMPTY
+exprToCLM _ (HandlerDecl _ _ _) = CLMEMPTY
+exprToCLM env (HandleWith e _) = exprToCLM env e  -- handler is erased; just execute the computation
+exprToCLM env (ActionBlock stmts) = exprToCLM env (desugarActionStmts stmts)  -- should be desugared by now
+exprToCLM _ (EffType _ _) = CLMEMPTY  -- type-level, erased at runtime
+exprToCLM _ (DeclBlock _) = CLMEMPTY  -- structure member list, should not reach CLM
+-- Class system: ClassDecl is processed in Pass 1, erased at CLM level
+exprToCLM _ (ClassDecl _ _) = CLMEMPTY
+exprToCLM _ e = CLMERR ("[CLM] cannot convert expr to CLM: " ++ show e) SourceInteractive
+
+-- | Try to infer the class name from an expression (for method/field resolution)
+inferClassFromExpr :: Environment -> Expr -> Maybe Name
+inferClassFromExpr env (Id nm) =
+    -- Check if nm is a binding whose type is a class
+    case lookupLambda nm env of
+        Just lam -> case lamType lam of
+            Id typNm | Map.member typNm (classDecls env) -> Just typNm
+            _ -> Nothing
+        Nothing -> Nothing  -- can't determine from a bare Id without type info
+inferClassFromExpr env (App (Id nm) _)
+    | Map.member nm (classDecls env) = Just nm  -- constructor call e.g. Dog.new(...)
+inferClassFromExpr _ _ = Nothing
 
 lambdaToCLMLambda :: Environment -> Lambda -> CLMLam
-lambdaToCLMLambda env (Lambda nm params (PatternMatches exs) tp) = 
+lambdaToCLMLambda env (Lambda nm params Intrinsic tp _) =
+    CLMLam [] CLMPRIMCALL
+lambdaToCLMLambda env (Lambda nm params Derive tp _) =
+    CLMLam [] CLMPRIMCALL
+lambdaToCLMLambda env (Lambda nm params (PatternMatches exs) tp _) =
     CLMLamCases (varsToCLMVars env params) (Prelude.map (exprToCLM env) exs)
-lambdaToCLMLambda env (Lambda nm params body tp) = 
+lambdaToCLMLambda env (Lambda nm params body tp _) =
     CLMLam (varsToCLMVars env params) (exprToCLM env body)
 
 --------------------------------------------------------------------------------
@@ -703,7 +1144,7 @@ compileExprToJS' :: Expr -> String
 compileExprToJS' e = intercalate ("\n" :: String) (compileExprToJS e) 
 
 compileExprToJS :: Expr -> [String]
-compileExprToJS (SumType lam@(Lambda typName typArgs (Constructors cons) typTyp)) = 
+compileExprToJS (SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _)) =
     imap (compileConstructorToJS ("cons_" ++ typName ++ "_") ) cons
 compileExprToJS (Function lam) = [compileFunctionToJS "" lam]
 compileExprToJS e = ["/* NOT SUPPORTED:\n" ++ ppr e ++ "\n*/"]
@@ -718,13 +1159,13 @@ argsToTupleFields args = showListPlainSep f ", " args
 
 -- taking out prefix in names for now
 compileConstructorToJS :: String -> Int -> Lambda -> String
-compileConstructorToJS pref i (Lambda nm args ex tp) = "function " ++nm ++
+compileConstructorToJS pref i (Lambda nm args ex tp _) = "function " ++nm ++
                          argsToString args 
                          ++ " { return { __consTag: " ++ (show i) ++ ", "
                          ++ argsToTupleFields args ++ " } } "                         
     
 compileFunctionToJS :: String -> Lambda -> String
-compileFunctionToJS pref lam@(Lambda nm args ex tp) = 
+compileFunctionToJS pref lam@(Lambda nm args ex tp _) =
     if (isLambdaConstructor lam) then ""
     else "function " ++ pref++nm ++ argsToString args ++ funBodyToString ex
 

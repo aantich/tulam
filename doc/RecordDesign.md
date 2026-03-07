@@ -22,6 +22,8 @@ All three are products with named projections. The keyword tells you what *kind*
 record Point = { x:Nat, y:Nat };
 ```
 
+Note: `record` uses `{ }` for field declarations — this is unambiguous since Package A migrated sum types to `|` syntax and pattern matching to `match |` syntax. `{ }` is now exclusively used for records and declarations.
+
 This creates:
 - A nominal type `Point`
 - A constructor `Point` that takes named fields
@@ -58,10 +60,10 @@ A named record desugars to a single-constructor sum type:
 ```tulam
 record Point = { x:Nat, y:Nat };
 // compiles identically to:
-type Point = { Point(x:Nat, y:Nat) };
+type Point = Point(x:Nat, y:Nat);
 ```
 
-This means records go through the existing pipeline — constructor extraction, field access via `CLMFieldAccess`, pattern matching. No new CLM nodes needed for Phase 2.
+Note: single-constructor sum types from records still use `{ }` for the field declaration block inside the record syntax, but the desugared sum type uses the standard `|` syntax (trivially, with a single constructor). This means records go through the existing pipeline — constructor extraction, field access via `CLMFieldAccess`, pattern matching. No new CLM nodes needed for Phase 2.
 
 ---
 
@@ -229,7 +231,7 @@ Row polymorphism requires:
 2. Row unification in the type checker (unifying `{x:a, ..r}` with `{x:Nat, y:Bool}` yields `a=Nat, r={y:Bool}`)
 3. Evidence passing for field access (the compiler must know the offset of `x` in an arbitrary record)
 
-None of this exists yet. Named records compile to known-layout constructors and work today. Structural records need the type checker.
+None of this exists yet. Named records compile to known-layout constructors and work today. Structural records need the type checker. However, the Package A syntax migration has eliminated the parsing ambiguity that previously made anonymous record types problematic — since `{ }` is now exclusively used for records/declarations, `{x:Nat, y:Nat}` in type position is unambiguously an anonymous record type.
 
 ---
 
@@ -273,7 +275,8 @@ instance Monoid(Nat) = {
 Note that `empty` in Monoid is a value field, not a function — structures can mix values and functions. An instance dictionary is literally a record whose fields are the implementations.
 
 This unification means:
-- Records and structures share the same `{ field:Type, ... }` syntax
+- Records, structures, and instances all share the same `{ field:Type, ... }` declaration syntax
+- `{ }` is exclusively used for records and declarations — sum types use `|` syntax and pattern matching uses `match |`, so there is no ambiguity
 - The compiler for structures already handles named fields, construction, field access
 - Row polymorphism on records will eventually enable structural constraints too
 
@@ -286,23 +289,37 @@ Records support pattern matching just like sum types:
 ```tulam
 record Point = { x:Nat, y:Nat };
 
-function isOrigin(p:Point) : Bool = {
-    { Point(Z, Z) } -> True,
-    { p } -> False
-};
+function isOrigin(p:Point) : Bool =
+    match
+    | Point(Z, Z) -> True
+    | p -> False;
 
 // Or with named fields (future):
-function isOrigin(p:Point) : Bool = {
-    { Point { x = Z, y = Z } } -> True,
-    { _ } -> False
-};
+function isOrigin(p:Point) : Bool =
+    match
+    | Point { x = Z, y = Z } -> True
+    | _ -> False;
 ```
 
-Since records desugar to single-constructor sum types, positional pattern matching already works through the existing CaseOf/ExpandedCase/CLMCASE pipeline. Named field patterns are sugar for positional patterns in field-declaration order.
+Since records desugar to single-constructor sum types, positional pattern matching already works through the existing CaseOf/ExpandedCase/CLMCASE pipeline. Named field patterns are sugar for positional patterns in field-declaration order. The `match |` syntax is used for all pattern matching (both sum types and records), while `{ }` is reserved for record/declaration blocks.
 
 ---
 
 ## 9. Summary
+
+### Syntax disambiguation (Package A migration)
+
+The Package A syntax migration resolves all previous `{ }` ambiguity concerns:
+
+| Construct | Old syntax | New syntax |
+|-----------|-----------|------------|
+| Sum types | `type Bool = { True, False }` | `type Bool = True \| False;` |
+| Pattern matching | `{ {pat} -> expr, ... }` | `match \| pat -> expr \| ...` |
+| Records/declarations | `{ field:Type, ... }` | `{ field:Type, ... }` (unchanged) |
+
+`{ }` is now **exclusively** used for records and declaration blocks (record fields, structure members, instance bodies). Sum types use `|`-separated constructors and pattern matching uses the `match` keyword with `|`-separated arms. This eliminates the parsing ambiguity that previously existed between record literals, pattern match blocks, and anonymous record types. `match` is a reserved keyword.
+
+### Feature roadmap
 
 | Feature | Phase | Depends on |
 |---------|-------|------------|
@@ -312,7 +329,7 @@ Since records desugar to single-constructor sum types, positional pattern matchi
 | Record spread in declarations (`..Name`) | Phase 2 (next) | Named records |
 | Record construction `Name { f = v }` | Phase 2 (next) | Named records |
 | Record update `p { f = v }` | Phase 3 | Named records, field access |
-| Anonymous record types `{x:a, y:b}` | Phase 6+ | Type checker |
+| Anonymous record types `{x:a, y:b}` | Phase 6+ | Type checker (no disambiguation issue — `{ }` is exclusively records) |
 | Row polymorphism `{x:a, ..}` | Phase 7+ | Type checker, anonymous records |
 | Named row variables `{x:a, ..r}` | Phase 7+ | Row polymorphism |
 | Method syntax `p.method(args)` | TBD | Type checker (for resolution) |

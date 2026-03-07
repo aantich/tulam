@@ -65,10 +65,18 @@ emptyDef    = Tok.LanguageDef
 lexer :: TokenParserIS ParserState
 lexer = Tok.makeTokenParser style
     where
-    ops = [";","=",",",".","..",":", "->", "=>", "|", "?", "<:", "\\", "===", "==>"]
+    ops = [";","=",",",".","..",":", "->", "=>", "|", "?", "<:", "\\", "===", "==>", "<-"]
     names = ["type","function","if","then","else","in","action","structure","instance",
-            "let", "case", "of", "where", "∃", "∀", "exists", "forall", "record",
-            "algebra", "trait", "morphism", "bridge", "law", "extends", "requires"]
+            "let", "where", "∃", "∀", "exists", "forall", "record",
+            "algebra", "trait", "morphism", "bridge", "law", "extends", "requires",
+            "value", "primitive", "intrinsic",
+            "repr", "invariant", "as", "default",
+            "match",
+            "module", "import", "open", "export", "private", "opaque", "hiding",
+            "target", "extern",
+            "effect", "handler", "handle",
+            "derive", "deriving",
+            "class", "abstract", "sealed", "implements", "override", "final", "static", "super"]
     style = emptyDef {
                 Tok.commentStart   = "/*"
                 , Tok.commentEnd     = "*/"

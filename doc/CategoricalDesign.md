@@ -111,10 +111,9 @@ algebra Category(arr: Type -> Type -> Type) = {
 };
 
 instance Category(Kleisli(m)) requires Monad(m) = {
-    function id(a:Type) : Kleisli(m, a, a) = { {x} -> return(x) },
-    function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = {
-        {x} -> bind(g(x), f)
-    }
+    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x),
+    function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = match
+        | x -> bind(g(x), f)
 };
 ```
 
@@ -347,17 +346,17 @@ A functor is a type constructor `F : Type -> Type` that also maps functions: if 
 **Option A: Functor as a declaration that combines type + mapping**
 
 ```tulam
-functor Maybe(a:Type) : Type = { Just(x:a), Nothing };
+functor Maybe(a:Type) : Type = Just(x:a) | Nothing;
 // This BOTH defines the sum type AND declares fmap exists.
 // fmap must be provided or derived.
 
-functor List(a:Type) : Type = { Nil, Cons(head:a, tail:List(a)) };
+functor List(a:Type) : Type = Nil | Cons(head:a, tail:List(a));
 ```
 
 **Option B: Functor as an algebra on type constructors**
 
 ```tulam
-type Maybe(a:Type) = { Just(x:a), Nothing };
+type Maybe(a:Type) = Just(x:a) | Nothing;
 
 algebra Functor(f:Type1) = {
     function fmap(g: a -> b, x:f(a)) : f(b),
@@ -367,10 +366,9 @@ algebra Functor(f:Type1) = {
 };
 
 instance Functor(Maybe) = {
-    function fmap(g, x) = {
-        {g, Nothing} -> Nothing,
-        {g, Just(v)} -> Just(g(v))
-    }
+    function fmap(g, x) = match
+        | g, Nothing -> Nothing
+        | g, Just(v) -> Just(g(v))
 };
 ```
 
@@ -387,9 +385,9 @@ However, we could add `functor` as **sugar** that expands to Option B:
 
 ```tulam
 // this:
-functor Maybe(a:Type) : Type = { Just(x:a), Nothing };
+functor Maybe(a:Type) : Type = Just(x:a) | Nothing;
 // expands to:
-type Maybe(a:Type) = { Just(x:a), Nothing };
+type Maybe(a:Type) = Just(x:a) | Nothing;
 // plus auto-derived: instance Functor(Maybe) = { ... }
 ```
 
@@ -413,10 +411,9 @@ A natural transformation is a family of functions `F(a) -> G(a)` that is *unifor
 
 ```tulam
 natural safeHead : List ~> Maybe = {
-    function transform(xs:List(a)) : Maybe(a) = {
-        {Nil} -> Nothing,
-        {Cons(x, rest)} -> Just(x)
-    }
+    function transform(xs:List(a)) : Maybe(a) = match
+        | Nil -> Nothing
+        | Cons(x, rest) -> Just(x)
 };
 
 natural flatten : List . List ~> List = {
@@ -483,8 +480,8 @@ algebra Category(arr: Type -> Type -> Type) = {
 
 // The default instance: plain functions form a category
 instance Category(Function) = {
-    function id(a:Type) : a -> a = { {x} -> x },
-    function compose(f, g) = { {x} -> f(g(x)) }
+    function id(a:Type) : a -> a = match | x -> x,
+    function compose(f, g) = match | x -> f(g(x))
 };
 ```
 
@@ -500,10 +497,9 @@ type Kleisli(m: Type -> Type, a:Type, b:Type) = a -> m(b);
 
 // Given a Monad(m), Kleisli(m) forms a Category
 instance Category(Kleisli(m)) requires Monad(m) = {
-    function id(a:Type) : Kleisli(m, a, a) = { {x} -> return(x) },
-    function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = {
-        {x} -> bind(g(x), f)
-    }
+    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x),
+    function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = match
+        | x -> bind(g(x), f)
 };
 ```
 
@@ -597,15 +593,14 @@ algebra Monad(m:Type1) extends Applicative(m) = {
     law leftUnit(x:a, f:a -> m(b))  = bind(pure(x), f) === f(x),
     law rightUnit(x:m(a))           = bind(x, pure) === x,
     law associativity(x:m(a), f:a -> m(b), g:b -> m(c)) =
-        bind(bind(x, f), g) === bind(x, { {a} -> bind(f(a), g) })
+        bind(bind(x, f), g) === bind(x, \a -> bind(f(a), g))
 };
 
 // Example instance:
 instance Monad(Maybe) = {
-    function bind(x, f) = {
-        {Nothing, f} -> Nothing,
-        {Just(v), f} -> f(v)
-    }
+    function bind(x, f) = match
+        | Nothing, f -> Nothing
+        | Just(v), f -> f(v)
 };
 ```
 
@@ -623,9 +618,9 @@ action main : IO(Unit) = {
 
 // desugars to:
 function main() : IO(Unit) =
-    bind(readLine(), { {name} ->
-        bind(putStrLn("Hello, " + name), { {_} -> pure({}) })
-    });
+    bind(readLine(), \name ->
+        bind(putStrLn("Hello, " + name), \_ -> pure({}))
+    );
 ```
 
 Since tulam already has `action` as a keyword for sequential computation, this is a natural fit: **`action` IS do-notation**. The action body is a sequence of statements that desugar into monadic bind chains.
@@ -650,7 +645,7 @@ The categorical structures enable specific syntactic sugar. The key insight is t
 | Sugar | Requires | Desugars to |
 |-------|----------|-------------|
 | `do` / `action` body | `Monad(m)` | `bind` chains |
-| `<- ` in actions | `Monad(m)` | `bind(expr, { {var} -> ... })` |
+| `<- ` in actions | `Monad(m)` | `bind(expr, \var -> ...)` |
 | `f . g` composition | `Category(arr)` | `compose(f, g)` |
 | `for x in xs` | `Traversable(t)` | `traverse` / `mapM` |
 | `f <$> x` | `Functor(f)` | `fmap(f, x)` |
@@ -695,6 +690,7 @@ The hierarchy tells the compiler what *extra things* it can derive and optimize.
 | Keyword | Status | Meaning |
 |---------|--------|---------|
 | `structure` | **Exists now** | General-purpose, catch-all |
+| `match` | **Exists now** | Pattern matching expression (`match \| pat -> expr \| ...`) |
 | `algebra` | **New sugar** | Single-type structure (enables product derivation) |
 | `morphism` | **New sugar** | Multi-type structure (enables composition) |
 | `extends` | **New** | Same-shape refinement (inherits operations + laws) |
@@ -702,8 +698,8 @@ The hierarchy tells the compiler what *extra things* it can derive and optimize.
 | `law` | **New** | Declares equational property using `===` |
 | `===` | **New operator** | Propositional equality in laws |
 | `==>` | **New operator** | Implication in conditional laws |
-| `functor` | **Future** | Sugar for type + Functor instance (requires HKT) |
-| `natural` | **Future** | Parametrically polymorphic functor morphism (requires HKT) |
+| `functor` | **Not a keyword** | `Functor` is an algebra on `Type1`; auto-derivation via `deriveFunctor()` |
+| `natural` | **Not a keyword** | Natural transformations are regular polymorphic functions; `~>` deferred to type checker |
 | `category` | **Not a keyword** | Defined as algebra in standard library |
 | `arrow` | **Not a keyword** | Defined as algebra in standard library |
 | `monad` | **Not a keyword** | Defined as algebra in standard library |
@@ -716,9 +712,34 @@ The hierarchy tells the compiler what *extra things* it can derive and optimize.
 3. Is so pervasive that verbosity hurts readability (`algebra`, `morphism`)
 
 **Standard library structures** suffice when the concept:
-1. Is just algebraic structure with laws (`Category`, `Monad`, `Arrow`)
+1. Is just algebraic structure with laws (`Category`, `Monad`, `Arrow`, `Functor`)
 2. Doesn't require special syntax (though it may *enable* sugar via the structure)
-3. Is one of many possible structures at the same level (`Monad` vs `Comonad`, `Arrow` vs `Profunctor`)
+3. Is one of many possible structures at the same level (`Monad` vs `Comonad`, `Arrow` vs `Profunctor`, `Functor` vs `Bifunctor` vs `Contravariant`)
+
+### Design decision: Deriving as language-level computation (not keywords)
+
+The original design proposed `functor` and `natural` as future keywords. After analysis, these were rejected in favor of a more principled approach:
+
+**Why not `functor` keyword:**
+- If `Functor` gets a keyword, then `Bifunctor`, `Contravariant`, `Profunctor` would all need one too — keyword bloat
+- The only value is auto-deriving `fmap`, which is better served by a general `deriving` mechanism
+- `algebra Functor(f:Type1)` works perfectly with existing infrastructure
+
+**Why not `natural` keyword:**
+- Natural transformations are just parametrically polymorphic functions — the type signature alone expresses the constraint
+- The `~>` syntax is documentation, not computation — it only becomes meaningful when a type checker can verify parametricity
+- No runtime benefit without type checking
+
+**The better approach: Deriving as type-level functions.**
+Since tulam has first-class types (universe hierarchy) and type-dependent functions execute at compile time, "derive Functor for Maybe" is just a compile-time function that inspects type structure:
+
+```tulam
+// deriving is a regular function call, not a keyword
+instance Functor(Maybe) = deriveFunctor(Maybe);
+instance Eq(MyType) = deriveEq(MyType);
+```
+
+This requires type reflection primitives (`constructors`, `fields`, `fieldType`) implemented as intrinsics, plus compile-time evaluation of derive functions during Pass 1. See `doc/ImplementationPlan.md` Phase 10.2 for full design.
 
 ---
 
