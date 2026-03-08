@@ -2,13 +2,13 @@
 
 // Basic class with fields and methods
 class Animal(name:String, age:Int) = {
-    function speak(self:Animal) : String = "...",
+    function speak(self:Animal) : String = "...";
     function info(self:Animal) : String = self.name
 };
 
 // Subclass with override
 class Dog(breed:String) extends Animal = {
-    override function speak(self:Dog) : String = "Woof!",
+    override function speak(self:Dog) : String = "Woof!";
     function fetch(self:Dog, item:String) : String = self.name
 };
 

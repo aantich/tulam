@@ -21,37 +21,37 @@ The first step is always a pure tulam algebra that describes the behavioral inte
 ```tulam
 algebra StringLike(s:Type) = {
     /// Concatenate two string-like values.
-    function concat(x:s, y:s) : s,
+    function concat(x:s, y:s) : s;
 
     /// Return the number of characters (not bytes).
-    function charLength(x:s) : Int,
+    function charLength(x:s) : Int;
 
     /// Extract a substring by character index range [start, end).
-    function substring(x:s, start:Int, end:Int) : s,
+    function substring(x:s, start:Int, end:Int) : s;
 
     /// Find the first occurrence of a pattern. Returns -1 if not found.
-    function indexOf(x:s, pattern:s) : Int,
+    function indexOf(x:s, pattern:s) : Int;
 
     /// Replace all occurrences of a pattern with a replacement.
-    function replace(x:s, pattern:s, replacement:s) : s,
+    function replace(x:s, pattern:s, replacement:s) : s;
 
     /// Split by a delimiter.
-    function split(x:s, delimiter:s) : List(s),
+    function split(x:s, delimiter:s) : List(s);
 
     /// Join a list of string-like values with a separator.
-    function join(sep:s, parts:List(s)) : s,
+    function join(sep:s, parts:List(s)) : s;
 
     /// Convert to lowercase.
-    function toLower(x:s) : s,
+    function toLower(x:s) : s;
 
     /// Convert to uppercase.
-    function toUpper(x:s) : s,
+    function toUpper(x:s) : s;
 
     /// Trim whitespace from both ends.
-    function trim(x:s) : s,
+    function trim(x:s) : s;
 
     law concat_associativity(x:s, y:s, z:s) =
-        concat(concat(x, y), z) === concat(x, concat(y, z)),
+        concat(concat(x, y), z) === concat(x, concat(y, z));
 
     law split_join_roundtrip(x:s, d:s) =
         join(d, split(x, d)) === x
@@ -72,20 +72,20 @@ Next, provide a pure tulam implementation of the algebra for the built-in `Strin
 
 ```tulam
 instance StringLike(String) = {
-    function concat(x:String, y:String) : String = strConcat(x, y),
-    function charLength(x:String) : String = strLength(x),
+    function concat(x:String, y:String) : String = strConcat(x, y);
+    function charLength(x:String) : String = strLength(x);
     function substring(x:String, start:Int, end:Int) : String =
-        strSubstring(x, start, end),
+        strSubstring(x, start, end);
     function indexOf(x:String, pattern:String) : Int =
-        strIndexOf(x, pattern),
+        strIndexOf(x, pattern);
     function replace(x:String, pattern:String, replacement:String) : String =
-        strReplace(x, pattern, replacement),
+        strReplace(x, pattern, replacement);
     function split(x:String, delimiter:String) : List(String) =
-        strSplit(x, delimiter),
+        strSplit(x, delimiter);
     function join(sep:String, parts:List(String)) : String =
-        strJoin(sep, parts),
-    function toLower(x:String) : String = strToLower(x),
-    function toUpper(x:String) : String = strToUpper(x),
+        strJoin(sep, parts);
+    function toLower(x:String) : String = strToLower(x);
+    function toUpper(x:String) : String = strToUpper(x);
     function trim(x:String) : String = strTrim(x)
 };
 ```
@@ -104,21 +104,21 @@ For each compilation target, provide a target-qualified instance that maps algeb
 target dotnet {
     instance StringLike(String) = {
         function concat(x:String, y:String) : String =
-            System.String.Concat(x, y),
+            System.String.Concat(x, y);
         function charLength(x:String) : Int =
-            x.Length,
+            x.Length;
         function substring(x:String, start:Int, end:Int) : String =
-            x.Substring(start, end - start),
+            x.Substring(start, end - start);
         function indexOf(x:String, pattern:String) : Int =
-            x.IndexOf(pattern),
+            x.IndexOf(pattern);
         function replace(x:String, pattern:String, replacement:String) : String =
-            x.Replace(pattern, replacement),
+            x.Replace(pattern, replacement);
         function split(x:String, delimiter:String) : List(String) =
-            toList(x.Split(delimiter)),
+            toList(x.Split(delimiter));
         function join(sep:String, parts:List(String)) : String =
-            System.String.Join(sep, toArray(parts)),
-        function toLower(x:String) : String = x.ToLowerInvariant(),
-        function toUpper(x:String) : String = x.ToUpperInvariant(),
+            System.String.Join(sep, toArray(parts));
+        function toLower(x:String) : String = x.ToLowerInvariant();
+        function toUpper(x:String) : String = x.ToUpperInvariant();
         function trim(x:String) : String = x.Trim()
     };
 };
@@ -130,21 +130,21 @@ target dotnet {
 target js {
     instance StringLike(String) = {
         function concat(x:String, y:String) : String =
-            x + y,
+            x + y;
         function charLength(x:String) : Int =
-            x.length,
+            x.length;
         function substring(x:String, start:Int, end:Int) : String =
-            x.substring(start, end),
+            x.substring(start, end);
         function indexOf(x:String, pattern:String) : Int =
-            x.indexOf(pattern),
+            x.indexOf(pattern);
         function replace(x:String, pattern:String, replacement:String) : String =
-            x.replaceAll(pattern, replacement),
+            x.replaceAll(pattern, replacement);
         function split(x:String, delimiter:String) : List(String) =
-            toList(x.split(delimiter)),
+            toList(x.split(delimiter));
         function join(sep:String, parts:List(String)) : String =
-            toArray(parts).join(sep),
-        function toLower(x:String) : String = x.toLowerCase(),
-        function toUpper(x:String) : String = x.toUpperCase(),
+            toArray(parts).join(sep);
+        function toLower(x:String) : String = x.toLowerCase();
+        function toUpper(x:String) : String = x.toUpperCase();
         function trim(x:String) : String = x.trim()
     };
 };
@@ -156,21 +156,21 @@ target js {
 target native {
     instance StringLike(String) = {
         function concat(x:String, y:String) : String =
-            std_string_append(x, y),
+            std_string_append(x, y);
         function charLength(x:String) : Int =
-            utf8_char_count(x),
+            utf8_char_count(x);
         function substring(x:String, start:Int, end:Int) : String =
-            utf8_substr(x, start, end),
+            utf8_substr(x, start, end);
         function indexOf(x:String, pattern:String) : Int =
-            std_string_find(x, pattern),
+            std_string_find(x, pattern);
         function replace(x:String, pattern:String, replacement:String) : String =
-            std_string_replace_all(x, pattern, replacement),
+            std_string_replace_all(x, pattern, replacement);
         function split(x:String, delimiter:String) : List(String) =
-            c_strtok_split(x, delimiter),
+            c_strtok_split(x, delimiter);
         function join(sep:String, parts:List(String)) : String =
-            c_string_join(sep, parts),
-        function toLower(x:String) : String = icu_to_lower(x),
-        function toUpper(x:String) : String = icu_to_upper(x),
+            c_string_join(sep, parts);
+        function toLower(x:String) : String = icu_to_lower(x);
+        function toUpper(x:String) : String = icu_to_upper(x);
         function trim(x:String) : String = c_string_trim(x)
     };
 };
@@ -195,7 +195,7 @@ When the native platform uses a different representation for a type, `repr` decl
 repr Nat as Int default where {
     function toRepr(n:Nat) : Int = match
         | Z -> 0
-        | Succ(m) -> 1 + toRepr(m),
+        | Succ(m) -> 1 + toRepr(m);
     function fromRepr(i:Int) : Nat = match
         | 0 -> Z
         | n -> Succ(fromRepr(n - 1))
@@ -206,7 +206,7 @@ repr Nat as Int default where {
 
 ```tulam
 repr Array(Byte) as PackedBytes where {
-    function toRepr(xs:Array(Byte)) : PackedBytes = packBytes(xs),
+    function toRepr(xs:Array(Byte)) : PackedBytes = packBytes(xs);
     function fromRepr(bs:PackedBytes) : Array(Byte) = unpackBytes(bs)
 };
 ```
@@ -219,7 +219,7 @@ Repr declarations can also be target-qualified when the representation mapping d
 target dotnet {
     repr List(a) as System.Collections.Generic.List(a) where {
         function toRepr(xs:List(a)) : System.Collections.Generic.List(a) =
-            listToDotNetList(xs),
+            listToDotNetList(xs);
         function fromRepr(cs:System.Collections.Generic.List(a)) : List(a) =
             dotNetListToList(cs)
     };
@@ -227,7 +227,7 @@ target dotnet {
 
 target js {
     repr List(a) as Array(a) where {
-        function toRepr(xs:List(a)) : Array(a) = listToArray(xs),
+        function toRepr(xs:List(a)) : Array(a) = listToArray(xs);
         function fromRepr(arr:Array(a)) : List(a) = arrayToList(arr)
     };
 };
@@ -408,19 +408,19 @@ Putting it all together, here is the complete file structure for the StringLike 
 module Algebra.StringLike;
 
 algebra StringLike(s:Type) = {
-    function concat(x:s, y:s) : s,
-    function charLength(x:s) : Int,
-    function substring(x:s, start:Int, end:Int) : s,
-    function indexOf(x:s, pattern:s) : Int,
-    function replace(x:s, pattern:s, replacement:s) : s,
-    function split(x:s, delimiter:s) : List(s),
-    function join(sep:s, parts:List(s)) : s,
-    function toLower(x:s) : s,
-    function toUpper(x:s) : s,
-    function trim(x:s) : s,
+    function concat(x:s, y:s) : s;
+    function charLength(x:s) : Int;
+    function substring(x:s, start:Int, end:Int) : s;
+    function indexOf(x:s, pattern:s) : Int;
+    function replace(x:s, pattern:s, replacement:s) : s;
+    function split(x:s, delimiter:s) : List(s);
+    function join(sep:s, parts:List(s)) : s;
+    function toLower(x:s) : s;
+    function toUpper(x:s) : s;
+    function trim(x:s) : s;
 
     law concat_assoc(x:s, y:s, z:s) =
-        concat(concat(x, y), z) === concat(x, concat(y, z)),
+        concat(concat(x, y), z) === concat(x, concat(y, z));
     law split_join(x:s, d:s) =
         join(d, split(x, d)) === x
 };
@@ -437,20 +437,20 @@ module Algebra.StringLike.Instances;
 import Algebra.StringLike;
 
 instance StringLike(String) = {
-    function concat(x:String, y:String) : String = strConcat(x, y),
-    function charLength(x:String) : Int = strLength(x),
+    function concat(x:String, y:String) : String = strConcat(x, y);
+    function charLength(x:String) : Int = strLength(x);
     function substring(x:String, start:Int, end:Int) : String =
-        strSubstring(x, start, end),
+        strSubstring(x, start, end);
     function indexOf(x:String, pattern:String) : Int =
-        strIndexOf(x, pattern),
+        strIndexOf(x, pattern);
     function replace(x:String, pattern:String, replacement:String) : String =
-        strReplace(x, pattern, replacement),
+        strReplace(x, pattern, replacement);
     function split(x:String, delimiter:String) : List(String) =
-        strSplit(x, delimiter),
+        strSplit(x, delimiter);
     function join(sep:String, parts:List(String)) : String =
-        strJoin(sep, parts),
-    function toLower(x:String) : String = strToLower(x),
-    function toUpper(x:String) : String = strToUpper(x),
+        strJoin(sep, parts);
+    function toLower(x:String) : String = strToLower(x);
+    function toUpper(x:String) : String = strToUpper(x);
     function trim(x:String) : String = strTrim(x)
 };
 ```
@@ -469,20 +469,20 @@ import System target dotnet;
 target dotnet {
     instance StringLike(String) = {
         function concat(x:String, y:String) : String =
-            System.String.Concat(x, y),
-        function charLength(x:String) : Int = x.Length,
+            System.String.Concat(x, y);
+        function charLength(x:String) : Int = x.Length;
         function substring(x:String, start:Int, end:Int) : String =
-            x.Substring(start, end - start),
+            x.Substring(start, end - start);
         function indexOf(x:String, pattern:String) : Int =
-            x.IndexOf(pattern),
+            x.IndexOf(pattern);
         function replace(x:String, pattern:String, replacement:String) : String =
-            x.Replace(pattern, replacement),
+            x.Replace(pattern, replacement);
         function split(x:String, delimiter:String) : List(String) =
-            toList(x.Split(delimiter)),
+            toList(x.Split(delimiter));
         function join(sep:String, parts:List(String)) : String =
-            System.String.Join(sep, toArray(parts)),
-        function toLower(x:String) : String = x.ToLowerInvariant(),
-        function toUpper(x:String) : String = x.ToUpperInvariant(),
+            System.String.Join(sep, toArray(parts));
+        function toLower(x:String) : String = x.ToLowerInvariant();
+        function toUpper(x:String) : String = x.ToUpperInvariant();
         function trim(x:String) : String = x.Trim()
     };
 };

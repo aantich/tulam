@@ -330,7 +330,7 @@ instance Show InterpreterState where
         ++ " }"
 
 emptyIntState = InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -366,6 +366,9 @@ data CurrentFlags = CurrentFlags {
   , verbose   :: Bool -- verbose pass logging and timing
   , newStrings :: Bool -- true if string literals desugar to fromStringLiteral
   , optSettings :: OptFlags -- optimization pass settings
+  , checkPositivity   :: Bool -- positivity checking for inductive types
+  , checkTermination  :: Bool -- termination checking for recursive functions
+  , checkCoverage     :: Bool -- pattern match coverage checking
 } deriving Show
 
 -- Safety limits for evaluation
@@ -377,7 +380,7 @@ maxEvalDepth = 1000
 
 initializeInterpreter :: IO InterpreterState
 initializeInterpreter = return $ InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -431,7 +434,7 @@ traverseExprM f UNDEFINED = pure UNDEFINED
 traverseExprM f (Typed e1 e2) = Typed <$> (f e1) <*> (f e2)
 traverseExprM f (App e exs) = App <$> (f e) <*> (mapM f exs)
 traverseExprM f (PatternMatches exs) = PatternMatches <$> (mapM f exs)
-traverseExprM f (Tuple exs) = Tuple <$> (mapM f exs)
+traverseExprM f (NTuple fields) = NTuple <$> mapM (\(mn,e) -> (,) mn <$> f e) fields
 traverseExprM f (DeclBlock exs) = DeclBlock <$> (mapM f exs)
 traverseExprM f (Statements exs) = Statements <$> (mapM f exs)
 traverseExprM f (UnaryOp nm e) = UnaryOp <$> (pure nm) <*> (f e)
@@ -440,7 +443,7 @@ traverseExprM _ Intrinsic = pure Intrinsic
 traverseExprM _ Derive = pure Derive
 traverseExprM f (Repr nm tp def fns inv) = Repr nm <$> f tp <*> pure def <*> mapM f fns <*> traverse f inv
 traverseExprM f (ReprCast e tp) = ReprCast <$> f e <*> f tp
-traverseExprM f (ExprLiteralCheck lit ex) = ExprLiteralCheck lit <$> f ex
+traverseExprM f (PatternGuard pc ex) = PatternGuard pc <$> f ex
 -- Module system nodes
 traverseExprM _ e@(ModuleDecl _) = pure e
 traverseExprM _ e@(Import _ _ _) = pure e
@@ -453,7 +456,6 @@ traverseExprM _ e@(TargetSwitch _) = pure e
 traverseExprM f (ArrayLit exs) = ArrayLit <$> mapM f exs
 -- Record system nodes
 traverseExprM f (RecFieldAccess ac e) = RecFieldAccess ac <$> f e
-traverseExprM f (RecordLit fields) = RecordLit <$> mapM (\(n,e) -> (,) n <$> f e) fields
 traverseExprM f (RecordType fields isOpen) = (\fs -> RecordType fs isOpen) <$> mapM (\(n,e) -> (,) n <$> f e) fields
 traverseExprM f (RecordConstruct nm fields) = RecordConstruct nm <$> mapM (\(n,e) -> (,) n <$> f e) fields
 traverseExprM f (RecordUpdate e fields) = RecordUpdate <$> f e <*> mapM (\(n,ex) -> (,) n <$> f ex) fields
@@ -487,7 +489,7 @@ traverseExprM f (Binding (Var nm tp val)) = Binding <$> (Var nm <$> f tp <*> f v
 traverseExprM f (Instance nm targs impls reqs) = Instance nm <$> mapM f targs <*> mapM f impls <*> mapM f reqs
 traverseExprM f (IfThenElse c t e) = IfThenElse <$> f c <*> f t <*> f e
 traverseExprM f (LetIn binds bdy) = LetIn <$> mapM (\(v,ex) -> (,) v <$> f ex) binds <*> f bdy
-traverseExprM f (ArrowType e1 e2) = ArrowType <$> f e1 <*> f e2
+traverseExprM f (Pi mn e1 e2) = Pi mn <$> f e1 <*> f e2
 traverseExprM f (Implicit e) = Implicit <$> f e
 traverseExprM f (Value v ex) = Value v <$> f ex
 traverseExprM f (Constructors lams) = Constructors <$> mapM (\l -> do { b <- f (body l); pure (l { body = b }) }) lams

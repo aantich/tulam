@@ -248,16 +248,16 @@ A package is a **curated set of name-to-hash bindings** plus metadata. It is not
 
 ```json
 {
-  "name": "tulam-collections",
-  "author": "someone",
-  "description": "Sorted sets, balanced trees, priority queues",
+  "name": "tulam-collections";
+  "author": "someone";
+  "description": "Sorted sets, balanced trees, priority queues";
   "bindings": {
-    "Collections.SortedSet.SortedSet": "#aabb1122...",
-    "Collections.SortedSet.insert": "#ccdd3344...",
-    "Collections.SortedSet.lookup": "#eeff5566...",
-    "Collections.PriorityQueue.PQueue": "#ccdd9900...",
+    "Collections.SortedSet.SortedSet": "#aabb1122...";
+    "Collections.SortedSet.insert": "#ccdd3344...";
+    "Collections.SortedSet.lookup": "#eeff5566...";
+    "Collections.PriorityQueue.PQueue": "#ccdd9900...";
     "Collections.PriorityQueue.push": "#eeff1122..."
-  },
+  };
   "structure-deps": {
     "Algebra.Ord": "#5678efgh..."
   }
@@ -293,9 +293,9 @@ A lock file is a complete, flattened name-to-hash mapping for every transitive d
 ```json
 {
   "resolved": {
-    "Algebra.Semigroup.combine": "#aabb11...",
-    "Algebra.Semigroup.Semigroup": "#ccdd22...",
-    "Collections.SortedSet.insert": "#ccdd3344...",
+    "Algebra.Semigroup.combine": "#aabb11...";
+    "Algebra.Semigroup.Semigroup": "#ccdd22...";
+    "Collections.SortedSet.insert": "#ccdd3344...";
     ...
   }
 }
@@ -394,7 +394,7 @@ An **instance set** is a named, coherent collection of instance bindings. Every 
 ```json
 {
   "instance-set": {
-    "Ord\0MyType": "#instance-hash-1",
+    "Ord\0MyType": "#instance-hash-1";
     "Eq\0MyType":  "#instance-hash-2"
   }
 }
@@ -437,11 +437,11 @@ The content hash is computed from the **backend-neutral** portion of the definit
 
 ```
 store/objects/ab/cd1234... = {
-  "hash": "#abcd1234...",
-  "ast": <normalized surface AST>,
+  "hash": "#abcd1234...";
+  "ast": <normalized surface AST>;
   "backends": {
-    "dotnet": <.NET-specific CLM or codegen output>,
-    "js":     <JS-specific codegen output>,
+    "dotnet": <.NET-specific CLM or codegen output>;
+    "js":     <JS-specific codegen output>;
     "native": <native-specific codegen output>
   }
 }
@@ -611,10 +611,10 @@ No changes to the syntax. The dependency system is invisible in normal code.
 
 ```json
 {
-  "name": "my-app",
+  "name": "my-app";
   "deps": {
     "tulam-collections": "#manifest:e4a7b2c1d3f5..."
-  },
+  };
   "instance-set": {}
 }
 ```
@@ -624,11 +624,11 @@ No changes to the syntax. The dependency system is invisible in normal code.
 ```json
 {
   "resolved": {
-    "Collections.SortedSet.SortedSet": "#def:a1b2c3d4...",
-    "Collections.SortedSet.insert":    "#def:e5f6a7b8...",
-    "Collections.SortedSet.member":    "#def:c9d0e1f2...",
-    "Algebra.Ord.Ord":                 "#def:11223344...",
-    "Algebra.Ord.compare":             "#def:55667788...",
+    "Collections.SortedSet.SortedSet": "#def:a1b2c3d4...";
+    "Collections.SortedSet.insert":    "#def:e5f6a7b8...";
+    "Collections.SortedSet.member":    "#def:c9d0e1f2...";
+    "Algebra.Ord.Ord":                 "#def:11223344...";
+    "Algebra.Ord.compare":             "#def:55667788...";
     "Algebra.Eq.Eq":                   "#def:99aabbcc..."
   }
 }

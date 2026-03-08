@@ -131,9 +131,9 @@ instance Show(Int) = {
 };
 
 instance Num(Nat) = {
-    function (+)(x:Nat, y:Nat) : Nat = plus(x, y),
-    function (-)(x:Nat, y:Nat) : Nat = minus(x, y),
-    function (*)(x:Nat, y:Nat) : Nat = mult(x, y),
+    function (+)(x:Nat, y:Nat) : Nat = plus(x, y);
+    function (-)(x:Nat, y:Nat) : Nat = minus(x, y);
+    function (*)(x:Nat, y:Nat) : Nat = mult(x, y);
     function fromInt(n:Int) : Nat = intToNat(n)
 };
 ```
@@ -175,51 +175,51 @@ Example entries:
 
 ```tulam
 algebra Num(a:Type) extends Eq(a), Ord(a) = {
-    function (+)(x:a, y:a) : a,
-    function (-)(x:a, y:a) : a,
-    function (*)(x:a, y:a) : a,
-    function negate(x:a) : a,
-    function abs(x:a) : a,
-    function fromInt(n:Int) : a,
+    function (+)(x:a, y:a) : a;
+    function (-)(x:a, y:a) : a;
+    function (*)(x:a, y:a) : a;
+    function negate(x:a) : a;
+    function abs(x:a) : a;
+    function fromInt(n:Int) : a;
 
     -- Default implementations
-    function negate(x:a) : a = fromInt(0) - x,
-    function abs(x:a) : a = if x >= fromInt(0) then x else negate(x),
+    function negate(x:a) : a = fromInt(0) - x;
+    function abs(x:a) : a = if x >= fromInt(0) then x else negate(x);
 
     -- Laws (optimization licenses)
-    law addAssociative(x:a, y:a, z:a) = (x + (y + z)) === ((x + y) + z),
-    law addCommutative(x:a, y:a) = (x + y) === (y + x),
-    law mulAssociative(x:a, y:a, z:a) = (x * (y * z)) === ((x * y) * z),
-    law mulDistributive(x:a, y:a, z:a) = (x * (y + z)) === (x * y + x * z),
-    law addIdentity(x:a) = (x + fromInt(0)) === x,
+    law addAssociative(x:a, y:a, z:a) = (x + (y + z)) === ((x + y) + z);
+    law addCommutative(x:a, y:a) = (x + y) === (y + x);
+    law mulAssociative(x:a, y:a, z:a) = (x * (y * z)) === ((x * y) * z);
+    law mulDistributive(x:a, y:a, z:a) = (x * (y + z)) === (x * y + x * z);
+    law addIdentity(x:a) = (x + fromInt(0)) === x;
     law mulIdentity(x:a) = (x * fromInt(1)) === x
 };
 
 algebra Integral(a:Type) extends Num(a) = {
-    function div(x:a, y:a) : a,
-    function mod(x:a, y:a) : a,
-    function toInt(x:a) : Int,
+    function div(x:a, y:a) : a;
+    function mod(x:a, y:a) : a;
+    function toInt(x:a) : Int;
 
     law divMod(x:a, y:a) = (div(x, y) * y + mod(x, y)) === x
 };
 
 algebra Fractional(a:Type) extends Num(a) = {
-    function (/)(x:a, y:a) : a,
-    function recip(x:a) : a,
-    function fromFloat(x:Float64) : a,
+    function (/)(x:a, y:a) : a;
+    function recip(x:a) : a;
+    function fromFloat(x:Float64) : a;
 
     function recip(x:a) : a = fromFloat(1.0) / x
 };
 
 algebra Floating(a:Type) extends Fractional(a) = {
-    function sqrt(x:a) : a,
-    function exp(x:a) : a,
-    function log(x:a) : a,
-    function sin(x:a) : a,
-    function cos(x:a) : a,
-    function tan(x:a) : a,
-    function pow(x:a, y:a) : a,
-    function pi() : a,
+    function sqrt(x:a) : a;
+    function exp(x:a) : a;
+    function log(x:a) : a;
+    function sin(x:a) : a;
+    function cos(x:a) : a;
+    function tan(x:a) : a;
+    function pow(x:a, y:a) : a;
+    function pi() : a;
 
     function tan(x:a) : a = sin(x) / cos(x)
 };
@@ -229,12 +229,12 @@ algebra Floating(a:Type) extends Fractional(a) = {
 
 ```tulam
 algebra Bits(a:Type) = {
-    function (.&.)(x:a, y:a) : a,     -- AND
-    function (.|.)(x:a, y:a) : a,     -- OR
-    function xor(x:a, y:a) : a,       -- XOR
-    function complement(x:a) : a,     -- NOT
-    function shiftL(x:a, n:Int) : a,  -- left shift
-    function shiftR(x:a, n:Int) : a,  -- right shift
+    function (.&.)(x:a, y:a) : a;     -- AND
+    function (.|.)(x:a, y:a) : a;     -- OR
+    function xor(x:a, y:a) : a;       -- XOR
+    function complement(x:a) : a;     -- NOT
+    function shiftL(x:a, n:Int) : a;  -- left shift
+    function shiftR(x:a, n:Int) : a;  -- right shift
     function bitSize(x:a) : Int       -- number of bits
 };
 
@@ -283,7 +283,7 @@ instance Semigroup(a) requires Num(a) = {
     function combine(x:a, y:a) : a = x + y
 };
 instance Monoid(a) requires Num(a) = {
-    function combine(x:a, y:a) : a = x + y,
+    function combine(x:a, y:a) : a = x + y;
     value empty = fromInt(0)
 };
 ```
@@ -338,9 +338,9 @@ For a type `T` to accept integer literals, it needs `Num(T)` which includes `fro
 record Complex = { re:Float64, im:Float64 };
 
 instance Num(Complex) = {
-    function fromInt(n:Int) : Complex = Complex(fromInt(n), 0.0),
+    function fromInt(n:Int) : Complex = Complex(fromInt(n), 0.0);
     function (+)(x:Complex, y:Complex) : Complex =
-        Complex(x.re + y.re, x.im + y.im),
+        Complex(x.re + y.re, x.im + y.im);
     -- ...
 };
 
@@ -359,8 +359,8 @@ z + 1                    -- Complex(43.0, 0.0)
 
 ```tulam
 repr <UserType> as <ReprType> [default] where {
-    function toRepr(x:<UserType>) : <ReprType>,
-    function fromRepr(x:<ReprType>) : <UserType>,
+    function toRepr(x:<UserType>) : <ReprType>;
+    function fromRepr(x:<ReprType>) : <UserType>;
     [invariant(x:<ReprType>) = <Bool expression>]
 };
 ```
@@ -375,10 +375,10 @@ type Nat = Z | Succ(n:Nat);
 repr Nat as Int default where {
     function toRepr(n:Nat) : Int =
         match | Z -> 0
-              | Succ(m) -> 1 + toRepr(m),
+              | Succ(m) -> 1 + toRepr(m);
     function fromRepr(i:Int) : Nat =
         match | 0 -> Z
-              | n -> Succ(fromRepr(n - 1)),
+              | n -> Succ(fromRepr(n - 1));
     invariant(i:Int) = i >= 0
 };
 ```
@@ -391,7 +391,7 @@ type Color = RGBA(r:Byte, g:Byte, b:Byte, a:Byte);
 repr Color as UInt32 where {
     function toRepr(c:Color) : UInt32 =
         (widen(c.r) .<<. 24) .|. (widen(c.g) .<<. 16)
-            .|. (widen(c.b) .<<. 8) .|. widen(c.a),
+            .|. (widen(c.b) .<<. 8) .|. widen(c.a);
     function fromRepr(i:UInt32) : Color =
         RGBA(truncate(i .>>. 24), truncate(i .>>. 16),
              truncate(i .>>. 8), truncate(i))
@@ -406,15 +406,15 @@ repr Nat as Int default where { ... };
 
 -- Network-friendly: compact UInt32
 repr Nat as UInt32 where {
-    function toRepr(n:Nat) : UInt32 = truncate(natToInt(n)),
-    function fromRepr(i:UInt32) : Nat = intToNat(widen(i)),
+    function toRepr(n:Nat) : UInt32 = truncate(natToInt(n));
+    function fromRepr(i:UInt32) : Nat = intToNat(widen(i));
     invariant(i:UInt32) = i <= 2147483647
 };
 
 -- GPU-friendly: Int32
 repr Nat as Int32 where {
-    function toRepr(n:Nat) : Int32 = truncate(natToInt(n)),
-    function fromRepr(i:Int32) : Nat = intToNat(widen(i)),
+    function toRepr(n:Nat) : Int32 = truncate(natToInt(n));
+    function fromRepr(i:Int32) : Nat = intToNat(widen(i));
     invariant(i:Int32) = i >= 0
 };
 ```
@@ -445,7 +445,7 @@ The `repr` declaration supports parameterized types as the user type:
 
 ```tulam
 repr Array(Byte) as PackedBytes where {
-    function toRepr(a:Array(Byte)) : PackedBytes = ...,
+    function toRepr(a:Array(Byte)) : PackedBytes = ...;
     function fromRepr(p:PackedBytes) : Array(Byte) = ...
 };
 ```
@@ -492,9 +492,9 @@ instance Num(Int) = intrinsic;
 
 -- The compiler could auto-derive (if the user doesn't provide one):
 instance Num(Nat) = {
-    function (+)(x:Nat, y:Nat) : Nat = fromRepr(toRepr(x) + toRepr(y)),
-    function (*)(x:Nat, y:Nat) : Nat = fromRepr(toRepr(x) * toRepr(y)),
-    function fromInt(n:Int) : Nat = fromRepr(n),
+    function (+)(x:Nat, y:Nat) : Nat = fromRepr(toRepr(x) + toRepr(y));
+    function (*)(x:Nat, y:Nat) : Nat = fromRepr(toRepr(x) * toRepr(y));
+    function fromInt(n:Int) : Nat = fromRepr(n);
     -- ... etc
 };
 
@@ -561,17 +561,17 @@ GPU/SIMD acceleration is NOT hard-coded to Array. It's governed by an open algeb
 
 ```tulam
 algebra Bulk(c:Type1) extends Functor(c), Foldable(c) = {
-    function length(xs:c(a)) : Int,
-    function index(xs:c(a), i:Int) : a,
-    function generate(n:Int, f:Int -> a) : c(a),
-    function fromArray(xs:Array(a)) : c(a),
-    function toArray(xs:c(a)) : Array(a),
+    function length(xs:c(a)) : Int;
+    function index(xs:c(a), i:Int) : a;
+    function generate(n:Int, f:Int -> a) : c(a);
+    function fromArray(xs:Array(a)) : c(a);
+    function toArray(xs:c(a)) : Array(a);
 
     -- Laws that license parallelism
     law indexMap(f:a -> b, xs:c(a), i:Int) =
-        index(fmap(f, xs), i) === f(index(xs, i)),
+        index(fmap(f, xs), i) === f(index(xs, i));
     law generateLength(n:Int, f:Int -> a) =
-        length(generate(n, f)) === n,
+        length(generate(n, f)) === n;
     law roundtrip(xs:c(a)) =
         fromArray(toArray(xs)) === xs
 };
@@ -585,11 +585,11 @@ instance Bulk(Array) = intrinsic;
 type Matrix(a:Type) = MatrixImpl(rows:Int, cols:Int, data:Array(a));
 
 instance Bulk(Matrix) = {
-    function length(m:Matrix(a)) : Int = m.rows * m.cols,
-    function index(m:Matrix(a), i:Int) : a = index(m.data, i),
-    function fmap(f, m) = MatrixImpl(m.rows, m.cols, fmap(f, m.data)),
-    function generate(n, f) = MatrixImpl(n, 1, generate(n, f)),
-    function toArray(m) = m.data,
+    function length(m:Matrix(a)) : Int = m.rows * m.cols;
+    function index(m:Matrix(a), i:Int) : a = index(m.data, i);
+    function fmap(f, m) = MatrixImpl(m.rows, m.cols, fmap(f, m.data));
+    function generate(n, f) = MatrixImpl(n, 1, generate(n, f));
+    function toArray(m) = m.data;
     function fromArray(xs) = MatrixImpl(length(xs), 1, xs)
 };
 ```
@@ -649,26 +649,26 @@ SIMD-specific operations beyond lane-wise arithmetic:
 ```tulam
 algebra Lane(v:Type1) = {
     -- Broadcast
-    function splat(x:a) : v(a),
+    function splat(x:a) : v(a);
 
     -- Lane access
-    function extract(xs:v(a), i:Int) : a,
-    function insert(xs:v(a), i:Int, x:a) : v(a),
+    function extract(xs:v(a), i:Int) : a;
+    function insert(xs:v(a), i:Int, x:a) : v(a);
 
     -- Permutation
-    function shuffle(xs:v(a), ys:v(a), mask:v(Int32)) : v(a),
+    function shuffle(xs:v(a), ys:v(a), mask:v(Int32)) : v(a);
 
     -- Horizontal operations (cross-lane reductions)
-    function hsum(xs:v(a)) : a requires Num(a),
-    function hmin(xs:v(a)) : a requires Ord(a),
-    function hmax(xs:v(a)) : a requires Ord(a),
+    function hsum(xs:v(a)) : a requires Num(a);
+    function hmin(xs:v(a)) : a requires Ord(a);
+    function hmax(xs:v(a)) : a requires Ord(a);
 
     -- Comparison (returns lane mask)
-    function cmpEq(xs:v(a), ys:v(a)) : v(Int32) requires Eq(a),
-    function cmpLt(xs:v(a), ys:v(a)) : v(Int32) requires Ord(a),
+    function cmpEq(xs:v(a), ys:v(a)) : v(Int32) requires Eq(a);
+    function cmpLt(xs:v(a), ys:v(a)) : v(Int32) requires Ord(a);
 
     -- Masked operations
-    function blend(mask:v(Int32), xs:v(a), ys:v(a)) : v(a),
+    function blend(mask:v(Int32), xs:v(a), ys:v(a)) : v(a);
 
     -- Width
     function lanes(xs:v(a)) : Int
@@ -871,19 +871,19 @@ type Nat = Z | Succ(n:Nat);
 repr Nat as Int default where {
     function toRepr(n:Nat) : Int =
         match | Z -> 0
-              | Succ(m) -> 1 + toRepr(m),
+              | Succ(m) -> 1 + toRepr(m);
     function fromRepr(i:Int) : Nat =
         match | 0 -> Z
-              | n -> Succ(fromRepr(n - 1)),
+              | n -> Succ(fromRepr(n - 1));
     invariant(i:Int) = i >= 0
 };
 
 instance Num(Nat) = {
-    function (+)(x:Nat, y:Nat) : Nat = plus(x, y),
-    function (*)(x:Nat, y:Nat) : Nat = mult(x, y),
-    function (-)(x:Nat, y:Nat) : Nat = minus(x, y),
-    function fromInt(n:Int) : Nat = fromRepr(n),
-    function negate(x:Nat) : Nat = Z,    -- Nat can't be negative
+    function (+)(x:Nat, y:Nat) : Nat = plus(x, y);
+    function (*)(x:Nat, y:Nat) : Nat = mult(x, y);
+    function (-)(x:Nat, y:Nat) : Nat = minus(x, y);
+    function fromInt(n:Int) : Nat = fromRepr(n);
+    function negate(x:Nat) : Nat = Z;    -- Nat can't be negative
     function abs(x:Nat) : Nat = x
 };
 

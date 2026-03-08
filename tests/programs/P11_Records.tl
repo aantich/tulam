@@ -28,3 +28,19 @@ function isOrigin(p:Point) : Bool = match
 // Color using named construction
 function red() : Color = Color { r = 255, g = 0, b = 0 };
 function getR(c:Color) : Int = c.r;
+
+// Sum-of-records: type alias unions that inherit record fields
+record Rect = { w:Int, h:Int };
+record Circle = { radius:Int };
+type Shape = Rect | Circle;
+
+function area(s:Shape) : Int = match
+    | Rect(w, h) -> w * h
+    | Circle(r) -> r * r * 3;
+
+function shapeArea1() : Int = area(Rect(10, 20));
+function shapeArea2() : Int = area(Circle(5));
+
+// Structural subtyping: nominal record passed to structural-typed function
+function getXStructural(p: {x:Int, y:Int}) : Int = p.x;
+function structTest() : Int = getXStructural(Point(3, 4));

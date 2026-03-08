@@ -148,7 +148,7 @@ pStructureWith keyword kind = do
     }
     return $ Structure (str{body = DeclBlock exs}) si
 
--- Parse structure members: comma-separated items with optional trailing derive block.
+-- Parse structure members: semicolon-separated items with optional trailing derive block.
 -- Returns (items, deriveBlock) where items are functions/laws/values and
 -- deriveBlock is the contents of an optional derive { ... } block.
 parseStructMembers :: Parser ([Expr], [Expr])
@@ -166,15 +166,15 @@ parseStructMembers = do
 
     parseMoreItems :: Parser ([Expr], [Expr])
     parseMoreItems = do
-        -- Try comma followed by derive block or more items
-        mComma <- option Nothing (Just <$> try (reservedOp ","))
-        case mComma of
+        -- Try semicolon followed by derive block or more items
+        mSemi <- option Nothing (Just <$> try (reservedOp ";"))
+        case mSemi of
             Nothing -> return ([], []) -- no more items
             Just _ -> do
-                -- After comma: either derive block or another item
+                -- After semicolon: either derive block or another item
                 mDerive <- option Nothing $ try $ Just <$> do
                     reserved "derive"
-                    braces (sepBy (try pValue <|> try pFuncOrDecl) (reservedOp ","))
+                    braces (sepEndBy (try pValue <|> try pFuncOrDecl) (reservedOp ";"))
                 case mDerive of
                     Just db -> return ([], db)
                     Nothing -> do
@@ -287,8 +287,8 @@ pRepr = do
     isDefault <- option False (reserved "default" >> return True)
     reserved "where"
     (fns, inv) <- braces $ do
-        funcs <- sepBy1 (try pFunc) (reservedOp ",")
-        inv <- optionMaybe (try (reservedOp "," >> pReprInvariant))
+        funcs <- sepEndBy1 (try pFunc) (reservedOp ";")
+        inv <- optionMaybe (try pReprInvariant)
         return (funcs, inv)
     return $ Repr userTypeExpr reprType isDefault fns inv
 
@@ -354,7 +354,7 @@ pClassDecl = do
 -- Parse method list inside class body, collecting method modifiers
 pClassMethodList :: Parser ([Expr], [(Name, MethodModifier)])
 pClassMethodList = do
-    items <- sepBy pClassMember (reservedOp ",")
+    items <- sepEndBy pClassMember (reservedOp ";")
     let methods = map fst items
     let mods = [(n, m) | (_, Just (n, m)) <- items]
     return (methods, mods)
@@ -379,7 +379,7 @@ pInstance = do
     reservedOp "="
     exs <- try (reserved "intrinsic" >> return [Intrinsic])
            <|> try (reserved "derive" >> return [Derive])
-           <|> braces (sepBy (try pValue <|> try pFunc) (reservedOp ","))
+           <|> braces (sepEndBy (try pValue <|> try pFunc) (reservedOp ";"))
     return $ Instance name targs exs reqs
 
 -- FUNCTIONS ---------------------------------------------------------
@@ -416,7 +416,7 @@ pFuncL = do
 pWhereClause :: Parser [(Var, Expr)]
 pWhereClause = do
     reserved "where"
-    braces (sepBy1 pWhereBinding (reservedOp ","))
+    braces (sepEndBy1 pWhereBinding (reservedOp ";"))
 
 pWhereBinding :: Parser (Var, Expr)
 pWhereBinding = try pWhereFn <|> pWhereVal
@@ -584,7 +584,7 @@ pEffectDecl = do
     name <- uIdentifier
     ps <- try pVars <|> pure []
     reservedOp "="
-    ops <- braces (sepBy pFuncDecl (reservedOp ","))
+    ops <- braces (sepEndBy pFuncDecl (reservedOp ";"))
     return $ EffectDecl name ps ops
 
 -- handler StdConsole : Console = { function readLine() = intrinsic, ... };
@@ -597,7 +597,7 @@ pHandlerDecl = do
     reservedOp ":"
     effName <- uIdentifier
     reservedOp "="
-    impls <- braces (sepBy pHandlerMember (reservedOp ","))
+    impls <- braces (sepEndBy pHandlerMember (reservedOp ";"))
     return $ HandlerDecl name effName ps impls
 
 -- Parse a handler member: either a let binding or a function
@@ -640,7 +640,7 @@ pAction = do
     tp <- typeSignature
     reservedOp "="
     -- Try new-style action block with <- support first, fall back to legacy
-    stmts <- braces (sepBy1 pActionStmt (reservedOp ","))
+    stmts <- braces (sepEndBy1 pActionStmt (reservedOp ";"))
     -- Check if any statement uses <- (new-style) or all are legacy
     let hasBinds = any isActionBind stmts
     let psi = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
@@ -699,7 +699,7 @@ pActionLetStmt = do
 pActionBlockExpr :: Parser Expr
 pActionBlockExpr = do
     reserved "action"
-    stmts <- braces (sepBy1 pActionStmt (reservedOp ","))
+    stmts <- braces (sepEndBy1 pActionStmt (reservedOp ";"))
     return $ ActionBlock stmts
     
 
@@ -734,14 +734,35 @@ typeSignature = try strictTypeSignature <|> pure UNDEFINED
 concreteType :: Parser Expr
 concreteType = pTypeArrow
 
--- Arrow types: a -> b -> c (right-associative)
+-- Pi types: (x:A) -> B(x) (dependent) or A -> B (non-dependent), right-associative
 pTypeArrow :: Parser Expr
-pTypeArrow = do
+pTypeArrow = try pDependentPi <|> pSimpleArrow
+
+-- Dependent Pi: (x:A) -> B(x)
+-- Disambiguated by: lowercase identifier followed by ':' inside parens, then '->'
+pDependentPi :: Parser Expr
+pDependentPi = do
+    (nm, domTy) <- parens $ do
+        nm <- identifier
+        Control.Monad.guard (not (null nm) && isLowerFirst nm)
+        reservedOp ":"
+        ty <- concreteType
+        return (nm, ty)
+    reservedOp "->"
+    body <- pTypeArrow  -- right-associative
+    return $ Pi (Just nm) domTy body
+  where
+    isLowerFirst (c:_) = c >= 'a' && c <= 'z' || c == '_'
+    isLowerFirst _     = False
+
+-- Non-dependent arrow: A -> B -> C
+pSimpleArrow :: Parser Expr
+pSimpleArrow = do
     lhs <- pTypeApp
     rest <- optionMaybe (reservedOp "->" >> pTypeArrow)
     case rest of
         Nothing  -> return lhs
-        Just rhs -> return $ ArrowType lhs rhs
+        Just rhs -> return $ Pi Nothing lhs rhs
 
 -- Type application: Vec(a, n), Maybe(a), or bare name/universe
 -- Also: Eff { label: Type, ... | r } ResultType
@@ -761,7 +782,8 @@ pTypeApp = try pEffTypeApp
             Nothing   -> return $ Id nm
             Just args -> return $ App (Id nm) args
     )
-    <|> try (Lit . LTuple <$> braces (sepBy1 concreteType (reservedOp ",")))  -- tuple types {a, b}
+    <|> try pRecordTypeExpr  -- record types in type position: {x:Int, y:Bool} or {x:Int, ..}
+    <|> try (braces (sepBy1 concreteType (reservedOp ",")) >>= \es -> return $ Lit (LNTuple (map (\e -> (Nothing, e)) es)))  -- tuple types {a, b}
     <|> parens concreteType
 
 -- Eff { label: Type, ... | r } ResultType
@@ -825,19 +847,19 @@ charVal = do
 pContainers :: Parser Expr
 pContainers =
         try (brackets (commaSep pExpr) >>= return . ArrayLit)
-        <|> try pRecordLitExpr
+        <|> try pNamedTupleExpr
         <|> try pRecordTypeExpr
-        <|> try (braces (commaSep pExpr) >>= return . Lit . LTuple)
+        <|> try (braces (commaSep pExpr) >>= \es -> return $ NTuple (map (\e -> (Nothing, e)) es))
         <|> (angles (commaSep pExpr) >>= return . Lit . LVec)
 
--- Record literal: { name = expr, name2 = expr2 }
--- Distinguished from tuple by "name =" pattern
-pRecordLitExpr :: Parser Expr
-pRecordLitExpr = braces $ do
-    fields <- sepBy1 pRecordLitField (reservedOp ",")
-    return $ RecordLit fields
+-- Named tuple / record literal: { name = expr, name2 = expr2 }
+-- Distinguished from positional tuple by "name =" pattern
+pNamedTupleExpr :: Parser Expr
+pNamedTupleExpr = braces $ do
+    fields <- sepBy1 pNamedField (reservedOp ",")
+    return $ NTuple (map (\(n,e) -> (Just n, e)) fields)
   where
-    pRecordLitField = do
+    pNamedField = do
         nm <- identifier
         reservedOp "="
         val <- pExpr

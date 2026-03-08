@@ -31,7 +31,7 @@ import GHC.Generics (Generic)
 -- | Cache format version. Bump this when Environment/CLM/Surface types change
 -- to auto-invalidate stale caches.
 cacheVersion :: Int
-cacheVersion = 2
+cacheVersion = 6  -- v6: consolidated standard library (69 files -> 13 files)
 
 -- | Cached module: an Environment slice + metadata for freshness checking.
 data ModuleCache = ModuleCache
@@ -74,7 +74,8 @@ readModuleCache modKey = do
     exists <- doesFileExist path
     if not exists then return Nothing
     else do
-        bytes <- BL.readFile path
+        strict <- BS.readFile path
+        let bytes = BL.fromStrict strict
         case decodeOrFail bytes of
             Left _ -> return Nothing
             Right (_, _, mc)

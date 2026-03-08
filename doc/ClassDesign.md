@@ -23,7 +23,7 @@ At the CLM level, objects are plain `CLMCON` values. Method dispatch is a new `C
 
 ```tulam
 class Animal(name:String, age:Int) = {
-    function speak(self:Animal) : String,
+    function speak(self:Animal) : String;
 
     function info(self:Animal) : String =
         self.name ++ " (age " ++ show(self.age) ++ ")"
@@ -41,7 +41,7 @@ class Animal(name:String, age:Int) = {
 
 ```tulam
 class Dog(breed:String) extends Animal = {
-    override function speak(self:Dog) : String = "Woof!",
+    override function speak(self:Dog) : String = "Woof!";
 
     function fetch(self:Dog, item:String) : String =
         self.name ++ " fetches " ++ item
@@ -97,7 +97,7 @@ Explicit super-args are only needed when the parent constructor signature differ
 
 ```tulam
 abstract class Shape(color:String) = {
-    function area(self:Shape) : Float64,         // abstract
+    function area(self:Shape) : Float64; // abstract
     function describe(self:Shape) : String =     // concrete
         "A " ++ self.color ++ " shape"
 };
@@ -132,10 +132,10 @@ Target mapping:
 ```tulam
 class Circle(radius:Float64) extends Shape implements Eq, Show = {
     override function area(self:Circle) : Float64 =
-        3.14159 * self.radius * self.radius,
+        3.14159 * self.radius * self.radius;
 
     function (==)(self:Circle, other:Circle) : Bool =
-        self.radius == other.radius,
+        self.radius == other.radius;
 
     function show(self:Circle) : String =
         "Circle(r=" ++ show(self.radius) ++ ")"
@@ -233,7 +233,7 @@ Each becomes a `ClassMeta` entry. Properties become field+method pairs. Interfac
 import System.Windows.Forms target dotnet;
 
 class CounterForm() extends Form("Counter App") = {
-    private counterRef : Ref(Int) = newRef(0),
+    private counterRef : Ref(Int) = newRef(0);
 
     function setupUI(self:CounterForm) : Unit = action {
         let label = Label.new();
@@ -250,7 +250,7 @@ class CounterForm() extends Form("Counter App") = {
             label.Text = show(count)
         });
         self.Controls.Add(btn)
-    },
+    };
 
     override function OnLoad(self:CounterForm, e:EventArgs) : Unit = action {
         self.setupUI();
@@ -346,7 +346,7 @@ data MethodModifier = MNone | MOverride | MFinal | MStatic
 data ClassInfo = ClassInfo {
     classParent      :: Maybe (Name, [Expr]),  -- parent name + super constructor args
     classImplements  :: [Expr],                -- algebra names: Eq, Show, etc.
-    classModifier    :: ClassModifier,
+    classModifier    :: ClassModifier;
     classExtern      :: Maybe Name             -- Just "dotnet" | Just "js" | Just "native" | Nothing
 } deriving (Show, Eq)
 
@@ -369,11 +369,11 @@ Method lambdas carry their modifier via a naming convention or a new field:
 
 -- Option B: Add modifier to Lambda (cleaner but more invasive)
 data Lambda = Lambda {
-    lamName    :: Name,
-    params     :: Record,
-    body       :: Expr,
-    lamType    :: Expr,
-    lamSrcInfo :: SourceInfo,
+    lamName    :: Name;
+    params     :: Record;
+    body       :: Expr;
+    lamType    :: Expr;
+    lamSrcInfo :: SourceInfo;
     lamMod     :: MethodModifier    -- NEW (default MNone for non-class methods)
 } deriving (Show, Eq)
 ```
@@ -439,22 +439,22 @@ data ClassMeta = ClassMeta {
 
 ```haskell
 data Environment = Environment {
-    types           :: NameMap Expr,
-    constructors    :: NameMap (Lambda, Int),
-    topLambdas      :: NameMap Lambda,
-    topBindings     :: NameMap Var,
-    clmLambdas      :: NameMap CLMLam,
-    clmBindings     :: NameMap CLMVar,
-    instanceLambdas :: NameMap Lambda,
-    clmInstances    :: NameMap CLMLam,
-    structInheritance :: NameMap [Name],
-    reprMap         :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)],
-    effectDecls     :: NameMap ([Var], [Lambda]),
-    effectHandlers  :: NameMap (Name, [Expr]),
+    types           :: NameMap Expr;
+    constructors    :: NameMap (Lambda, Int);
+    topLambdas      :: NameMap Lambda;
+    topBindings     :: NameMap Var;
+    clmLambdas      :: NameMap CLMLam;
+    clmBindings     :: NameMap CLMVar;
+    instanceLambdas :: NameMap Lambda;
+    clmInstances    :: NameMap CLMLam;
+    structInheritance :: NameMap [Name];
+    reprMap         :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)];
+    effectDecls     :: NameMap ([Var], [Lambda]);
+    effectHandlers  :: NameMap (Name, [Expr]);
     classDecls      :: NameMap ClassMeta,        -- NEW: class hierarchy
     classTagCounter :: !Int,                     -- NEW: global class tag allocator
-    outProgram      :: NameMap String,
-    rawCLMLambdas   :: NameMap CLMLam,
+    outProgram      :: NameMap String;
+    rawCLMLambdas   :: NameMap CLMLam;
     rawCLMInstances :: NameMap CLMLam
 } deriving Show
 ```
@@ -941,7 +941,7 @@ instance Printable(Animal) = {
 
 // Or via `implements` shorthand
 class Dog(...) extends Animal implements Printable = {
-    override function speak(self:Dog) : String = "Woof!",
+    override function speak(self:Dog) : String = "Woof!";
     function print(self:Dog) : String = self.speak()
 };
 ```
@@ -954,7 +954,7 @@ Mutation in classes goes through the effect system:
 class Counter(countRef:Ref(Int)) = {
     function increment(self:Counter) : Unit = action {
         modifyRef(self.countRef, \n -> n + 1)
-    },
+    };
     function get(self:Counter) : Int = readRef(self.countRef)
 };
 

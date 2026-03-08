@@ -483,8 +483,7 @@ evalCLM i e@(CLMIAP (CLMID funcNm) exs) = do
                                             let mTypeNames = inferTypeNames env exs'
                                             trace $ "  inferred types: " ++ show mTypeNames
                                             case mTypeNames of
-                                                Just typeNames -> do
-                                                    let firstType = Prelude.head typeNames
+                                                Just typeNames@(firstType:_) -> do
                                                     -- CHECK INTRINSICS FIRST
                                                     case lookupIntrinsic funcNm firstType of
                                                         Just intrinsicFn -> case intrinsicFn exs' of
@@ -600,7 +599,9 @@ dispatchInstance env funcNm typeNames exs' = do
                                 _ -> do
                                     trace $ "No instance found for " ++ funcNm ++ ", using default"
                                     case Map.lookup funcNm (clmLambdas env) of
-                                        Just clmLam -> pure $ applyCLMLam clmLam [CLMID (Prelude.head typeNames)]
+                                        Just clmLam -> case typeNames of
+                                            (t:_) -> pure $ applyCLMLam clmLam [CLMID t]
+                                            []    -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
                                         Nothing -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
 
 -- Infer the type name from a CLM expression by looking at constructor tags
@@ -658,7 +659,7 @@ resultMatchesHint :: Environment -> CLMExpr -> Name -> Bool
 resultMatchesHint env (CLMCON (ConsTag consName _) _) typeName =
     case lookupTypeOfConstructor consName env of
         Just actualType -> actualType == typeName
-        Nothing -> True  -- can't determine type, assume match
+        Nothing -> False  -- can't determine type, don't assume match — trigger re-dispatch
 resultMatchesHint _ (CLMLIT (LInt _)) typeName = typeName == "Int"
 resultMatchesHint _ (CLMLIT (LFloat _)) typeName = typeName == "Float64"
 resultMatchesHint _ (CLMLIT (LString _)) typeName = typeName == "String"
@@ -1014,9 +1015,7 @@ dispatchArrayHOF "foldl" [CLMLAM lam, acc, CLMARRAY xs] = do
         let app = applyCLMLam lam [a, x]
         r <- evalCLM 0 app
         _contEval 1 app r) acc xs
-    case result of
-        CLMERR _ _ -> pure $ Just result
-        _        -> pure $ Just result
+    pure $ Just result
 -- foldr(f, acc, arr) — right fold over array
 dispatchArrayHOF "foldr" [CLMLAM lam, acc, CLMARRAY xs] = do
     result <- foldrM (\x a -> do

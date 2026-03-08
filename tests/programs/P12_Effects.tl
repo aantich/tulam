@@ -2,19 +2,19 @@
 
 // Test 1: Effect declaration parsing
 effect Console = {
-    function readLine() : String,
+    function readLine() : String;
     function putStrLn(s:String) : Unit
 };
 
 // Test 2: Another effect declaration
 effect FileIO = {
-    function readFile(path:String) : String,
+    function readFile(path:String) : String;
     function writeFile(path:String, content:String) : Unit
 };
 
 // Test 3: Handler declaration
 handler StdConsole : Console = {
-    function readLine() = intrinsic,
+    function readLine() = intrinsic;
     function putStrLn(s) = intrinsic
 };
 

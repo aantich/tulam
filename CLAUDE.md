@@ -66,13 +66,13 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - **Implicit parameters**: Structure (typeclass) functions generate implicit-parameter functions, e.g. `(+) [a:Type] (x:a,y:a):a`. Instance declarations expand the case body.
 - **Type-dependent functions execute at compile time only**: Only value-dependent simply-typed functions survive to runtime; type-dependent dispatch is resolved during compilation.
 - **Expression traversal**: `traverseExpr` (pure) and `traverseExprM` (monadic/stateful) for AST transformations throughout passes.
-- **Universe hierarchy**: `U 0` = `Type` (types of values), `U 1` = `Type1` (kinds / type constructors), `U 2` = `Type2`, etc. `pattern Type = U 0` provides backward compatibility. Levels are carried but not yet enforced.
+- **Universe hierarchy**: `U 0` = `Type` (types of values), `U 1` = `Type1` (kinds / type constructors), `U 2` = `Type2`, etc. `pattern Type = U 0` provides backward compatibility. **Cumulativity**: `U n` unifies with `U m` when `n ≤ m` (types lift upward). Type-level computation uses `evalCLMPure` (pure CLM evaluator reusing `applyCLMLam`/`resolveCases`). `normalizeTy` in TypeCheck.hs normalizes after dependent substitution and on unification failure. Future: explicit Level polymorphism (Option C).
 - **Categorical structure vocabulary**: `algebra` (single-type structure, e.g. Monoid), `morphism` (multi-type structure, e.g. Convertible), with `functor` and `natural` planned for when HKT support lands. Monad, Category, Arrow are standard library structures, not keywords. See `doc/CategoricalDesign.md` for full design.
 - **Primitive types**: `primitive` keyword declares machine-level types with no constructors (Int, Float64, String, Char). Operations come through algebra instances.
 - **Intrinsics**: `intrinsic` keyword marks compiler-provided implementations. Works at instance level (`instance Num(Int) = intrinsic;`) or function level. The intrinsic registry in `src/Intrinsics.hs` maps `(funcName, typeName)` to Haskell evaluation functions. Intrinsics are checked before normal instance lookup in CLMIAP dispatch.
 - **Repr system**: `repr UserType as ReprType` declares a representation mapping. Stored in `reprMap` in `InterpreterState`. `toRepr`/`fromRepr` are registered as implicit-param wrapper lambdas + instance lambdas. `expr as Type` (`ReprCast`) resolves direction in `exprToCLM` using the repr map.
-- **Arrow types**: `a -> b` parses in all type positions via `pTypeArrow` (right-associative). `ArrowType Expr Expr` in AST. Erased to `CLMEMPTY` at CLM conversion — type-level only, no runtime representation. Used in Functor/Monad signatures.
-- **Type checker**: Bidirectional type checking (infer/check) with row polymorphism for records. Internal type representation (`Ty`) is separate from Surface AST. Unification uses HashMap-based substitution with occurs check. Structure constraints (`CStructure`) are emitted for implicit-param functions and resolved against `instanceLambdas`. Permissive mode (default): type errors are warnings; `strictTypes` flag makes them fatal. `RecordLit` and `RecordType` added to Surface AST for `{name = val}` and `{name:Type}` syntax.
+- **Pi types (dependent functions)**: `a -> b` (non-dependent) and `(x:A) -> B(x)` (dependent) parse in all type positions via `pTypeArrow` (right-associative). `Pi (Maybe Name) Expr Expr` in AST; `pattern ArrowType a b = Pi Nothing a b` for backward compat. Erased to `CLMEMPTY` at CLM conversion. `lamToTy` preserves param names as `TPi (Just name)`. `inferApp` substitutes bound variables on dependent application. Pattern synonyms `ExprConsTagCheck`/`ExprLiteralCheck` map to unified `PatternGuard PatternCheck Expr`. `Prim`/`PrimCall` removed (use `Function`+`Intrinsic`).
+- **Type checker**: Bidirectional type checking (infer/check) with row polymorphism for records. Internal type representation (`Ty`) is separate from Surface AST. Unification uses HashMap-based substitution with occurs check. Structure constraints (`CStructure`) are emitted for implicit-param functions and resolved against `instanceLambdas`. Permissive mode (default): type errors are warnings; `strictTypes` flag makes them fatal. `NTuple [(Maybe Name, Expr)]` unifies tuples and record literals — positional `{1,2}` and named `{x=1,y=2}`. Pattern synonyms `Tuple`, `RecordLit`, `LTuple` for backward compat. `RecordType` remains separate for structural record types with open rows.
 - **Class system (OOP)**: First-class classes with single inheritance, dynamic method dispatch, and abstract/sealed modifiers. `ClassDecl Lambda ClassInfo` in Surface AST. Objects are plain `CLMCON` (no vtable) — method dispatch is tag-based via `ClassMeta.cmMethods` in Environment. `CLMMCALL obj methodName args` dispatches by looking up the object's ConsTag class name in `classDecls`, finding the method in the pre-merged methods HashMap (includes inherited methods). Fields layout is parent-first, own-last. `extends` for single inheritance. `abstract` prevents instantiation. `sealed` restricts subclasses to same source file; `cmSourceFile` tracks origin; `checkSealedExhaustiveness` warns on incomplete pattern matches. `implements` auto-generates algebra instances from class methods (matching by name), falls back to derive blocks. `override`/`final`/`static` method modifiers. `targetImports` stores `import ... target ...` declarations for codegen-time extern class resolution (stub in `MetadataResolver.hs`). Designed for 1-1 mapping to .NET/JS/C++ classes in codegen. See `doc/ClassDesign.md`.
 
 ### Design Documents
@@ -80,35 +80,41 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `doc/ClassDesign.md` — First-class OOP: classes, inheritance, extern subclassing, 1-1 codegen mapping
 - `doc/InteropDesign.md` — .NET/JS/C++ interop: imports, type mapping, null/exception handling
 - `doc/CategoricalDesign.md` — Categorical type system design (algebras, morphisms, functors, monads, categories, arrows)
+- `doc/ConcurrencyDesign.md` — Effect-based structured concurrency: async/await, channels, STM, actors, parallel combinators
 - `doc/ImplementationPlan.md` — 14-phase incremental implementation roadmap from current state to full categorical type system
+- `doc/SigmaDesign.md` — Sigma types & telescopes: dependent pairs, existentials, relationship to existing systems
+- `doc/SigmaCoreChanges.md` — Sigma types: detailed CLM and TypeChecker changes required
 - `doc/PrimitiveDesign.md` — Primitive types, intrinsics, repr system, SIMD, GPU acceleration design
 - `doc/RecordDesign.md` — Record system design (nominal, structural, spread, functions-as-fields)
 - `doc/LanguageReference.md` — Full language reference documentation
 
 ### Data Files
 
-- `lib/` — Modular standard library. REPL loads all modules from here via `loadModuleTree "lib/Base.tl"`.
+- `lib/` — Consolidated standard library (13 files). REPL loads all modules from here via `loadModuleTree "lib/Base.tl"`.
   - `lib/Prelude.tl` — Primitive type declarations only (Int, Float64, String, Char, Int8-64, UInt8-64, Float32, Byte, Array). Loaded first.
-  - `lib/Base.tl` — Umbrella module that re-exports all 34 submodules.
-  - `lib/Algebra/` — Semigroup, Additive, Multiplicative, Ring, Floating, Absolute, Bits, StringOps, Eq, Ord
-  - `lib/Core/` — Bool, Ordering, Nat, Maybe, Either, List, Combinators, Instances
-  - `lib/Numeric/` — Int, Int/Fixed, UInt, Float, Conversion, String
-  - `lib/HKT/` — Functor, Applicative, Monad, Instances
-  - `lib/Morphism/` — Convertible
-  - `lib/Collection/` — Array
-  - `lib/SIMD/` — Vec, Lane
-  - `lib/Repr/` — Nat (repr Nat as Int)
+  - `lib/Core.tl` — Pure algebraic data types: Bool, Unit, Ordering, Nat, Maybe, Either, List, Pair, NonEmpty, Tree, combinators (id, const, compose, flip, apply). No algebra imports.
+  - `lib/Algebra.tl` — All algebra definitions: Semigroup, Monoid, Group, Additive, Multiplicative, Ring, Field, Floating, Absolute, Bits, StringOps, Eq, Ord, Show, Bounded, Enum, Hashable, Lattice, StringExt, StringLike.
+  - `lib/Morphism.tl` — Multi-type structures: Convertible, Embed, Iso.
+  - `lib/Instances.tl` — ALL instance declarations: reflection intrinsics, Core type instances, numeric intrinsic instances, Show/Bounded/Enum/Hashable/Lattice instances, numeric conversions.
+  - `lib/HKT.tl` — Higher-kinded types: Functor, Applicative, Monad + instances.
+  - `lib/Collection.tl` — Array higher-order functions (Functor/Applicative/Monad instances).
+  - `lib/Effect.tl` — Effect declarations and handlers: Console, FileIO, Exception, State.
+  - `lib/Mutable.tl` — Mutable references: Ref, MutArray.
+  - `lib/SIMD.tl` — SIMD vector types and Lane algebra.
+  - `lib/Repr.tl` — Representation mappings: Nat as Int.
+  - `lib/Str.tl` — Str type: UTF-8 encoded immutable strings, codec, algebra instances, StringLike, FromString.
+  - `lib/Base.tl` — Umbrella module that re-exports all 11 submodules.
 - `parsertests.tl` — Parser test cases.
 
 ## Language Conventions
 
 - Type and constructor names must start with a capital letter.
 - `#` suffix denotes legacy built-in operations (e.g., `print#`). New approach uses `intrinsic` keyword instead.
-- Semicolons terminate top-level declarations.
+- **Separator rule**: Semicolons = declaration/statement separators (top-level, structure/instance/class/effect/handler/where/derive/action bodies). Commas = data separators (args, tuples, record fields, let bindings). Trailing semicolons are allowed in declaration blocks.
 - Sum types use pipe-separated syntax: `type Bool = True | False;` (not curly braces).
 - Pattern matching uses `match` keyword with pipes: `match | pat1 -> expr1 | pat2 -> expr2`. Inline form: `match expr | pat -> body`.
 - `match` is a **reserved word**.
-- `{ }` braces are reserved exclusively for records and declaration blocks (structures, instances, repr where-clauses).
+- `{ }` braces are used for NTuples (positional `{1,2}` and named `{x=1,y=2}`), record types, and declaration blocks (structures, instances, repr where-clauses).
 - `structure` = typeclasses, `instance` = typeclass instances, `record` = single-constructor product type sugar.
 - `primitive` = machine-level type declaration, `intrinsic` = compiler-provided implementation body.
 - `algebra`/`trait` = single-type structures, `morphism`/`bridge` = multi-type structures.

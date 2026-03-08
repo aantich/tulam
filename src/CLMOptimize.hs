@@ -116,7 +116,7 @@ freeVarsCLM (CLMARRAY exs)  = Set.unions (Prelude.map freeVarsCLM exs)
 freeVarsCLM (CLMAPP f exs)  = Set.union (freeVarsCLM f) (Set.unions (Prelude.map freeVarsCLM exs))
 freeVarsCLM (CLMIAP f exs)  = Set.union (freeVarsCLM f) (Set.unions (Prelude.map freeVarsCLM exs))
 freeVarsCLM (CLMPAP f exs)  = Set.union (freeVarsCLM f) (Set.unions (Prelude.map freeVarsCLM exs))
-freeVarsCLM (CLMBIND nm ex) = Set.insert nm (freeVarsCLM ex)
+freeVarsCLM (CLMBIND nm ex) = Set.delete nm (freeVarsCLM ex)
 freeVarsCLM (CLMFieldAccess _ ex) = freeVarsCLM ex
 freeVarsCLM (CLMPROG exs)   = Set.unions (Prelude.map freeVarsCLM exs)
 freeVarsCLM (CLMTYPED e1 e2) = Set.union (freeVarsCLM e1) (freeVarsCLM e2)
@@ -166,6 +166,10 @@ isPureCLM :: CLMExpr -> Bool
 isPureCLM (CLMIAP _ _)  = False  -- may dispatch to IO
 isPureCLM (CLMPROG _)   = False  -- sequential effects
 isPureCLM (CLMERR _ _)  = False  -- errors
+isPureCLM (CLMMCALL _ _ _) = False  -- dynamic dispatch (may have side effects)
+isPureCLM (CLMSCALL _ _ _) = False  -- super dispatch (may have side effects)
+isPureCLM (CLMNEW _ _)  = False  -- construction (may have side effects)
+isPureCLM (CLMHANDLE _ _ _ _) = False  -- effect handler (inherently effectful)
 isPureCLM (CLMAPP f exs) = isPureCLM f && Prelude.all isPureCLM exs
 isPureCLM (CLMCON _ exs) = Prelude.all isPureCLM exs
 isPureCLM (CLMARRAY exs) = Prelude.all isPureCLM exs
@@ -180,6 +184,8 @@ isPureCLM (CLMFieldAccess _ ex) = isPureCLM ex
 isPureCLM (CLMTYPED e _) = isPureCLM e
 isPureCLM (CLMBIND _ ex) = isPureCLM ex
 isPureCLM (CLMPAP f exs) = isPureCLM f && Prelude.all isPureCLM exs
+isPureCLM (CLMREF _)    = True   -- ref handle is a value
+isPureCLM (CLMMUTARRAY _) = True -- mut array handle is a value
 
 -- | Check if a CLM expression is a fully evaluated value
 isValueCLM :: CLMExpr -> Bool
@@ -279,34 +285,40 @@ constantFold = go
         -- Don't fold inside type-directed dispatch annotations;
         -- the inner CLMIAP must survive to runtime for dispatch
         CLMTYPED inner hint -> CLMTYPED inner hint
-        -- Binary intrinsic on two literals
+        -- Binary intrinsic on two literals (CLMIAP dispatch)
         CLMIAP (CLMID funcNm) [CLMLIT a, CLMLIT b] ->
-            tryFoldBinary funcNm a b
-        -- Unary intrinsic on one literal
+            tryFoldBinary funcNm a b (CLMIAP (CLMID funcNm) [CLMLIT a, CLMLIT b])
+        -- Unary intrinsic on one literal (CLMIAP dispatch)
         CLMIAP (CLMID funcNm) [CLMLIT a] ->
-            tryFoldUnary funcNm a
+            tryFoldUnary funcNm a (CLMIAP (CLMID funcNm) [CLMLIT a])
+        -- Binary intrinsic on two literals (CLMAPP direct call)
+        CLMAPP (CLMID funcNm) [CLMLIT a, CLMLIT b] ->
+            tryFoldBinary funcNm a b (CLMAPP (CLMID funcNm) [CLMLIT a, CLMLIT b])
+        -- Unary intrinsic on one literal (CLMAPP direct call)
+        CLMAPP (CLMID funcNm) [CLMLIT a] ->
+            tryFoldUnary funcNm a (CLMAPP (CLMID funcNm) [CLMLIT a])
         -- Recurse
         _ -> descendCLM go expr
 
-    tryFoldBinary funcNm a b =
+    tryFoldBinary funcNm a b fallback =
         let typeName = literalTypeName a
         in case typeName of
             Just tn -> case lookupIntrinsic funcNm tn of
                 Just intrFn -> case intrFn [CLMLIT a, CLMLIT b] of
                     Just result -> result
-                    Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a, CLMLIT b]
-                Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a, CLMLIT b]
-            Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a, CLMLIT b]
+                    Nothing -> fallback
+                Nothing -> fallback
+            Nothing -> fallback
 
-    tryFoldUnary funcNm a =
+    tryFoldUnary funcNm a fallback =
         let typeName = literalTypeName a
         in case typeName of
             Just tn -> case lookupIntrinsic funcNm tn of
                 Just intrFn -> case intrFn [CLMLIT a] of
                     Just result -> result
-                    Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a]
-                Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a]
-            Nothing -> CLMIAP (CLMID funcNm) [CLMLIT a]
+                    Nothing -> fallback
+                Nothing -> fallback
+            Nothing -> fallback
 
 -- | Determine the type name for a literal (for intrinsic lookup)
 literalTypeName :: Literal -> Maybe Name

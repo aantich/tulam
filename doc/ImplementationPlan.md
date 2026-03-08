@@ -39,7 +39,30 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 **What works:** Parsing sum types, functions with pattern matching, structures (typeclasses), instance declarations, actions, records with spread syntax, if/then/else, let/in, algebra/morphism/trait/bridge keywords, structure inheritance (extends), value declarations, law declarations, primitive type declarations, intrinsic instances, **anonymous lambdas** (`\x -> expr`), **first-class functions** (functions as values, passed to/returned from other functions), **common ADTs** (Maybe, Either, List with utility functions and Semigroup/Monoid instances), **combinators** (id, const, apply, compose, flip), **automated morphism composition** (transitive instances auto-derived with cycle detection), **parameterized type instances** (e.g., `Semigroup(List(a))`), **unary minus** (`-3` dispatches to `negate`), **Floating math** (sqrt, sin, cos, tan, exp, log, asin, acos, atan, pow, pi), **Bits algebra** (.&., .|., xor, complement, shiftL, shiftR, bitSize for Int), **String operations** (concat, length, Eq/Ord for String), **Int↔Float64 conversions** (toFloat, toInt, recip), **repr system** (`repr UserType as ReprType [default] where { ... }` + `expr as Type` casting), **higher-kinded types** (Functor, Applicative, Monad algebras on Type1 with instances for Maybe and List — `fmap(not, Just(True))` → `Just(False)`, `bind(Just(x), f)` → `f(x)`, List monad flatMap), **module system** (module/import/export/open/private/opaque with dependency resolution), **expanded numeric primitives** (Int8-64, UInt8-64, Float32 with full intrinsic support), **arrays** (Array(a) with length/index/slice), **SIMD type declarations** (Vec2/4/8/16 with Lane algebra stubs). Environment building handles types, constructors, lambdas, instance-specialized functions, primitive types, intrinsic expansion, morphism composition, repr registration, and module resolution. Case optimization expands patterns into constructor tag checks. CLM conversion produces simply-typed IR, including repr cast direction resolution and CLMARRAY. Interpreter evaluates: function application (including first-class), constructor matching, field access, literals, action sequences, pattern match cases, **implicit parameter dispatch** (CLMIAP) with intrinsic-first lookup (including nullary intrinsics) and partial type inference for HKT dispatch, partial application (CLMPAP), and lambda values (CLMLAM).
 
-**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion + Phase 13.3 (Type-Test Patterns + Downcast) + Phase 13.6 (TC Subtyping) + Minimal Definition Checking + Parameterized Derive + Requires Enforcement + Effect Handler Runtime COMPLETE.** 720 automated hspec tests all passing.
+**Phases 1–9 + Phase 9.5 + Phase 9.6 + Phase 10.1–10.2 (Reflection + Derive) + Phase 10.3 (Type-Directed Dispatch) + Phase 11 Type Checker + Module System + Primitive Type Expansion + Phase 13.3 (Type-Test Patterns + Downcast) + Phase 13.6 (TC Subtyping) + Minimal Definition Checking + Parameterized Derive + Requires Enforcement + Effect Handler Runtime + Universe-Polymorphic Core + GADT Support COMPLETE.** 849 automated hspec tests all passing.
+
+**Universe-Polymorphic Core Language (completed):**
+- Level polymorphism: `Level = LConst Int | LVar Name | LSucc Level | LMax Level Level` in Surface.hs
+- `CLMU Level` replaces `CLMU Int` in CLM IR, with level normalization in `evalCLMPure`
+- `TU Level` + `TLevel` in type checker, with cumulativity (`U n ≤ U m` when `n ≤ m`)
+- Pi/Sigma type shadowing fixes in `substTyVar`, alpha-renaming in `unify'`
+- `freeRigidVars` for existential escape checking
+- Sigma type normalization with dependent substitution
+- Type constructors registered as type-level functions in `topLambdas` for kind checking
+- Full GADT support: parser, `infer (ConTuple ...)` with fresh-var instantiation, `gadtRefine` for pattern match type refinement, `applyGADTRefinements` for branch body refinement
+- Cache version bumped to v4 for new AST constructors
+- Design doc: `doc/CoreDesign.md` (includes positivity/termination checking design notes)
+- Test: `tests/programs/P34_PiTypes.tl` (8 runtime + 6 parser + 8 TC + 12 normalizer tests)
+- Test: `tests/programs/P35_GADTs.tl` (7 runtime + 6 TC unit tests)
+
+**Safety Passes (completed):**
+- Positivity checking (Pass 2.1): strict positivity of inductive types — type must not appear in negative position (function domain)
+- Termination checking (Pass 3.1): structural recursion check — at least one arg must decrease in recursive calls
+- Coverage checking (Pass 2.3): pattern match exhaustiveness — all constructors covered or wildcard present
+- All three passes are optional via `CurrentFlags` (`checkPositivity`, `checkTermination`, `checkCoverage`)
+- REPL commands: `:s positivity on/off`, `:s termination on/off`, `:s coverage on/off`
+- All enabled by default. Emit warnings (not errors) consistent with permissive mode.
+- Tests: 19 unit tests covering positive/negative cases + flag disable + stdlib integration
 
 **Parameterized Derive (completed):**
 - `derive` on parameterized types (Maybe, List, Pair, Triple, etc.) works via reflection — `structuralEq`/`structuralCompare`/`structuralShow` recurse into fields using CLMIAP dispatch which infers concrete types at runtime.
@@ -130,7 +153,7 @@ This is the single most important missing piece. Everything in the categorical d
 
 ```tulam
 instance Eq(Nat) = {
-    function ==(x:Nat, y:Nat) : Bool = eq(x,y),
+    function ==(x:Nat, y:Nat) : Bool = eq(x,y);
     function !=(x:Nat, y:Nat) : Bool = not(eq(x,y))
 };
 ```
@@ -472,7 +495,7 @@ Add `extends` as reserved word. Modify structure/algebra parsing:
 
 ```tulam
 structure Ord(a:Type) extends Eq(a) = {
-    function compare(x:a, y:a) : Ordering,
+    function compare(x:a, y:a) : Ordering;
     function <(x:a, y:a) : Bool = ...
 };
 ```
@@ -761,7 +784,7 @@ Deferred to codegen. When the compiler knows `repr Nat as Int`:
    repr Nat as Int default where {
        function toRepr(n:Nat) : Int = match
            | Z -> 0
-           | Succ(m) -> 1 + toRepr(m),
+           | Succ(m) -> 1 + toRepr(m);
        function fromRepr(i:Int) : Nat = if i == 0 then Z else Succ(fromRepr(i - 1))
    };
    ```
@@ -821,11 +844,11 @@ exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
 ```tulam
 algebra Functor(f:Type1) = { function fmap(g: a -> b, x:f(a)) : f(b) };
 algebra Applicative(f:Type1) extends Functor(f) = {
-    function pure(x:a) : f(a),
+    function pure(x:a) : f(a);
     function ap(ff:f(a -> b), fa:f(a)) : f(b)
 };
 algebra Monad(m:Type1) extends Applicative(m) = {
-    function bind(x:m(a), f: a -> m(b)) : m(b),
+    function bind(x:m(a), f: a -> m(b)) : m(b);
     function then(x:m(a), y:m(b)) : m(b)
 };
 
@@ -910,7 +933,7 @@ Add `effect`, `handler`, `handle` to reserved words. Parse effect declarations:
 
 ```tulam
 effect Console = {
-    function readLine() : String,
+    function readLine() : String;
     function putStrLn(s:String) : Unit
 };
 ```
@@ -925,8 +948,8 @@ Parse `action` blocks with `<-` for monadic bind:
 
 ```tulam
 action main() = {
-    name <- readLine(),
-    greeting = "Hello, " ++ name,
+    name <- readLine();
+    greeting = "Hello, " ++ name;
     putStrLn(greeting)
 };
 // Desugars to: bind(readLine(), \name -> let greeting = ... in bind(putStrLn(greeting), \_ -> pure(())))
@@ -954,14 +977,14 @@ Eff { console: Console | r } Unit                  // open row (effect-polymorph
 
 ```tulam
 handler StdConsole : Console = {
-    function readLine() = intrinsic,
+    function readLine() = intrinsic;
     function putStrLn(s) = intrinsic
 };
 
 // Parameterized handler with let bindings
 handler RefState(init:a) : State = {
-    let state = newRef(init),
-    function get() = readRef(state),
+    let state = newRef(init);
+    function get() = readRef(state);
     function put(x) = writeRef(state, x)
 };
 
@@ -1033,11 +1056,11 @@ Implementation: `dispatchReflectionIntrinsic` in `src/Interpreter.hs`, wired int
 
 ```tulam
 algebra Eq(a:Type) = {
-    function (==)(x:a, y:a) : Bool,
-    function (!=)(x:a, y:a) : Bool = not(x == y),
+    function (==)(x:a, y:a) : Bool;
+    function (!=)(x:a, y:a) : Bool = not(x == y);
 
     derive {
-        function (==)(x, y:a) : Bool = structuralEq(x, y),
+        function (==)(x, y:a) : Bool = structuralEq(x, y);
         function (!=)(x, y:a) : Bool = not(structuralEq(x, y))
     }
 };
@@ -1108,12 +1131,12 @@ The `~>` notation is useful documentation but provides no runtime benefit withou
 
 ```tulam
 algebra Category(arr:Type2) = {
-    function id() : arr(a, a),
+    function id() : arr(a, a);
     function compose(f:arr(b,c), g:arr(a,b)) : arr(a,c)
 };
 
 algebra Arrow(arr:Type2) extends Category(arr) = {
-    function arr(f: a -> b) : arr(a, b),
+    function arr(f: a -> b) : arr(a, b);
     function first(f:arr(a,b)) : arr({a,c}, {b,c})
 };
 ```
@@ -1136,12 +1159,12 @@ instance Num(Vec4(Float32)) = intrinsic;
 instance Num(Vec8(Float32)) = intrinsic;
 
 algebra Lane(v:Type1) = {
-    function splat(x:a) : v(a),
-    function extract(xs:v(a), i:Int) : a,
-    function hsum(xs:v(a)) : a requires Num(a),
-    function hmin(xs:v(a)) : a requires Ord(a),
-    function hmax(xs:v(a)) : a requires Ord(a),
-    function blend(mask:v(Int32), xs:v(a), ys:v(a)) : v(a),
+    function splat(x:a) : v(a);
+    function extract(xs:v(a), i:Int) : a;
+    function hsum(xs:v(a)) : a requires Num(a);
+    function hmin(xs:v(a)) : a requires Ord(a);
+    function hmax(xs:v(a)) : a requires Ord(a);
+    function blend(mask:v(Int32), xs:v(a), ys:v(a)) : v(a);
     function lanes(xs:v(a)) : Int
 };
 
@@ -1653,3 +1676,4 @@ Replaced the hard-coded 3-level `buildExpressionParser` with a Pratt parser and 
 | 13 | Planned | High | Class hierarchy, dynamic dispatch, extern integration |
 | 14 | Future | Very High | Codegen backends (.NET/JS/C++), metadata readers |
 | 12 | Future | Very High | GPU codegen, memory model, kernel fusion |
+| Sigma Types | Planned | Medium-High | Telescopes, dependent pairs, existentials — see `doc/SigmaDesign.md` and `doc/SigmaCoreChanges.md` |

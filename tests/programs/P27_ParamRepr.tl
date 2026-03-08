@@ -9,7 +9,7 @@ function unwrapPacked(p:PackedInts) : Array(Int) = match
 
 // Parameterized repr: Array(Int) maps to PackedInts
 repr Array(Int) as PackedInts where {
-    function toRepr(a:Array(Int)) : PackedInts = PackedInts(a),
+    function toRepr(a:Array(Int)) : PackedInts = PackedInts(a);
     function fromRepr(p:PackedInts) : Array(Int) = unwrapPacked(p)
 };
 

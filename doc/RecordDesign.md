@@ -73,7 +73,7 @@ Since functions are first-class values, any record can contain function fields:
 
 ```tulam
 record Counter = {
-    count : Nat,
+    count : Nat;
     step  : Nat
 };
 
@@ -100,15 +100,15 @@ Functions can also be fields of the record itself, creating "object-like" record
 
 ```tulam
 record Widget = {
-    label : String,
-    render(self:Widget) : String,
+    label : String;
+    render(self:Widget) : String;
     onClick(self:Widget) : Widget
 };
 
 // Different widgets can have different render/onClick behavior:
 let button = Widget {
-    label = "OK",
-    render(self) = concat#("<button>", self.label, "</button>"),
+    label = "OK";
+    render(self) = concat#("<button>", self.label, "</button>");
     onClick(self) = self { label = "Clicked!" }  // record update
 };
 ```
@@ -260,14 +260,14 @@ record Point = { x:Nat, y:Nat };
 
 // A structure: product of FUNCTIONS parameterized over types, with laws
 algebra Monoid(a:Type) = {
-    empty : a,                        // can be a value field!
-    combine(x:a, y:a) : a,
+    empty : a;                        // can be a value field!
+    combine(x:a, y:a) : a;
     law assoc(x:a,y:a,z:a) = combine(x,combine(y,z)) === combine(combine(x,y),z)
 };
 
 // An instance: a record VALUE satisfying the structure
 instance Monoid(Nat) = {
-    empty = Z,
+    empty = Z;
     combine(x:Nat, y:Nat) : Nat = plus(x, y)
 };
 ```

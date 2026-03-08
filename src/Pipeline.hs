@@ -152,7 +152,7 @@ desugarAction e = e
 -- expr, rest          =>  seq(expr, rest)  i.e. bind(expr, \_ -> rest)
 -- expr (last)         =>  expr
 desugarActionStmts :: [ActionStmt] -> Expr
-desugarActionStmts [] = App (Id "pure") [Tuple []]  -- pure(())
+desugarActionStmts [] = App (Id "pure") [NTuple []]  -- pure(())
 desugarActionStmts [ActionExpr e] = e
 desugarActionStmts [ActionBind nm e] = e  -- last statement is bind — just return the expr
 desugarActionStmts [ActionLet nm e] = e   -- last statement is let — just return the expr
@@ -257,20 +257,43 @@ processBinding (Function lam, si) env
     | otherwise = pure $ addLambda (lamName lam) lam env
 -- treating actions the same way - they will have some proper type eventually anyway
 processBinding (Action lam, si) env = pure $ addLambda (lamName lam) lam env
--- primitive functions
-processBinding (Prim lam, si) env = pure $ addLambda (lamName lam) lam env
+-- (Prim removed — legacy primitive functions use Function + Intrinsic instead)
 
 -- now extracting constructors from SumTypes, body is guaranteed to be
 -- a list of Lambdas under Constructors constructor
 processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _)), si) env = do
     -- resolve any spread fields (..Name) in constructor params
     let cons' = Prelude.map (resolveSpreadFields env) cons
-    let newCons = imap fixCons cons'
+    -- For constructors with no args that match existing record types, inherit their fields.
+    -- This allows: record Rect = {w:Int, h:Int}; type Shape = Rect | Circle;
+    -- to create Shape with Rect(w:Int, h:Int) | Circle(radius:Int)
+    let cons'' = Prelude.map (inheritRecordFields env) cons'
+    let newCons = imap fixCons cons''
     let newTp = SumType lam { body = Constructors newCons }
-    pure $ addManyNamedConstructors 0 newCons (addNamedSumType newTp env)
+    -- Register type constructor as a type-level function in topLambdas.
+    -- For type Maybe(a:Type) = ..., register Maybe : (a:Type) -> Type
+    -- This enables kind checking via evalCLMPure/normalizeTy.
+    -- The body constructs a type application node: App (Id typName) [Id a, ...]
+    let typeLevelLam = if Prelude.null typArgs
+            then Nothing  -- no params → no function to register (it's just a Type)
+            else
+                let retBody = App (Id typName) (Prelude.map (\v -> Id (name v)) typArgs)
+                in Just $ (mkLambda typName typArgs retBody (U 0)) { lamSrcInfo = lamSrcInfo lam }
+    let env1 = addManyNamedConstructors 0 newCons (addNamedSumType newTp env)
+    pure $ case typeLevelLam of
+        Just tll -> addLambda typName tll env1
+        Nothing  -> env1
     where fixCons i lam@(Lambda nm args ex typ _) = if (ex /= UNDEFINED)
             then lam
             else lam { body = ConTuple (ConsTag nm i) $ Prelude.map (\v -> Id $ name v) args}
+          -- If a constructor has no args and its name matches an existing record constructor,
+          -- inherit that record's fields so the sum type variant carries the same data.
+          inheritRecordFields e cl@(Lambda nm args _ _ _)
+            | Prelude.null args, body cl == UNDEFINED
+            , Just (recLam, _tag) <- lookupConstructor nm e
+            , not (Prelude.null (params recLam))
+            = cl { params = params recLam }
+            | otherwise = cl
 
 -- CLASS declarations
 processBinding (ClassDecl lam cinfo, si) env = do
@@ -1192,8 +1215,8 @@ varToCLMVar e v = (name v, exprToCLM e (val v))
 varsToCLMVars e vs = Prelude.map (varToCLMVar e) vs
 
 patternCheckToCLM :: Environment -> Expr -> CLMPatternCheck
-patternCheckToCLM e (ExprConsTagCheck ct ex) = CLMCheckTag ct (exprToCLM e ex)
-patternCheckToCLM e (ExprLiteralCheck lit ex) = CLMCheckLit lit (exprToCLM e ex)
+patternCheckToCLM e (PatternGuard (PCheckTag ct) ex) = CLMCheckTag ct (exprToCLM e ex)
+patternCheckToCLM e (PatternGuard (PCheckLit lit) ex) = CLMCheckLit lit (exprToCLM e ex)
 patternCheckToCLM e ex = CLMCheckTag (ConsTag "ERROR" (-1)) (CLMERR ("Invalid pattern check: " ++ show ex) SourceInteractive)
 
 exprToCLM :: Environment -> Expr -> CLMExpr
@@ -1231,7 +1254,6 @@ exprToCLM env (RecFieldAccess (nm, -1) e) | nm /= "" =
                     Nothing       -> CLMFieldAccess (nm, -1) clmE  -- defer to interpreter
 exprToCLM env (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLM env e)
 exprToCLM env (ExpandedCase cases ex si) = CLMCASE (Prelude.map (patternCheckToCLM env) cases) (exprToCLM env ex)
-exprToCLM env PrimCall = CLMPRIMCALL
 exprToCLM env Intrinsic = CLMPRIMCALL
 exprToCLM env Derive = CLMPRIMCALL
 exprToCLM env (ConTuple cs exs) = CLMCON cs (Prelude.map (exprToCLM env) exs)
@@ -1275,7 +1297,7 @@ exprToCLM env e@(App (Id nm) exs) =
 exprToCLM env (App ex exs) = CLMAPP (exprToCLM env ex) (Prelude.map (exprToCLM env) exs)
 exprToCLM env (Function lam) = CLMLAM $ lambdaToCLMLambda env lam
 exprToCLM env (Lit l) = CLMLIT l
-exprToCLM _ (U n) = CLMU n
+exprToCLM _ (U n) = CLMU (LConst n)
 -- ReprCast: resolve direction based on repr map
 -- If targetType is a user type (key in reprMap) → use fromRepr
 -- If targetType is a repr type (value in reprMap) → use toRepr
@@ -1294,13 +1316,15 @@ exprToCLM env (ReprCast e tp) =
                  else if Map.member simpleName (reprMap env)
                       then CLMIAP (CLMID "fromRepr") [clmE]
                       else CLMERR ("[CLM] no repr or class found for cast to " ++ show tp) SourceInteractive
-exprToCLM _ (ArrowType _ _) = CLMEMPTY  -- type-level, erased at runtime
+exprToCLM env (Typed e _) = exprToCLM env e  -- type annotation, erased at runtime
+exprToCLM _ (Pi _ _ _) = CLMEMPTY  -- type-level Pi, erased at runtime
 exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
--- Record literal: convert to a constructor-like tuple of values (field order preserved)
--- Records desugar to product types; at CLM level they're just tagged tuples
-exprToCLM env (RecordLit fields) =
-    let values = Prelude.map (\(_n, e) -> exprToCLM env e) fields
-    in CLMCON (ConsTag "__Record" 0) values
+-- NTuple: unified tuple/record literal. Convert to CLMCON at CLM level.
+-- Named tuples (records) get "__Record" tag; positional tuples get "__Tuple" tag.
+exprToCLM env (NTuple fields) =
+    let values = Prelude.map (\(_mn, e) -> exprToCLM env e) fields
+        tag = if hasNamedFields fields then ConsTag "__Record" 0 else ConsTag "__Tuple" 0
+    in CLMCON tag values
 -- Record type: type-level, erased at runtime
 exprToCLM _ (RecordType _ _) = CLMEMPTY
 -- Module system nodes: erased at runtime

@@ -20,12 +20,26 @@ import Data.List (isInfixOf, isPrefixOf)
 import Interpreter
 import Parser
 import Logs
-import Util.IOLogger (initLogState)
+import Util.IOLogger (initLogState, LogState(..), LogMessage(..), LogLevel(..))
+import qualified Data.Sequence as Seq
 import System.Directory (doesFileExist)
+import CaseOptimization (positivityCheckPass, terminationCheckPass, coverageCheckPass)
 
 -- Helper: run an IntState action with a fresh state
 runFresh :: IntState a -> IO a
 runFresh act = runIntState act emptyIntState
+
+-- Helper: run an IntState action and return collected warning messages
+runAndGetWarnings :: InterpreterState -> IntState () -> IO [String]
+runAndGetWarnings s act = do
+    logSt <- execStateT (evalStateT act s) initLogState
+    let allMsgs = Prelude.foldr (:) [] (logs logSt)
+    let msgs = [message (payload m) | m <- allMsgs, level m == LogWarning]
+    return msgs
+
+-- Helper: make a minimal InterpreterState with given env
+mkStateWithEnv :: Environment -> InterpreterState
+mkStateWithEnv env = emptyIntState { currentEnvironment = env }
 
 -- Helper: load all modules from lib/ into state, return the state
 setupEnv :: IO InterpreterState
@@ -605,9 +619,9 @@ main = do
                     let Right (ty, _) = runTC (exprToTy (Id "Bool")) env0 st0
                     ty `shouldBe` TCon "Bool"
 
-                it "converts U 0 to TU 0" $ do
+                it "converts U 0 to TU (LConst 0)" $ do
                     let Right (ty, _) = runTC (exprToTy (U 0)) env0 st0
-                    ty `shouldBe` TU 0
+                    ty `shouldBe` TU (LConst 0)
 
                 it "converts arrow type a -> b" $ do
                     let Right (ty, _) = runTC (exprToTy (ArrowType (Id "Int") (Id "Bool"))) env0 st0
@@ -679,16 +693,53 @@ main = do
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "unifies universes" $ do
-                    let result = runTC (unify (TU 0) (TU 0)) env0 st0
+                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 0))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
-                it "fails on different universes" $ do
-                    let result = runTC (unify (TU 0) (TU 1)) env0 st0
+                it "cumulativity: U 0 unifies with U 1 (U n ≤ U m when n ≤ m)" $ do
+                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 1))) env0 st0
+                    case result of
+                        Right _ -> pure ()  -- cumulativity allows this
+                        Left errs -> expectationFailure $ "Should succeed by cumulativity: " ++ show errs
+
+                it "fails on higher-to-lower universe (U 1 does not unify with U 0)" $ do
+                    let result = runTC (unify (TU (LConst 1)) (TU (LConst 0))) env0 st0
                     case result of
                         Left _ -> pure ()
-                        Right _ -> expectationFailure "Should have failed"
+                        Right _ -> expectationFailure "Should have failed: U 1 > U 0"
+
+                it "cumulativity: U 0 ≤ U 2 (transitive)" $ do
+                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 2))) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should succeed: " ++ show errs
+
+                it "cumulativity: U 0 ≤ U 0 (reflexive)" $ do
+                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 0))) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should succeed: " ++ show errs
+
+                it "cumulativity: U 1 ≤ U 2" $ do
+                    let result = runTC (unify (TU (LConst 1)) (TU (LConst 2))) env0 st0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should succeed: " ++ show errs
+
+                it "fails: U 2 does not unify with U 0" $ do
+                    let result = runTC (unify (TU (LConst 2)) (TU (LConst 0))) env0 st0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Should have failed: U 2 > U 0"
+
+                it "cumulativity: TVar unifies with U 1 (variable can be any universe)" $ do
+                    let st1 = st0 { nextVar = 1 }
+                        result = runTC (unify (TVar 0) (TU (LConst 1))) env0 st1
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "Should succeed: " ++ show errs
 
                 it "transitively resolves substitutions" $ do
                     -- TVar 0 = TVar 1, TVar 1 = Int => TVar 0 resolves to Int
@@ -1228,12 +1279,12 @@ main = do
                         TApp (TApp (TCon "F") [TRigid "a"]) [TRigid "b"] -> pure ()
                         other -> expectationFailure $ "Expected nested TApp, got: " ++ show other
 
-                it "Function in type position converts to arrow" $ do
+                it "Function in type position converts to Pi type" $ do
                     let lam = mkLambda "" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
                     let Right (ty, _) = runTC (exprToTy (Function lam)) env0 st0
                     case ty of
-                        TArrow (TCon "Int") _ -> pure ()
-                        other -> expectationFailure $ "Expected arrow type, got: " ++ show other
+                        TPi _ (TCon "Int") _ -> pure ()
+                        other -> expectationFailure $ "Expected Pi type, got: " ++ show other
 
             -- ============================================================
             -- Step 7a: Class field + method body checking
@@ -1866,8 +1917,8 @@ main = do
                 it "showTy TForall" $ showTy (TForall "a" (TArrow (TRigid "a") (TRigid "a"))) `shouldBe` "forall a. a -> a"
                 it "showTy TRecord" $ showTy (TRecord (RExtend "x" (TCon "Int") REmpty)) `shouldBe` "{x:Int}"
                 it "showTy TEffect" $ showTy (TEffect (RExtend "c" (TCon "C") REmpty) (TCon "Unit")) `shouldBe` "Eff {c:C} Unit"
-                it "showTy TU 0" $ showTy (TU 0) `shouldBe` "Type"
-                it "showTy TU 1" $ showTy (TU 1) `shouldBe` "Type1"
+                it "showTy TU (LConst 0)" $ showTy (TU (LConst 0)) `shouldBe` "Type"
+                it "showTy TU (LConst 1)" $ showTy (TU (LConst 1)) `shouldBe` "Type1"
                 it "showTy nested arrow in arg position" $ do
                     showTy (TArrow (TArrow (TCon "Int") (TCon "Bool")) (TCon "String"))
                         `shouldBe` "(Int -> Bool) -> String"
@@ -1965,13 +2016,13 @@ main = do
 
                 it "U n infers TU (n+1)" $ do
                     let Right (ty, _) = runTC (infer (U 0)) env0 st0
-                    ty `shouldBe` TU 1
+                    ty `shouldBe` TU (LConst 1)
                     let Right (ty2, _) = runTC (infer (U 1)) env0 st0
-                    ty2 `shouldBe` TU 2
+                    ty2 `shouldBe` TU (LConst 2)
 
                 it "SumType infers Type" $ do
                     let Right (ty, _) = runTC (infer (SumType (mkLambda "Bool" [] (Tuple []) (U 0)))) env0 st0
-                    ty `shouldBe` TU 0
+                    ty `shouldBe` TU (LConst 0)
 
                 it "ReprCast infers target type" $ do
                     let Right (ty, _) = runTC (infer (ReprCast (Lit (LInt 42)) (Id "Nat"))) env0 st0
@@ -1998,20 +2049,20 @@ main = do
                         other -> expectationFailure $ "Expected fresh var, got: " ++ show other
 
             describe "lamToTy" $ do
-                it "converts simple lambda to arrow type" $ do
+                it "converts simple lambda to Pi type (preserving param name)" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
                     let Right (ty, _) = runTC (lamToTy lam) env0 st0
                     case ty of
-                        TArrow (TCon "Int") _ -> pure ()
-                        other -> expectationFailure $ "Expected Int -> ?, got: " ++ show other
+                        TPi (Just "x") (TCon "Int") _ -> pure ()
+                        other -> expectationFailure $ "Expected (x:Int) -> ?, got: " ++ show other
 
-                it "converts multi-param lambda to nested arrows" $ do
+                it "converts multi-param lambda to nested Pi types" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED, Var "y" (Id "Bool") UNDEFINED]
                                         UNDEFINED (Id "String")
                     let Right (ty, _) = runTC (lamToTy lam) env0 st0
                     case ty of
-                        TArrow (TCon "Int") (TArrow (TCon "Bool") _) -> pure ()
-                        other -> expectationFailure $ "Expected Int -> Bool -> ?, got: " ++ show other
+                        TPi (Just "x") (TCon "Int") (TPi (Just "y") (TCon "Bool") _) -> pure ()
+                        other -> expectationFailure $ "Expected (x:Int) -> (y:Bool) -> ?, got: " ++ show other
 
                 it "converts zero-param lambda to return type" $ do
                     let lam = mkLambda "f" [] UNDEFINED (Id "Int")
@@ -2214,13 +2265,13 @@ main = do
             it "each loaded module has publicNames" $ do
                 st <- setupEnv
                 let loaded = loadedModules (currentModuleEnv st)
-                -- Core.Bool should define Bool, True, False
-                case Map.lookup "Core.Bool" loaded of
+                -- Core should define Bool, True, False (consolidated from Core.Bool)
+                case Map.lookup "Core" loaded of
                     Just menv -> do
                         Set.member "Bool" (publicNames menv) `shouldBe` True
                         Set.member "True" (publicNames menv) `shouldBe` True
                         Set.member "False" (publicNames menv) `shouldBe` True
-                    Nothing -> expectationFailure "Core.Bool module not found in loadedModules"
+                    Nothing -> expectationFailure "Core module not found in loadedModules"
 
             it "filterVisibleNames with ImportAll returns all public names" $ do
                 let names = Set.fromList ["Foo", "Bar", "Baz"]
@@ -2549,9 +2600,9 @@ main = do
             it "lib/ directory contains key module files" $ do
                 exists1 <- doesFileExist "lib/Prelude.tl"
                 exists2 <- doesFileExist "lib/Base.tl"
-                exists3 <- doesFileExist "lib/Algebra/Ring.tl"
-                exists4 <- doesFileExist "lib/Core/Bool.tl"
-                exists5 <- doesFileExist "lib/Numeric/Int.tl"
+                exists3 <- doesFileExist "lib/Algebra.tl"
+                exists4 <- doesFileExist "lib/Core.tl"
+                exists5 <- doesFileExist "lib/Instances.tl"
                 exists1 `shouldBe` True
                 exists2 `shouldBe` True
                 exists3 `shouldBe` True
@@ -3059,6 +3110,21 @@ main = do
                 result <- evalExpr st11 "getR(Color(100, 200, 50))"
                 result `shouldBe` CLMLIT (LInt 100)
 
+            it "sum-of-records: area(Rect(10, 20)) = 200" $ do
+                st11 <- loadTestProgram st "tests/programs/P11_Records.tl"
+                result <- evalExpr st11 "shapeArea1()"
+                result `shouldBe` CLMLIT (LInt 200)
+
+            it "sum-of-records: area(Circle(5)) = 75" $ do
+                st11 <- loadTestProgram st "tests/programs/P11_Records.tl"
+                result <- evalExpr st11 "shapeArea2()"
+                result `shouldBe` CLMLIT (LInt 75)
+
+            it "structural subtyping: nominal record matches structural type" $ do
+                st11 <- loadTestProgram st "tests/programs/P11_Records.tl"
+                result <- evalExpr st11 "structTest()"
+                result `shouldBe` CLMLIT (LInt 3)
+
         describe "P12: Effect System" $ do
             it "effect declaration parses successfully" $ do
                 st12 <- loadTestProgram st "tests/programs/P12_Effects.tl"
@@ -3104,7 +3170,7 @@ main = do
                     Left err -> expectationFailure $ "Parse error: " ++ err
 
             it "action block parsing with bind syntax" $ do
-                result <- parseTestString "function f() : Unit = action { x <- readLine(), putStrLn(x) };"
+                result <- parseTestString "function f() : Unit = action { x <- readLine(); putStrLn(x) };"
                 case result of
                     Right exprs -> length exprs `shouldBe` 1
                     Left err -> expectationFailure $ "Parse error: " ++ err
@@ -4389,3 +4455,1554 @@ main = do
                 case res of
                     Right [FixityDecl AssocNone 0 ["<=>"]] -> return ()
                     other -> expectationFailure $ "Expected FixityDecl, got: " ++ show other
+
+        -- ==================================================================
+        -- P34: Pi Types & AST Cleanups
+        -- ==================================================================
+        describe "P34: Pi Types and Dependent Functions" $ do
+            -- Runtime tests from test program
+            it "t1: function with dependent return type" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t1()"
+                result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]]
+            it "t2: non-dependent arrow backward compat" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t2()"
+                result `shouldBe` CLMLIT (LInt 42)
+            it "t3: higher-order arrow-typed parameter" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t3()"
+                result `shouldBe` CLMLIT (LInt 10)
+            it "t4: dependent function via higher-order applyDep" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t4()"
+                -- depMaker(Succ(Z)) = plus(Succ(Z), Succ(Z)) = Succ(Succ(Z))
+                result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]
+            it "t5: nested non-dependent arrows" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t5()"
+                result `shouldBe` CLMLIT (LInt 7)
+            it "t6: parenthesized arrow domain (Int -> Int) -> Int" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t6()"
+                result `shouldBe` CLMLIT (LInt 11)
+            it "t7: dep Pi param with different arg" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t7()"
+                -- depMaker(Succ(Succ(Z))) = plus(Succ(Succ(Z)), Succ(Z)) = Succ(Succ(Succ(Z)))
+                result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]]
+            it "t8: dependent function chaining" $ do
+                st34 <- loadTestProgram st "tests/programs/P34_PiTypes.tl"
+                result <- evalExpr st34 "t8()"
+                result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]]
+
+            -- Parser-level tests for Pi type syntax (via function return type)
+            it "parses non-dependent arrow in return type: Int -> Bool" $ do
+                res <- parseTestString "function f(x:Int) : Int -> Bool = x;"
+                case res of
+                    Right [Function lam] -> case lamType lam of
+                        Pi Nothing (Id "Int") (Id "Bool") -> pure ()
+                        other -> expectationFailure $ "Expected Pi Nothing, got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            it "parses dependent Pi in return type: (n:Nat) -> Nat" $ do
+                res <- parseTestString "function f(x:Int) : (n:Nat) -> Nat = x;"
+                case res of
+                    Right [Function lam] -> case lamType lam of
+                        Pi (Just "n") (Id "Nat") (Id "Nat") -> pure ()
+                        other -> expectationFailure $ "Expected Pi (Just n), got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            it "parses chained dependent Pi: (n:Nat) -> (m:Nat) -> Nat" $ do
+                res <- parseTestString "function f(x:Int) : (n:Nat) -> (m:Nat) -> Nat = x;"
+                case res of
+                    Right [Function lam] -> case lamType lam of
+                        Pi (Just "n") (Id "Nat") (Pi (Just "m") (Id "Nat") (Id "Nat")) -> pure ()
+                        other -> expectationFailure $ "Expected nested Pi, got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            it "parses mixed dep/non-dep: (n:Nat) -> Int -> Nat" $ do
+                res <- parseTestString "function f(x:Int) : (n:Nat) -> Int -> Nat = x;"
+                case res of
+                    Right [Function lam] -> case lamType lam of
+                        Pi (Just "n") (Id "Nat") (Pi Nothing (Id "Int") (Id "Nat")) -> pure ()
+                        other -> expectationFailure $ "Expected mixed Pi, got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            it "parses dependent Pi in param type: f: (n:Nat) -> Nat" $ do
+                res <- parseTestString "function g(f: (n:Nat) -> Nat) : Nat = f(Z);"
+                case res of
+                    Right [Function lam] -> case params lam of
+                        [Var "f" (Pi (Just "n") (Id "Nat") (Id "Nat")) _] -> pure ()
+                        other -> expectationFailure $ "Expected dep Pi param, got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            it "parses parenthesized non-dep arrow in param: f: (Int -> Int)" $ do
+                res <- parseTestString "function g(f: (Int -> Int)) : Int = f(1);"
+                case res of
+                    Right [Function lam] -> case params lam of
+                        [Var "f" (Pi Nothing (Id "Int") (Id "Int")) _] -> pure ()
+                        other -> expectationFailure $ "Expected arrow param, got: " ++ show other
+                    other -> expectationFailure $ "Expected function, got: " ++ show other
+
+            -- Type checker tests for Pi types
+            let tcSt0 = initTCState TCRelaxed
+                tcEnv0 = emptyTCEnv
+
+            it "exprToTy: non-dependent arrow → TPi Nothing" $ do
+                let Right (ty, _) = runTC (exprToTy (Pi Nothing (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
+                ty `shouldBe` TPi Nothing (TCon "Int") (TCon "Bool")
+
+            it "exprToTy: dependent Pi → TPi (Just name)" $ do
+                let Right (ty, _) = runTC (exprToTy (Pi (Just "n") (Id "Nat") (Id "Nat"))) tcEnv0 tcSt0
+                ty `shouldBe` TPi (Just "n") (TCon "Nat") (TCon "Nat")
+
+            it "exprToTy: ArrowType pattern synonym still works" $ do
+                let Right (ty, _) = runTC (exprToTy (ArrowType (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
+                ty `shouldBe` TArrow (TCon "Int") (TCon "Bool")
+
+            it "lamToTy: named params → TPi (Just name)" $ do
+                let lam = mkLambda "f" [Var "n" (Id "Nat") UNDEFINED] UNDEFINED (Id "Nat")
+                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                case ty of
+                    TPi (Just "n") (TCon "Nat") _ -> pure ()
+                    other -> expectationFailure $ "Expected TPi (Just n), got: " ++ show other
+
+            it "lamToTy: unnamed params → TPi Nothing" $ do
+                let lam = mkLambda "f" [Var "" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
+                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                case ty of
+                    TPi Nothing (TCon "Int") _ -> pure ()
+                    other -> expectationFailure $ "Expected TPi Nothing, got: " ++ show other
+
+            it "lamToTy: underscore params → TPi Nothing" $ do
+                let lam = mkLambda "f" [Var "_" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
+                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                case ty of
+                    TPi Nothing (TCon "Int") _ -> pure ()
+                    other -> expectationFailure $ "Expected TPi Nothing, got: " ++ show other
+
+            -- PatternGuard / ExprConsTagCheck backward compat
+            it "ExprConsTagCheck pattern synonym constructs PatternGuard" $ do
+                let expr = ExprConsTagCheck (ConsTag "True" 0) (Id "x")
+                case expr of
+                    PatternGuard (PCheckTag (ConsTag "True" 0)) (Id "x") -> pure ()
+                    other -> expectationFailure $ "Pattern synonym mismatch: " ++ show other
+
+            it "ExprLiteralCheck pattern synonym constructs PatternGuard" $ do
+                let expr = ExprLiteralCheck (LInt 42) (Id "y")
+                case expr of
+                    PatternGuard (PCheckLit (LInt 42)) (Id "y") -> pure ()
+                    other -> expectationFailure $ "Pattern synonym mismatch: " ++ show other
+
+            -- Type-level normalization tests
+            describe "Type-level normalization (evalCLMPure)" $ do
+                let env = currentEnvironment st
+
+                it "normalizeTy: TCon passes through unchanged" $ do
+                    let result = normalizeTy env (TCon "Int")
+                    result `shouldBe` TCon "Int"
+
+                it "normalizeTy: TApp with unknown function passes through" $ do
+                    let result = normalizeTy env (TApp (TCon "Vec") [TCon "Int", TCon "Z"])
+                    result `shouldBe` TApp (TCon "Vec") [TCon "Int", TCon "Z"]
+
+                it "normalizeTy: plus(Z, Z) reduces to Z" $ do
+                    let result = normalizeTy env (TApp (TCon "plus") [TCon "Z", TCon "Z"])
+                    result `shouldBe` TCon "Z"
+
+                it "normalizeTy: plus(Succ(Z), Z) reduces to Succ(Z)" $ do
+                    let natZ = TCon "Z"
+                        natSZ = TApp (TCon "Succ") [natZ]
+                        result = normalizeTy env (TApp (TCon "plus") [natSZ, natZ])
+                    result `shouldBe` TApp (TCon "Succ") [TCon "Z"]
+
+                it "normalizeTy: plus(Succ(Z), Succ(Z)) reduces to Succ(Succ(Z))" $ do
+                    let natZ = TCon "Z"
+                        natSZ = TApp (TCon "Succ") [natZ]
+                        natSSZ = TApp (TCon "Succ") [natSZ]
+                        result = normalizeTy env (TApp (TCon "plus") [natSZ, natSZ])
+                    result `shouldBe` natSSZ
+
+                it "normalizeTy: nested plus(plus(Z,Z), Succ(Z)) reduces" $ do
+                    let natZ = TCon "Z"
+                        natSZ = TApp (TCon "Succ") [natZ]
+                        inner = TApp (TCon "plus") [natZ, natZ]
+                        result = normalizeTy env (TApp (TCon "plus") [inner, natSZ])
+                    result `shouldBe` natSZ
+
+                it "normalizeTy: mult(Succ(Succ(Z)), Succ(Succ(Z))) = 4" $ do
+                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
+                        result = normalizeTy env (TApp (TCon "mult") [n 2, n 2])
+                    result `shouldBe` n 4
+
+                it "normalizeTy: doesn't reduce when args have TVar" $ do
+                    let result = normalizeTy env (TApp (TCon "plus") [TVar 0, TCon "Z"])
+                    result `shouldBe` TApp (TCon "plus") [TVar 0, TCon "Z"]
+
+                it "tyToCLM: Z → CLMCON Z 0 []" $ do
+                    let result = tyToCLM env (TCon "Z")
+                    result `shouldBe` CLMCON (ConsTag "Z" 0) []
+
+                it "tyToCLM: Succ(Z) → CLMCON Succ 1 [CLMCON Z 0 []]" $ do
+                    let result = tyToCLM env (TApp (TCon "Succ") [TCon "Z"])
+                    result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]
+
+                it "clmToTy: CLMCON Z → TCon Z" $ do
+                    let result = clmToTy (CLMCON (ConsTag "Z" 0) [])
+                    result `shouldBe` Just (TCon "Z")
+
+                it "clmToTy: CLMCON Succ [Z] → TApp Succ [Z]" $ do
+                    let result = clmToTy (CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []])
+                    result `shouldBe` Just (TApp (TCon "Succ") [TCon "Z"])
+
+                -- Functions at different universe levels
+                it "normalizeTy: not(True) reduces to False (Bool functions at type level)" $ do
+                    let result = normalizeTy env (TApp (TCon "not") [TCon "True"])
+                    result `shouldBe` TCon "False"
+
+                it "normalizeTy: not(False) reduces to True" $ do
+                    let result = normalizeTy env (TApp (TCon "not") [TCon "False"])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: not(not(True)) reduces to True (nested Bool)" $ do
+                    let inner = TApp (TCon "not") [TCon "True"]
+                        result = normalizeTy env (TApp (TCon "not") [inner])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: eq(Z, Z) reduces to True" $ do
+                    let result = normalizeTy env (TApp (TCon "eq") [TCon "Z", TCon "Z"])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: eq(Z, Succ(Z)) reduces to False" $ do
+                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
+                        result = normalizeTy env (TApp (TCon "eq") [TCon "Z", natSZ])
+                    result `shouldBe` TCon "False"
+
+                it "normalizeTy: eq(Succ(Z), Succ(Z)) reduces to True" $ do
+                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
+                        result = normalizeTy env (TApp (TCon "eq") [natSZ, natSZ])
+                    result `shouldBe` TCon "True"
+
+                -- Larger computations
+                it "normalizeTy: plus(3, 2) = 5 (larger Nat arithmetic)" $ do
+                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
+                        result = normalizeTy env (TApp (TCon "plus") [n 3, n 2])
+                    result `shouldBe` n 5
+
+                it "normalizeTy: mult(3, 2) = 6" $ do
+                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
+                        result = normalizeTy env (TApp (TCon "mult") [n 3, n 2])
+                    result `shouldBe` n 6
+
+                it "normalizeTy: plus(mult(2,2), Succ(Z)) = 5 (composed arithmetic)" $ do
+                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
+                        inner = TApp (TCon "mult") [n 2, n 2]
+                        result = normalizeTy env (TApp (TCon "plus") [inner, n 1])
+                    result `shouldBe` n 5
+
+                -- Edge cases
+                it "normalizeTy: TRigid args — reduction attempted but may not fully reduce" $ do
+                    let result = normalizeTy env (TApp (TCon "plus") [TRigid "n", TCon "Z"])
+                    -- TRigid is concrete, so reduction IS attempted.
+                    -- plus(n, Z) pattern matches: first case is (Z, m) -> m, second is (Succ(k), m) -> ...
+                    -- Since n is opaque (not Z or Succ), neither case matches → returns unreduced
+                    result `shouldBe` TApp (TCon "plus") [TRigid "n", TCon "Z"]
+
+                it "normalizeTy: Pi type children get normalized" $ do
+                    let body = TApp (TCon "plus") [TCon "Z", TCon "Z"]
+                        result = normalizeTy env (TPi Nothing (TCon "Int") body)
+                    result `shouldBe` TPi Nothing (TCon "Int") (TCon "Z")
+
+                it "normalizeTy: preserves structure when nothing to normalize" $ do
+                    let ty = TPi (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
+                        result = normalizeTy env ty
+                    result `shouldBe` ty
+
+                -- tyToCLM edge cases
+                it "tyToCLM: function name → CLMID" $ do
+                    let result = tyToCLM env (TCon "plus")
+                    result `shouldBe` CLMID "plus"
+
+                it "tyToCLM: TRigid → CLMID" $ do
+                    let result = tyToCLM env (TRigid "a")
+                    result `shouldBe` CLMID "a"
+
+                it "tyToCLM: TU (LConst 0) → CLMU (LConst 0)" $ do
+                    let result = tyToCLM env (TU (LConst 0))
+                    result `shouldBe` CLMU (LConst 0)
+
+                it "tyToCLM: nested constructor Succ(Succ(Z))" $ do
+                    let n2 = TApp (TCon "Succ") [TApp (TCon "Succ") [TCon "Z"]]
+                        result = tyToCLM env n2
+                    result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]
+
+                -- clmToTy edge cases
+                it "clmToTy: CLMEMPTY → Nothing" $ do
+                    clmToTy CLMEMPTY `shouldBe` Nothing
+
+                it "clmToTy: CLMU (LConst 1) → Just (TU (LConst 1))" $ do
+                    clmToTy (CLMU (LConst 1)) `shouldBe` Just (TU (LConst 1))
+
+                it "clmToTy: CLMID → Just (TCon)" $ do
+                    clmToTy (CLMID "Nat") `shouldBe` Just (TCon "Nat")
+
+                it "clmToTy: deeply nested constructor round-trips" $ do
+                    let n3 = CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]]
+                        expected = TApp (TCon "Succ") [TApp (TCon "Succ") [TApp (TCon "Succ") [TCon "Z"]]]
+                    clmToTy n3 `shouldBe` Just expected
+
+                -- isConcreteTy
+                it "isConcreteTy: TVar is not concrete" $ do
+                    isConcreteTy (TVar 0) `shouldBe` False
+
+                it "isConcreteTy: TCon is concrete" $ do
+                    isConcreteTy (TCon "Int") `shouldBe` True
+
+                it "isConcreteTy: TRigid is concrete" $ do
+                    isConcreteTy (TRigid "a") `shouldBe` True
+
+                it "isConcreteTy: TApp with all concrete args is concrete" $ do
+                    isConcreteTy (TApp (TCon "Vec") [TCon "Int", TCon "Z"]) `shouldBe` True
+
+                it "isConcreteTy: TApp with TVar arg is not concrete" $ do
+                    isConcreteTy (TApp (TCon "Vec") [TCon "Int", TVar 0]) `shouldBe` False
+
+                it "isConcreteTy: TPi with concrete parts is concrete" $ do
+                    isConcreteTy (TPi Nothing (TCon "Int") (TCon "Bool")) `shouldBe` True
+
+        -- ==================================================================
+        -- P35: GADTs (Generalized Algebraic Data Types)
+        -- ==================================================================
+        describe "P35: GADTs" $ do
+            -- Runtime tests from test program
+            it "t1: vecHead(singleVec) = 42" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t1()"
+                result `shouldBe` CLMLIT (LInt 42)
+            it "t2: vecHead(doubleVec) = 1" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t2()"
+                result `shouldBe` CLMLIT (LInt 1)
+            it "t3: mkSome(99) constructs SafeOption" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t3()"
+                result `shouldBe` CLMCON (ConsTag "SomeVal" 0) [CLMLIT (LInt 99)]
+            it "t4: extractI(mkLitI(5)) = 5" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t4()"
+                result `shouldBe` CLMLIT (LInt 5)
+            it "t5: extractB(mkLitB()) = True" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t5()"
+                result `shouldBe` CLMCON (ConsTag "True" 0) []
+            it "t6: vecHead(VCons(100, VNil)) = 100" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t6()"
+                result `shouldBe` CLMLIT (LInt 100)
+            it "t7: SomeVal(7) constructs correctly" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                result <- evalExpr st35 "t7()"
+                result `shouldBe` CLMCON (ConsTag "SomeVal" 0) [CLMLIT (LInt 7)]
+
+            -- Type checker unit tests for GADT
+            describe "GADT type checker" $ do
+                it "GADT constructor infers specific return type (VNil : Vec(a, Z))" $ do
+                    st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                    let env35 = currentEnvironment st35
+                        tcEnv = buildTCEnvFromEnvironment env35
+                        tcSt = initTCState TCRelaxed
+                    -- VNil should infer a return type of Vec(_, Z) where Z is concrete
+                    case runTC (infer (ConTuple (ConsTag "VNil" 0) [])) tcEnv tcSt of
+                        Right (ty, _) -> do
+                            case ty of
+                                TApp (TCon "Vec") [_, zTy] ->
+                                    zTy `shouldBe` TCon "Z"
+                                _ -> expectationFailure $ "Expected Vec(_, Z), got: " ++ showTy ty
+                        Left errs -> expectationFailure $ "Type check failed: " ++ show errs
+
+                it "GADT constructor infers specific return type (VCons : Vec(a, Succ(n)))" $ do
+                    st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                    let env35 = currentEnvironment st35
+                        tcEnv = buildTCEnvFromEnvironment env35
+                        tcSt = initTCState TCRelaxed
+                    -- VCons(42, VNil) should infer Vec(Int, Succ(_))
+                    case runTC (infer (ConTuple (ConsTag "VCons" 1) [Lit (LInt 42), ConTuple (ConsTag "VNil" 0) []])) tcEnv tcSt of
+                        Right (ty, st') ->
+                            case runTC (applySubst ty) tcEnv st' of
+                                Right (ty', _) ->
+                                    case ty' of
+                                        TApp (TCon "Vec") [intTy, succTy] -> do
+                                            intTy `shouldBe` TCon "Int"
+                                            case succTy of
+                                                TApp (TCon "Succ") [TCon "Z"] -> pure ()
+                                                TApp (TCon "Succ") [_] -> pure () -- fresh var for Z is ok
+                                                _ -> expectationFailure $ "Expected Succ(_), got: " ++ showTy succTy
+                                        _ -> expectationFailure $ "Expected Vec(Int, Succ(_)), got: " ++ showTy ty'
+                                Left _ -> expectationFailure "applySubst failed"
+                        Left errs -> expectationFailure $ "Type check failed: " ++ show errs
+
+                it "non-GADT constructor still infers correct type" $ do
+                    let env0 = currentEnvironment st
+                        tcEnv = buildTCEnvFromEnvironment env0
+                        tcSt = initTCState TCRelaxed
+                    -- Just(42) should infer Maybe(Int)
+                    case runTC (infer (ConTuple (ConsTag "Just" 1) [Lit (LInt 42)])) tcEnv tcSt of
+                        Right (ty, st') ->
+                            case runTC (applySubst ty) tcEnv st' of
+                                Right (ty', _) ->
+                                    case ty' of
+                                        TApp (TCon "Maybe") [TCon "Int"] -> pure ()
+                                        _ -> expectationFailure $ "Expected Maybe(Int), got: " ++ showTy ty'
+                                Left _ -> expectationFailure "applySubst failed"
+                        Left errs -> expectationFailure $ "Type check failed: " ++ show errs
+
+                it "GADT refinement helper extracts type name" $ do
+                    -- extractTypeName (App (Id "Vec") [...]) = "Vec"
+                    extractTypeName (App (Id "Vec") [Id "a", Id "n"]) `shouldBe` "Vec"
+                    extractTypeName (Id "Bool") `shouldBe` "Bool"
+                    extractTypeName UNDEFINED `shouldBe` ""
+
+                it "applyGADTRefinements substitutes rigid vars in varTypes" $ do
+                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", TRigid "n"), ("y", TRigid "a")] }
+                        refinements = [("n", TCon "Z"), ("a", TCon "Int")]
+                        env1 = applyGADTRefinements refinements env0
+                    Map.lookup "x" (varTypes env1) `shouldBe` Just (TCon "Z")
+                    Map.lookup "y" (varTypes env1) `shouldBe` Just (TCon "Int")
+
+                it "applyGADTRefinements is identity when no refinements" $ do
+                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", TRigid "n")] }
+                        env1 = applyGADTRefinements [] env0
+                    Map.lookup "x" (varTypes env1) `shouldBe` Just (TRigid "n")
+
+        -- ==================================================================
+        -- Level Type Unit Tests
+        -- ==================================================================
+        describe "Level smart constructors and helpers" $ do
+            it "levelSucc normalizes concrete levels" $ do
+                levelSucc (LConst 0) `shouldBe` LConst 1
+                levelSucc (LConst 3) `shouldBe` LConst 4
+            it "levelSucc preserves LVar" $ do
+                levelSucc (LVar "l") `shouldBe` LSucc (LVar "l")
+            it "levelSucc on LSucc" $ do
+                levelSucc (LSucc (LVar "l")) `shouldBe` LSucc (LSucc (LVar "l"))
+            it "levelMax normalizes concrete levels" $ do
+                levelMax (LConst 1) (LConst 3) `shouldBe` LConst 3
+                levelMax (LConst 5) (LConst 2) `shouldBe` LConst 5
+                levelMax (LConst 0) (LConst 0) `shouldBe` LConst 0
+            it "levelMax preserves LVar" $ do
+                levelMax (LVar "l") (LConst 1) `shouldBe` LMax (LVar "l") (LConst 1)
+            it "levelLeq on concrete levels" $ do
+                levelLeq (LConst 0) (LConst 1) `shouldBe` Just True
+                levelLeq (LConst 1) (LConst 1) `shouldBe` Just True
+                levelLeq (LConst 2) (LConst 1) `shouldBe` Just False
+            it "levelLeq returns Nothing for LVar" $ do
+                levelLeq (LVar "l") (LConst 1) `shouldBe` Nothing
+                levelLeq (LConst 0) (LVar "l") `shouldBe` Nothing
+            it "levelEq on concrete levels" $ do
+                levelEq (LConst 0) (LConst 0) `shouldBe` Just True
+                levelEq (LConst 0) (LConst 1) `shouldBe` Just False
+            it "levelEq on matching LVars" $ do
+                levelEq (LVar "l") (LVar "l") `shouldBe` Just True
+                levelEq (LVar "l") (LVar "m") `shouldBe` Just False
+            it "showLevel renders correctly" $ do
+                showLevel (LConst 0) `shouldBe` "0"
+                showLevel (LConst 3) `shouldBe` "3"
+                showLevel (LVar "l") `shouldBe` "l"
+                showLevel (LSucc (LVar "l")) `shouldBe` "l+1"
+                showLevel (LMax (LVar "l") (LConst 1)) `shouldBe` "max(l, 1)"
+            it "substLevel replaces matching var" $ do
+                substLevel "l" (LConst 2) (LVar "l") `shouldBe` LConst 2
+            it "substLevel ignores non-matching var" $ do
+                substLevel "l" (LConst 2) (LVar "m") `shouldBe` LVar "m"
+            it "substLevel recurses into LSucc" $ do
+                substLevel "l" (LConst 1) (LSucc (LVar "l")) `shouldBe` LConst 2
+            it "substLevel recurses into LMax" $ do
+                substLevel "l" (LConst 3) (LMax (LVar "l") (LConst 1)) `shouldBe` LConst 3
+            it "substLevel preserves LConst" $ do
+                substLevel "l" (LConst 2) (LConst 5) `shouldBe` LConst 5
+            it "levelZero and levelOne constants" $ do
+                levelZero `shouldBe` LConst 0
+                levelOne `shouldBe` LConst 1
+
+        -- ==================================================================
+        -- TC: substTyVar Shadowing for TPi/TSigma
+        -- ==================================================================
+        describe "substTyVar shadowing" $ do
+            it "TPi (Just n) shadows: does not substitute in body when name matches" $ do
+                -- substTyVar "a" Int (TPi (Just "a") Nat (TRigid "a")) should NOT replace body's "a"
+                let result = substTyVar "a" (TCon "Int") (TPi (Just "a") (TCon "Nat") (TRigid "a"))
+                result `shouldBe` TPi (Just "a") (TCon "Nat") (TRigid "a")
+            it "TPi (Just n) non-shadow: substitutes in body when name differs" $ do
+                let result = substTyVar "a" (TCon "Int") (TPi (Just "x") (TRigid "a") (TRigid "a"))
+                result `shouldBe` TPi (Just "x") (TCon "Int") (TCon "Int")
+            it "TPi Nothing always substitutes in both domain and codomain" $ do
+                let result = substTyVar "a" (TCon "Int") (TPi Nothing (TRigid "a") (TRigid "a"))
+                result `shouldBe` TPi Nothing (TCon "Int") (TCon "Int")
+            it "TSigma (Just n) shadows: does not substitute in body when name matches" $ do
+                let result = substTyVar "a" (TCon "Int") (TSigma (Just "a") (TCon "Nat") (TRigid "a"))
+                result `shouldBe` TSigma (Just "a") (TCon "Nat") (TRigid "a")
+            it "TSigma (Just n) non-shadow: substitutes in body when name differs" $ do
+                let result = substTyVar "b" (TCon "Bool") (TSigma (Just "x") (TRigid "b") (TRigid "b"))
+                result `shouldBe` TSigma (Just "x") (TCon "Bool") (TCon "Bool")
+            it "TSigma Nothing always substitutes" $ do
+                let result = substTyVar "a" (TCon "Int") (TSigma Nothing (TRigid "a") (TRigid "a"))
+                result `shouldBe` TSigma Nothing (TCon "Int") (TCon "Int")
+
+        -- ==================================================================
+        -- TC: Alpha-Renaming in Unify for TPi/TSigma
+        -- ==================================================================
+        describe "unify alpha-renaming for TPi/TSigma" $ do
+            it "TPi: unifies (x:A) -> B(x) with (y:A) -> B(y) via alpha-rename" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    ty1 = TPi (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
+                    ty2 = TPi (Just "y") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "y"])
+                case runTC (unify ty1 ty2) env0 st0 of
+                    Right _ -> pure ()
+                    Left errs -> expectationFailure $ "Alpha-rename should succeed: " ++ show errs
+            it "TPi: fails when domains differ despite alpha-rename" $ do
+                let st0 = initTCState TCStrict
+                    env0 = emptyTCEnv
+                    ty1 = TPi (Just "x") (TCon "Nat") (TRigid "x")
+                    ty2 = TPi (Just "y") (TCon "Int") (TRigid "y")
+                case runTC (unify ty1 ty2) env0 st0 of
+                    Left _ -> pure ()
+                    Right _ -> expectationFailure "Should fail: domains differ"
+            it "TPi: unnamed vs named unification works" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    ty1 = TPi Nothing (TCon "Int") (TCon "Bool")
+                    ty2 = TPi (Just "x") (TCon "Int") (TCon "Bool")
+                case runTC (unify ty1 ty2) env0 st0 of
+                    Right _ -> pure ()
+                    Left errs -> expectationFailure $ "Should succeed: " ++ show errs
+            it "TSigma: unifies (x:A, B(x)) with (y:A, B(y)) via alpha-rename" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    ty1 = TSigma (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
+                    ty2 = TSigma (Just "y") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "y"])
+                case runTC (unify ty1 ty2) env0 st0 of
+                    Right _ -> pure ()
+                    Left errs -> expectationFailure $ "Alpha-rename should succeed: " ++ show errs
+
+        -- ==================================================================
+        -- freeRigidVars
+        -- ==================================================================
+        describe "freeRigidVars" $ do
+            it "TRigid returns the name" $ do
+                freeRigidVars (TRigid "a") `shouldBe` ["a"]
+            it "TCon returns empty" $ do
+                freeRigidVars (TCon "Int") `shouldBe` []
+            it "TVar returns empty" $ do
+                freeRigidVars (TVar 0) `shouldBe` []
+            it "TApp collects from head and args" $ do
+                freeRigidVars (TApp (TRigid "f") [TRigid "a", TCon "Int"]) `shouldBe` ["f", "a"]
+            it "TPi (Just n) filters bound name from body" $ do
+                freeRigidVars (TPi (Just "x") (TRigid "a") (TRigid "x")) `shouldBe` ["a"]
+            it "TPi Nothing collects from both" $ do
+                freeRigidVars (TPi Nothing (TRigid "a") (TRigid "b")) `shouldBe` ["a", "b"]
+            it "TSigma (Just n) filters bound name from body" $ do
+                freeRigidVars (TSigma (Just "x") (TRigid "a") (TRigid "x")) `shouldBe` ["a"]
+            it "nested types collect all rigids" $ do
+                let ty = TPi Nothing (TApp (TCon "Vec") [TRigid "a", TRigid "n"]) (TRigid "b")
+                freeRigidVars ty `shouldBe` ["a", "n", "b"]
+
+        -- ==================================================================
+        -- GADT: gadtRefine error/edge cases
+        -- ==================================================================
+        describe "GADT gadtRefine edge cases" $ do
+            it "gadtRefine returns [] for empty checks" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                case runTC (gadtRefine []) env0 st0 of
+                    Right (refs, _) -> refs `shouldBe` []
+                    Left _ -> expectationFailure "Should not fail"
+            it "gadtRefine returns [] when no compiler env" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv  -- no envCompiler
+                    checks = [PatternGuard (PCheckTag (ConsTag "VNil" 0)) (Id "x")]
+                case runTC (gadtRefine checks) env0 st0 of
+                    Right (refs, _) -> refs `shouldBe` []
+                    Left _ -> expectationFailure "Should not fail"
+            it "gadtRefine returns [] for literal checks (no constructor)" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    checks = [PatternGuard (PCheckLit (LInt 42)) (Id "x")]
+                case runTC (gadtRefine checks) env0 st0 of
+                    Right (refs, _) -> refs `shouldBe` []
+                    Left _ -> expectationFailure "Should not fail"
+            it "gadtRefine returns [] for unknown constructor" $ do
+                let st0 = initTCState TCRelaxed
+                    cenv = currentEnvironment st
+                    env0 = buildTCEnvFromEnvironment cenv
+                    checks = [PatternGuard (PCheckTag (ConsTag "NonExistent" 0)) (Id "x")]
+                case runTC (gadtRefine checks) env0 st0 of
+                    Right (refs, _) -> refs `shouldBe` []
+                    Left _ -> expectationFailure "Should not fail"
+            it "gadtRefine returns [] for non-parameterized constructor (True/False)" $ do
+                let st0 = initTCState TCRelaxed
+                    cenv = currentEnvironment st
+                    env0 = buildTCEnvFromEnvironment cenv
+                    checks = [PatternGuard (PCheckTag (ConsTag "True" 0)) (Id "x")]
+                case runTC (gadtRefine checks) env0 st0 of
+                    Right (refs, _) -> refs `shouldBe` []
+                    Left _ -> expectationFailure "Should not fail"
+
+            it "gadtRefine produces refinement for GADT constructor" $ do
+                st35 <- loadTestProgram st "tests/programs/P35_GADTs.tl"
+                let cenv = currentEnvironment st35
+                    env0 = buildTCEnvFromEnvironment cenv
+                    -- Simulate matching VNil against v:Vec(Int, n)
+                    env1 = env0 { varTypes = Map.insert "v" (TApp (TCon "Vec") [TCon "Int", TRigid "n"]) (varTypes env0) }
+                    checks = [PatternGuard (PCheckTag (ConsTag "VNil" 0)) (Id "v")]
+                    st0 = initTCState TCRelaxed
+                case runTC (gadtRefine checks) env1 st0 of
+                    Right (refs, _) -> do
+                        -- Should produce a refinement for "n" → Z
+                        let nRef = Prelude.lookup "n" refs
+                        case nRef of
+                            Just (TCon "Z") -> pure ()
+                            Just other -> expectationFailure $ "Expected n → Z, got n → " ++ showTy other
+                            Nothing -> expectationFailure $ "Expected refinement for n, got: " ++ show refs
+                    Left errs -> expectationFailure $ "gadtRefine failed: " ++ show errs
+
+        -- ==================================================================
+        -- GADT: gadtExprToTy
+        -- ==================================================================
+        describe "gadtExprToTy" $ do
+            it "maps type param names to fresh vars" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    mapping = [("a", TVar 100), ("n", TVar 101)]
+                case runTC (gadtExprToTy mapping (Id "a")) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TVar 100
+                    Left _ -> expectationFailure "Should not fail"
+            it "preserves uppercase as TCon" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    mapping = [("a", TVar 100)]
+                case runTC (gadtExprToTy mapping (Id "Z")) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TCon "Z"
+                    Left _ -> expectationFailure "Should not fail"
+            it "handles App with mixed params and constructors" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    mapping = [("a", TVar 100), ("n", TVar 101)]
+                    -- Vec(a, Succ(n))
+                    expr = App (Id "Vec") [Id "a", App (Id "Succ") [Id "n"]]
+                case runTC (gadtExprToTy mapping expr) env0 st0 of
+                    Right (ty, _) ->
+                        ty `shouldBe` TApp (TCon "Vec") [TVar 100, TApp (TCon "Succ") [TVar 101]]
+                    Left _ -> expectationFailure "Should not fail"
+            it "handles U expression" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                case runTC (gadtExprToTy [] (U 0)) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TU (LConst 0)
+                    Left _ -> expectationFailure "Should not fail"
+
+        -- ==================================================================
+        -- infer(SumType) kind computation
+        -- ==================================================================
+        describe "infer(SumType) kind computation" $ do
+            it "non-parameterized type has kind Type" $ do
+                let st0 = initTCState TCRelaxed
+                    env0 = emptyTCEnv
+                    boolLam = mkLambda "Bool" [] (Tuple []) (U 0)
+                case runTC (infer (SumType boolLam)) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TU (LConst 0)
+                    Left errs -> expectationFailure $ "Failed: " ++ show errs
+            it "single-param type has kind Type -> Type" $ do
+                let st0 = initTCState TCRelaxed
+                    cenv = currentEnvironment st
+                    env0 = buildTCEnvFromEnvironment cenv
+                    maybeLam = mkLambda "Maybe" [Var "a" (U 0) UNDEFINED] (Tuple []) (U 0)
+                case runTC (infer (SumType maybeLam)) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TPi Nothing (TU (LConst 0)) (TU (LConst 0))
+                    Left errs -> expectationFailure $ "Failed: " ++ show errs
+            it "two-param type has kind Type -> Type -> Type" $ do
+                let st0 = initTCState TCRelaxed
+                    cenv = currentEnvironment st
+                    env0 = buildTCEnvFromEnvironment cenv
+                    eitherLam = mkLambda "Either" [Var "a" (U 0) UNDEFINED, Var "b" (U 0) UNDEFINED] (Tuple []) (U 0)
+                case runTC (infer (SumType eitherLam)) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` TPi Nothing (TU (LConst 0)) (TPi Nothing (TU (LConst 0)) (TU (LConst 0)))
+                    Left errs -> expectationFailure $ "Failed: " ++ show errs
+
+        -- ==================================================================
+        -- normalizeTy for TSigma dependent substitution
+        -- ==================================================================
+        describe "normalizeTy TSigma" $ do
+            it "normalizes TSigma children" $ do
+                let env0 = currentEnvironment st
+                    -- TSigma Nothing (plus(Z,Z)) (TCon "Int") → TSigma Nothing Z Int
+                    natZ = TCon "Z"
+                    inner = TApp (TCon "plus") [natZ, natZ]
+                    result = normalizeTy env0 (TSigma Nothing inner (TCon "Int"))
+                result `shouldBe` TSigma Nothing natZ (TCon "Int")
+            it "preserves TSigma when nothing to normalize" $ do
+                let env0 = currentEnvironment st
+                    ty = TSigma (Just "x") (TCon "Nat") (TCon "Int")
+                    result = normalizeTy env0 ty
+                result `shouldBe` ty
+
+        -- ==================================================================
+        -- Positivity Checking (Pass 2.1)
+        -- ==================================================================
+        describe "positivityCheckPass" $ do
+            it "no warning for simple enum type" $ do
+                -- type Color = Red | Green | Blue (no params, trivially positive)
+                let redCon = mkLambda "Red" [] (Tuple []) (Id "Color")
+                    greenCon = mkLambda "Green" [] (Tuple []) (Id "Color")
+                    blueCon = mkLambda "Blue" [] (Tuple []) (Id "Color")
+                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("Color", colorType)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s positivityCheckPass
+                warnings `shouldBe` []
+
+            it "no warning for recursive type in positive position" $ do
+                -- type Nat = Z | Succ(Nat)  -- Nat only in positive position
+                let zCon = mkLambda "Z" [] (Tuple []) (Id "Nat")
+                    succCon = mkLambda "Succ" [Var "n" (Id "Nat") UNDEFINED] (Tuple [Id "n"]) (Id "Nat")
+                    natType = SumType (mkLambda "Nat" [] (Constructors [zCon, succCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("Nat", natType)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s positivityCheckPass
+                warnings `shouldBe` []
+
+            it "warns on negative occurrence (type in function domain)" $ do
+                -- type Bad = MkBad(Bad -> Int) -- Bad in negative position
+                let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s positivityCheckPass
+                Prelude.length warnings `shouldBe` 1
+                Prelude.head warnings `shouldSatisfy` isInfixOf "positivity"
+
+            it "no warning for type in function codomain (positive)" $ do
+                -- type F = MkF(Int -> F) -- F only in positive position (result)
+                let mkFCon = mkLambda "MkF" [Var "f" (Pi Nothing (Id "Int") (Id "F")) UNDEFINED] (Tuple [Id "f"]) (Id "F")
+                    fType = SumType (mkLambda "F" [] (Constructors [mkFCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("F", fType)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s positivityCheckPass
+                warnings `shouldBe` []
+
+            it "warns on doubly-negative (negative overall) occurrence" $ do
+                -- type Bad2 = MkBad2((Bad2 -> Int) -> Int) -- Bad2 in neg-of-neg-of-pos = neg
+                -- Actually (Bad2 -> Int) -> Int: Bad2 is in domain of domain = positive
+                -- Let's use: type Bad2 = MkBad2((Int -> Bad2) -> Int) -- Bad2 in codomain-of-domain = negative
+                let innerArrow = Pi Nothing (Id "Int") (Id "Bad2")  -- Int -> Bad2
+                    outerArrow = Pi Nothing innerArrow (Id "Int")   -- (Int -> Bad2) -> Int
+                    mkCon = mkLambda "MkBad2" [Var "f" outerArrow UNDEFINED] (Tuple [Id "f"]) (Id "Bad2")
+                    badType = SumType (mkLambda "Bad2" [] (Constructors [mkCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("Bad2", badType)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s positivityCheckPass
+                Prelude.length warnings `shouldBe` 1
+
+            it "disabled when flag is off" $ do
+                let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U 0))
+                    env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkPositivity = False } }
+                warnings <- runAndGetWarnings s positivityCheckPass
+                warnings `shouldBe` []
+
+        -- ==================================================================
+        -- Termination Checking (Pass 2.2)
+        -- ==================================================================
+        describe "terminationCheckPass" $ do
+            it "no warning for non-recursive function" $ do
+                -- function id(x:Int) : Int = x;
+                let lam = mkLambda "id" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int")
+                    env = initialEnvironment { topLambdas = Map.fromList [("id", lam)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s terminationCheckPass
+                warnings `shouldBe` []
+
+            it "no warning for structurally decreasing recursion" $ do
+                -- function f(x:Nat) : Nat = match | Z -> Z | Succ(n) -> f(n);
+                -- Use CaseOf with Var patterns that bind constructor subterms
+                let zCase = CaseOf [Var "x" UNDEFINED (ConTuple (ConsTag "Z" 0) [])]
+                              (Id "Z") SourceInteractive
+                    -- Succ(n) pattern: Var "n" bound inside constructor app
+                    succCase = CaseOf [Var "x" UNDEFINED (App (Id "Succ") [Id "n"])]
+                                 (App (Id "f") [Id "n"]) SourceInteractive
+                    matchBody = PatternMatches [zCase, succCase]
+                    lam = mkLambda "f" [Var "x" (Id "Nat") UNDEFINED] matchBody (Id "Nat")
+                    env = initialEnvironment { topLambdas = Map.fromList [("f", lam)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s terminationCheckPass
+                -- The function IS self-recursive (references "f" in body)
+                -- n is a structural subterm of x (extracted from Succ pattern)
+                warnings `shouldBe` []
+
+            it "warns on non-decreasing recursion" $ do
+                -- function loop(x:Int) : Int = loop(x);  -- no structural decrease
+                let lam = mkLambda "loop" [Var "x" (Id "Int") UNDEFINED]
+                            (App (Id "loop") [Id "x"]) (Id "Int")
+                    env = initialEnvironment { topLambdas = Map.fromList [("loop", lam)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s terminationCheckPass
+                Prelude.length warnings `shouldBe` 1
+                Prelude.head warnings `shouldSatisfy` isInfixOf "termination"
+
+            it "warns on growing argument recursion" $ do
+                -- function grow(x:Nat) : Nat = grow(Succ(x));  -- arg grows
+                let lam = mkLambda "grow" [Var "x" (Id "Nat") UNDEFINED]
+                            (App (Id "grow") [App (Id "Succ") [Id "x"]]) (Id "Nat")
+                    env = initialEnvironment { topLambdas = Map.fromList [("grow", lam)] }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s terminationCheckPass
+                Prelude.length warnings `shouldBe` 1
+
+            it "disabled when flag is off" $ do
+                let lam = mkLambda "loop" [Var "x" (Id "Int") UNDEFINED]
+                            (App (Id "loop") [Id "x"]) (Id "Int")
+                    env = initialEnvironment { topLambdas = Map.fromList [("loop", lam)] }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkTermination = False } }
+                warnings <- runAndGetWarnings s terminationCheckPass
+                warnings `shouldBe` []
+
+        -- ==================================================================
+        -- Pattern Match Coverage Checking (Pass 2.3)
+        -- ==================================================================
+        describe "coverageCheckPass" $ do
+            it "no warning when all constructors covered" $ do
+                -- type Bool = True | False, match covers both
+                let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
+                    falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
+                                 (Id "a") SourceInteractive
+                    falseCase = ExpandedCase [ExprConsTagCheck (ConsTag "False" 1) (Id "x")]
+                                  (Id "b") SourceInteractive
+                    matchBody = PatternMatches [trueCase, falseCase]
+                    lam = mkLambda "f" [Var "x" (Id "Bool") UNDEFINED] matchBody (Id "Bool")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Bool", boolType)],
+                        constructors = Map.fromList [
+                            ("True", (trueCon, 0)),
+                            ("False", (falseCon, 1))
+                        ],
+                        topLambdas = Map.fromList [("f", lam)]
+                    }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s coverageCheckPass
+                warnings `shouldBe` []
+
+            it "warns when constructor is missing" $ do
+                -- type Bool = True | False, match only covers True
+                let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
+                    falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
+                                 (Id "a") SourceInteractive
+                    matchBody = PatternMatches [trueCase]
+                    lam = mkLambda "f" [Var "x" (Id "Bool") UNDEFINED] matchBody (Id "Bool")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Bool", boolType)],
+                        constructors = Map.fromList [
+                            ("True", (trueCon, 0)),
+                            ("False", (falseCon, 1))
+                        ],
+                        topLambdas = Map.fromList [("f", lam)]
+                    }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s coverageCheckPass
+                Prelude.length warnings `shouldBe` 1
+                Prelude.head warnings `shouldSatisfy` isInfixOf "False"
+                Prelude.head warnings `shouldSatisfy` isInfixOf "coverage"
+
+            it "no warning with wildcard/default case" $ do
+                -- match with empty checks = wildcard
+                let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
+                    falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
+                                 (Id "a") SourceInteractive
+                    wildcardCase = ExpandedCase [] (Id "b") SourceInteractive
+                    matchBody = PatternMatches [trueCase, wildcardCase]
+                    lam = mkLambda "f" [Var "x" (Id "Bool") UNDEFINED] matchBody (Id "Bool")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Bool", boolType)],
+                        constructors = Map.fromList [
+                            ("True", (trueCon, 0)),
+                            ("False", (falseCon, 1))
+                        ],
+                        topLambdas = Map.fromList [("f", lam)]
+                    }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s coverageCheckPass
+                warnings `shouldBe` []
+
+            it "warns with multiple missing constructors" $ do
+                -- type Color = Red | Green | Blue, match only covers Red
+                let redCon = mkLambda "Red" [] (Tuple []) (Id "Color")
+                    greenCon = mkLambda "Green" [] (Tuple []) (Id "Color")
+                    blueCon = mkLambda "Blue" [] (Tuple []) (Id "Color")
+                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U 0))
+                    redCase = ExpandedCase [ExprConsTagCheck (ConsTag "Red" 0) (Id "x")]
+                                (Id "a") SourceInteractive
+                    matchBody = PatternMatches [redCase]
+                    lam = mkLambda "f" [Var "x" (Id "Color") UNDEFINED] matchBody (Id "Color")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Color", colorType)],
+                        constructors = Map.fromList [
+                            ("Red", (redCon, 0)),
+                            ("Green", (greenCon, 1)),
+                            ("Blue", (blueCon, 2))
+                        ],
+                        topLambdas = Map.fromList [("f", lam)]
+                    }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s coverageCheckPass
+                Prelude.length warnings `shouldBe` 1
+                Prelude.head warnings `shouldSatisfy` isInfixOf "Green"
+                Prelude.head warnings `shouldSatisfy` isInfixOf "Blue"
+
+            it "checks instance lambdas too" $ do
+                let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
+                    falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
+                                 (Id "a") SourceInteractive
+                    matchBody = PatternMatches [trueCase]
+                    lam = mkLambda "show\0Bool" [Var "x" (Id "Bool") UNDEFINED] matchBody (Id "String")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Bool", boolType)],
+                        constructors = Map.fromList [
+                            ("True", (trueCon, 0)),
+                            ("False", (falseCon, 1))
+                        ],
+                        instanceLambdas = Map.fromList [("show\0Bool", lam)]
+                    }
+                    s = mkStateWithEnv env
+                warnings <- runAndGetWarnings s coverageCheckPass
+                Prelude.length warnings `shouldBe` 1
+
+            it "disabled when flag is off" $ do
+                let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
+                    falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
+                                 (Id "a") SourceInteractive
+                    matchBody = PatternMatches [trueCase]
+                    lam = mkLambda "f" [Var "x" (Id "Bool") UNDEFINED] matchBody (Id "Bool")
+                    env = initialEnvironment {
+                        types = Map.fromList [("Bool", boolType)],
+                        constructors = Map.fromList [
+                            ("True", (trueCon, 0)),
+                            ("False", (falseCon, 1))
+                        ],
+                        topLambdas = Map.fromList [("f", lam)]
+                    }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkCoverage = False } }
+                warnings <- runAndGetWarnings s coverageCheckPass
+                warnings `shouldBe` []
+
+        -- ==================================================================
+        -- Integration: three passes on real stdlib
+        -- ==================================================================
+        describe "three passes on stdlib" $ do
+            it "positivity check produces no warnings on stdlib types" $ do
+                warnings <- runAndGetWarnings st positivityCheckPass
+                let posWarnings = Prelude.filter (isInfixOf "positivity") warnings
+                posWarnings `shouldBe` []
+
+            it "coverage check produces no errors on stdlib" $ do
+                warnings <- runAndGetWarnings st coverageCheckPass
+                let covWarnings = Prelude.filter (isInfixOf "coverage") warnings
+                covWarnings `shouldBe` []
+
+        -- ==================================================================
+        -- New Surface Syntax: +/* for type definitions (TDD — all should fail initially)
+        -- ==================================================================
+        describe "New syntax: type definitions with + and *" $ do
+
+            -- A: Enum types with + separator
+            it "A1: parses two-variant enum with +" $ do
+                res <- parseTestString "type MyBool = MyTrue + MyFalse;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "MyBool"
+                        case body lam of
+                            Constructors cs -> length cs `shouldBe` 2
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "A2: parses three-variant enum with +" $ do
+                res <- parseTestString "type Color3 = Red3 + Green3 + Blue3;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 3
+                                map lamName cs `shouldBe` ["Red3", "Green3", "Blue3"]
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "A3: parses single nullary constructor" $ do
+                res <- parseTestString "type MyUnit = MyUnitVal;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "MyUnit"
+                        case body lam of
+                            Constructors [c] -> lamName c `shouldBe` "MyUnitVal"
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- B: Single-variant types (implicit constructor from lowercase field start)
+            it "B1: parses implicit-constructor record with *" $ do
+                res <- parseTestString "type Pt = x:Float64 * y:Float64;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "Pt"
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "Pt"  -- implicit constructor name = type name
+                                length (params c) `shouldBe` 2
+                                Surface.name (head (params c)) `shouldBe` "x"
+                                Surface.name (params c !! 1) `shouldBe` "y"
+                            other -> expectationFailure $ "Expected single implicit constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "B2: parses three-field implicit record" $ do
+                res <- parseTestString "type Pers = nm:String * ag:Int * act:Bool;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "Pers"
+                                length (params c) `shouldBe` 3
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "B3: parses single-field implicit record" $ do
+                res <- parseTestString "type Wrap = val:Int;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "Wrap"
+                                length (params c) `shouldBe` 1
+                                Surface.name (head (params c)) `shouldBe` "val"
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- C: Sum types with fields using + and *
+            it "C1: parses Maybe-like with nullary + unary using +" $ do
+                res <- parseTestString "type MyMaybe(a:Type) = MyNothing + MyJust * val:a;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "MyMaybe"
+                        length (params lam) `shouldBe` 1
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (head cs) `shouldBe` "MyNothing"
+                                params (head cs) `shouldBe` []
+                                lamName (cs !! 1) `shouldBe` "MyJust"
+                                length (params (cs !! 1)) `shouldBe` 1
+                                Surface.name (head (params (cs !! 1))) `shouldBe` "val"
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "C2: parses Either-like with two unary variants" $ do
+                res <- parseTestString "type MyEither(a:Type, b:Type) = MyLeft * val:a + MyRight * val:b;"
+                case res of
+                    Right [SumType lam] -> do
+                        length (params lam) `shouldBe` 2
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (head cs) `shouldBe` "MyLeft"
+                                length (params (head cs)) `shouldBe` 1
+                                lamName (cs !! 1) `shouldBe` "MyRight"
+                                length (params (cs !! 1)) `shouldBe` 1
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "C3: parses multi-field constructors in sum" $ do
+                res <- parseTestString "type Sh = Circ * cx:Float64 * cy:Float64 * r:Float64 + Rct * w:Float64 * h:Float64;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (head cs) `shouldBe` "Circ"
+                                length (params (head cs)) `shouldBe` 3
+                                lamName (cs !! 1) `shouldBe` "Rct"
+                                length (params (cs !! 1)) `shouldBe` 2
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "C4: parses recursive sum type" $ do
+                res <- parseTestString "type MyList(a:Type) = MyNil + MyCons * hd:a * tl:MyList(a);"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (cs !! 1) `shouldBe` "MyCons"
+                                length (params (cs !! 1)) `shouldBe` 2
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "C5: parses three-way sum with mixed arity" $ do
+                res <- parseTestString "type Ex = LitE * v:Int + AddE * l:Ex * r:Ex + NegE * e:Ex;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 3
+                                map lamName cs `shouldBe` ["LitE", "AddE", "NegE"]
+                                map (length . params) cs `shouldBe` [1, 2, 1]
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- D: GADTs with new syntax
+            it "D1: parses GADT with nullary constructor return type" $ do
+                res <- parseTestString "type PEq(a:Type, b:Type) = PRefl : PEq(a, a);"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "PEq"
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "PRefl"
+                                params c `shouldBe` []
+                                -- GADT return type should be PEq(a, a), not the default PEq(a, b)
+                                case lamType c of
+                                    App (Id "PEq") [Id "a", Id "a"] -> return ()
+                                    other -> expectationFailure $ "Expected PEq(a,a), got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "D2: parses GADT with fields + return type" $ do
+                res <- parseTestString "type GV(a:Type, n:Nat) = GVNil : GV(a, Z) + GVCons * hd:a * tl:GV(a, n) : GV(a, Succ(n));"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                -- GVNil: nullary, return type GV(a, Z)
+                                lamName (head cs) `shouldBe` "GVNil"
+                                params (head cs) `shouldBe` []
+                                -- GVCons: two fields, return type GV(a, Succ(n))
+                                lamName (cs !! 1) `shouldBe` "GVCons"
+                                length (params (cs !! 1)) `shouldBe` 2
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "D3: parses multi-variant GADT" $ do
+                res <- parseTestString "type TE(a:Type) = TLI * n:Int : TE(Int) + TLB * b:Bool : TE(Bool);"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (head cs) `shouldBe` "TLI"
+                                lamName (cs !! 1) `shouldBe` "TLB"
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "D4: parses SafeOption-style GADT with Bool index" $ do
+                res <- parseTestString "type SO(a:Type, p:Bool) = SomeV * x:a : SO(a, True) + NoV : SO(a, False);"
+                case res of
+                    Right [SumType lam] -> do
+                        length (params lam) `shouldBe` 2
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                length (params (head cs)) `shouldBe` 1
+                                params (cs !! 1) `shouldBe` []
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- E: Dependent telescopes (field types reference earlier field names)
+            it "E1: parses dependent record with telescope" $ do
+                res <- parseTestString "type SV(a:Type) = n:Nat * elems:Vec(a, n);"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "SV"  -- implicit constructor
+                                length (params c) `shouldBe` 2
+                                Surface.name (head (params c)) `shouldBe` "n"
+                                Surface.name (params c !! 1) `shouldBe` "elems"
+                                -- The type of elems should reference n
+                                case typ (params c !! 1) of
+                                    App (Id "Vec") [Id "a", Id "n"] -> return ()
+                                    other -> expectationFailure $ "Expected Vec(a,n), got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "E2: parses triple-field dependent telescope" $ do
+                res <- parseTestString "type Mat(a:Type) = rows:Nat * cols:Nat * dat:Vec(Vec(a, cols), rows);"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 3
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- F: Function types in fields
+            it "F1: parses arrow type in field without parens" $ do
+                res <- parseTestString "type Hndl = hname:String * f:Int -> Bool;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 2
+                                Surface.name (params c !! 1) `shouldBe` "f"
+                                -- f's type should be Int -> Bool (Pi Nothing Int Bool)
+                                case typ (params c !! 1) of
+                                    Pi Nothing (Id "Int") (Id "Bool") -> return ()
+                                    other -> expectationFailure $ "Expected Int -> Bool, got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "F2: parses multi-arrow in field" $ do
+                res <- parseTestString "type Mpr = transform:Int -> Int -> Int * label:String;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 2
+                                Surface.name (head (params c)) `shouldBe` "transform"
+                                Surface.name (params c !! 1) `shouldBe` "label"
+                                -- transform has type Int -> Int -> Int (right-assoc arrows)
+                                case typ (head (params c)) of
+                                    Pi Nothing (Id "Int") (Pi Nothing (Id "Int") (Id "Int")) -> return ()
+                                    other -> expectationFailure $ "Expected Int -> Int -> Int, got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "F3: parses parenthesized product inside field type" $ do
+                res <- parseTestString "type Xf = f:(Int * Bool) -> String * nm:String;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 2
+                                Surface.name (head (params c)) `shouldBe` "f"
+                                Surface.name (params c !! 1) `shouldBe` "nm"
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            -- G: Dependent Pi in field
+            it "G1: parses dependent Pi in field type" $ do
+                res <- parseTestString "type DH = nm:String * f:(n:Nat) -> Vec(Int, n);"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 2
+                                Surface.name (params c !! 1) `shouldBe` "f"
+                                -- f's type: (n:Nat) -> Vec(Int, n) = Pi (Just "n") Nat (App Vec [Int, n])
+                                case typ (params c !! 1) of
+                                    Pi (Just "n") (Id "Nat") _ -> return ()
+                                    other -> expectationFailure $ "Expected dependent Pi, got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+        -- ==================================================================
+        -- New syntax: forall and exists in type expressions
+        -- ==================================================================
+        describe "New syntax: forall/exists quantifiers" $ do
+
+            it "H1: parses forall a. a -> a in type annotation" $ do
+                res <- parseTestString "function myId(x: forall a. a -> a) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        -- The param type should contain forall
+                        case typ (head (params lam)) of
+                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") (Id "a")) -> return ()
+                            other -> expectationFailure $ "Expected forall a. a -> a, got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "H2: parses forall with two variables" $ do
+                res <- parseTestString "function myConst(x: forall a b. a -> b -> a) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        case typ (head (params lam)) of
+                            Pi (Just "a") (U 0) (Pi (Just "b") (U 0) _) -> return ()
+                            other -> expectationFailure $ "Expected nested forall, got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "H3: parses forall with kind annotation" $ do
+                res <- parseTestString "function myF(x: forall (a:Type)(b:Type). a -> b) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        case typ (head (params lam)) of
+                            Pi (Just "a") (U 0) (Pi (Just "b") (U 0) _) -> return ()
+                            other -> expectationFailure $ "Expected kinded forall, got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "H4: parses unicode ∀ as alias for forall" $ do
+                res <- parseTestString "function myId2(x: ∀ a. a -> a) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        case typ (head (params lam)) of
+                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") (Id "a")) -> return ()
+                            other -> expectationFailure $ "Expected forall from ∀, got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "H5: parses exists (a:Type). body" $ do
+                res <- parseTestString "type Showable = exists (a:Type). val:a * show:a -> String;"
+                case res of
+                    Right [SumType lam] -> do
+                        -- The body of the type should contain Exists
+                        -- Exists is a new AST node or desugar - for now just check parsing succeeds
+                        lamName lam `shouldBe` "Showable"
+                    other -> expectationFailure $ "Expected SumType with exists, got: " ++ show other
+
+            it "H6: parses unicode ∃ as alias for exists" $ do
+                res <- parseTestString "type Hidden = ∃ (a:Type). a;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "Hidden"
+                    other -> expectationFailure $ "Expected SumType with ∃, got: " ++ show other
+
+            it "H7: parses multi-variable exists" $ do
+                res <- parseTestString "type BiHid = exists (a:Type)(b:Type). f:a -> b * val:a;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "BiHid"
+                    other -> expectationFailure $ "Expected SumType with multi-exists, got: " ++ show other
+
+        -- ==================================================================
+        -- New syntax: * and + as type operators in annotations
+        -- ==================================================================
+        describe "New syntax: * and + as type operators in annotations" $ do
+
+            it "I1: parses Int * Bool as product type annotation" $ do
+                res <- runFresh $ parseExpr (T.pack "42 : Int * Bool")
+                case res of
+                    Right (Typed (Lit (LInt 42)) _prodTy) -> return ()
+                    other -> expectationFailure $ "Expected typed expr with product, got: " ++ show other
+
+            it "I2: parses Int + Bool as sum type annotation" $ do
+                res <- runFresh $ parseExpr (T.pack "42 : Int + Bool")
+                case res of
+                    Right (Typed (Lit (LInt 42)) _sumTy) -> return ()
+                    other -> expectationFailure $ "Expected typed expr with sum, got: " ++ show other
+
+            it "I3: * binds tighter than + in annotations" $ do
+                -- Int * Bool + String * Char should be (Int * Bool) + (String * Char)
+                res <- parseTestString "function f(x: Int * Bool + String * Char) : Int = 42;"
+                case res of
+                    Right [Function _] -> return ()  -- just check parsing succeeds for now
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "I4: -> binds looser than * in annotations" $ do
+                -- Int * Bool -> String means (Int * Bool) -> String
+                res <- parseTestString "function f(x: Int * Bool -> String) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        case typ (head (params lam)) of
+                            Pi Nothing _ (Id "String") -> return ()
+                            other -> expectationFailure $ "Expected (... -> String), got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "I5: -> binds looser than + in annotations" $ do
+                -- a -> b + c means a -> (b + c)  (right-assoc arrow, + in codomain)
+                res <- parseTestString "function f(x: Int -> Bool + String) : Int = 42;"
+                case res of
+                    Right [Function _] -> return ()  -- just check parsing succeeds
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+            it "I6: forall scopes over everything" $ do
+                -- forall a. a -> a * a means forall a. (a -> (a * a))
+                res <- parseTestString "function f(x: forall a. a -> a * a) : Int = 42;"
+                case res of
+                    Right [Function lam] -> do
+                        case typ (head (params lam)) of
+                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") _) -> return ()
+                            other -> expectationFailure $ "Expected forall a. (a -> ...), got: " ++ show other
+                    other -> expectationFailure $ "Expected Function, got: " ++ show other
+
+        -- ==================================================================
+        -- New syntax: unpack expression
+        -- ==================================================================
+        describe "New syntax: unpack expression" $ do
+
+            it "J1: parses unpack e as (a, x) in body" $ do
+                res <- runFresh $ parseExpr (T.pack "unpack s as (a, x) in x")
+                case res of
+                    Right _ -> return ()  -- just check parsing succeeds
+                    Left err -> expectationFailure $ "Parse failed: " ++ show err
+
+        -- ==================================================================
+        -- New syntax: type composition with + (flat variant inlining)
+        -- ==================================================================
+        describe "New syntax: type composition" $ do
+
+            it "K1: parses type defined as sum of existing types" $ do
+                -- type Shape = Circle + Rect; where Circle and Rect are previously defined types
+                res <- parseTestString "type Shape2 = Circle2 + Rect2;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "Shape2"
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                map lamName cs `shouldBe` ["Circle2", "Rect2"]
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "K2: parses type extension with new fields" $ do
+                -- type LabeledPoint = Point * label:String;
+                -- Here Point is an existing type, label:String is a new field
+                -- This should parse as a single-constructor type with Point + label field
+                res <- parseTestString "type LPt = BasePt * label:String;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "LPt"
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+        -- ==================================================================
+        -- New syntax: edge cases and complex combinations
+        -- ==================================================================
+        describe "New syntax: edge cases" $ do
+
+            it "L1: empty type params still works" $ do
+                res <- parseTestString "type Void2 = Absurd2;"
+                case res of
+                    Right [SumType lam] -> do
+                        lamName lam `shouldBe` "Void2"
+                        params lam `shouldBe` []
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L2: parameterized enum (no fields, just + between constructors)" $ do
+                res <- parseTestString "type Cmp = LT2 + EQ2 + GT2;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> length cs `shouldBe` 3
+                            other -> expectationFailure $ "Expected 3 constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L3: constructor with many fields" $ do
+                res <- parseTestString "type Big = BigC * a:Int * b:Int * c:Int * d:Int * e:Int;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                lamName c `shouldBe` "BigC"
+                                length (params c) `shouldBe` 5
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L4: sum with one nullary and one multi-field variant" $ do
+                res <- parseTestString "type Res = Ok2 * val:Int * msg:String + Err2;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 2
+                                lamName (head cs) `shouldBe` "Ok2"
+                                length (params (head cs)) `shouldBe` 2
+                                lamName (cs !! 1) `shouldBe` "Err2"
+                                params (cs !! 1) `shouldBe` []
+                            other -> expectationFailure $ "Expected Constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L5: GADT nullary at start + fielded at end" $ do
+                res <- parseTestString "type FList(a:Type, n:Nat) = FNil : FList(a, Z) + FCons * hd:a * tl:FList(a, n) : FList(a, Succ(n));"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> length cs `shouldBe` 2
+                            other -> expectationFailure $ "Expected 2 constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L6: type body spanning multiple lines with + at start of line" $ do
+                res <- parseTestString "type Multi = A1 * x:Int\n  + B1 * y:Bool\n  + C1;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors cs -> do
+                                length cs `shouldBe` 3
+                                map lamName cs `shouldBe` ["A1", "B1", "C1"]
+                            other -> expectationFailure $ "Expected 3 constructors, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L7: field type is a type application" $ do
+                res <- parseTestString "type Container = items:List(Int) * count:Int;"
+                case res of
+                    Right [SumType lam] -> do
+                        case body lam of
+                            Constructors [c] -> do
+                                length (params c) `shouldBe` 2
+                                case typ (head (params c)) of
+                                    App (Id "List") [Id "Int"] -> return ()
+                                    other -> expectationFailure $ "Expected List(Int), got: " ++ show other
+                            other -> expectationFailure $ "Expected single constructor, got: " ++ show other
+                    other -> expectationFailure $ "Expected SumType, got: " ++ show other
+
+            it "L8: | still works in pattern matching (unchanged)" $ do
+                res <- parseTestString "function f(x:Bool) : Int = match x | True -> 1 | False -> 0;"
+                case res of
+                    Right [Function _] -> return ()
+                    other -> expectationFailure $ "Expected Function with match, got: " ++ show other
+
+            it "L9: function params still use comma (unchanged)" $ do
+                res <- parseTestString "function g(x:Int, y:Bool, z:String) : Int = x;"
+                case res of
+                    Right [Function lam] -> do
+                        length (params lam) `shouldBe` 3
+                    other -> expectationFailure $ "Expected Function with 3 params, got: " ++ show other
+
+        -- ==================================================================
+        -- P35: Integration tests (load + eval with new syntax)
+        -- ==================================================================
+        describe "P35: New syntax integration (load + eval)" $ do
+            it "loads P35 test program" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                let env = currentEnvironment st'
+                -- Check that types are registered
+                case lookupType "TestBool" env of
+                    Just (SumType _) -> return ()
+                    other -> expectationFailure $ "Expected TestBool type, got: " ++ show other
+                case lookupType "TestPoint" env of
+                    Just (SumType _) -> return ()
+                    other -> expectationFailure $ "Expected TestPoint type, got: " ++ show other
+                case lookupType "TestMaybe" env of
+                    Just (SumType _) -> return ()
+                    other -> expectationFailure $ "Expected TestMaybe type, got: " ++ show other
+
+            it "P35 t1: enum match returns 1 for Green2" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t1()"
+                result `shouldBe` CLMLIT (LInt 1)
+
+            it "P35 t2: record field access returns 3.0" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t2()"
+                result `shouldBe` CLMLIT (LFloat 3.0)
+
+            it "P35 t3: Maybe Just pattern match returns True" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t3()"
+                result `shouldBe` conTrue
+
+            it "P35 t4: Maybe Nothing pattern match returns False" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t4()"
+                result `shouldBe` conFalse
+
+            it "P35 t5: Either Left extraction returns 10" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t5()"
+                result `shouldBe` CLMLIT (LInt 10)
+
+            it "P35 t6: Nested sum match returns 99" $ do
+                st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
+                result <- evalExpr st' "t6()"
+                result `shouldBe` CLMLIT (LInt 99)

@@ -281,6 +281,27 @@ processSet "verbose" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { verbose = False} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose off"
 
+processSet "positivity" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkPositivity = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "positivity checking on"
+processSet "positivity" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkPositivity = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "positivity checking off"
+
+processSet "termination" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkTermination = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "termination checking on"
+processSet "termination" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkTermination = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "termination checking off"
+
+processSet "coverage" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking on"
+processSet "coverage" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking off"
+
 processSet "newstrings" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { newStrings = True} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "newstrings on" ++ " (string literals desugar to fromStringLiteral)"

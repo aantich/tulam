@@ -7,6 +7,9 @@
 module CaseOptimization
     ( caseOptimizationPass
     , checkSealedExhaustiveness
+    , positivityCheckPass
+    , terminationCheckPass
+    , coverageCheckPass
     ) where
 
 import State
@@ -19,6 +22,7 @@ import Util.PrettyPrinting as TC
 
 import Data.HashMap.Strict as Map
 import qualified Data.List
+import qualified Data.Set as Set
 
 --------------------------------------------------------------------------------
 -- PASS 2: Preliminary Optimizations and basic sanity checks
@@ -298,3 +302,241 @@ checkSealedExhaustiveness = do
     isWildcard (ExpandedCase [] _ _) = True
     isWildcard (CaseOf [] _ _)       = True
     isWildcard _                     = False
+
+-- ============================================================================
+-- POSITIVITY CHECKING (Pass 2.1)
+-- ============================================================================
+-- Ensures inductive type definitions are well-founded: the type being defined
+-- only appears in strictly positive positions in constructor arguments.
+-- Negative occurrence (e.g., type Bad = MkBad(f: Bad -> Int)) would allow
+-- non-termination and logical inconsistency.
+
+data Polarity = Positive | Negative deriving (Eq, Show)
+
+flipPolarity :: Polarity -> Polarity
+flipPolarity Positive = Negative
+flipPolarity Negative = Positive
+
+-- | Check all sum types in the environment for strict positivity.
+positivityCheckPass :: IntState ()
+positivityCheckPass = do
+    s <- get
+    let flags = currentFlags s
+    when (State.checkPositivity flags) $ do
+        let env = currentEnvironment s
+        mapM_ (checkTypePositivity env) (Map.toList (types env))
+
+checkTypePositivity :: Environment -> (Name, Expr) -> IntState ()
+checkTypePositivity env (typName, SumType lam) = do
+    case body lam of
+        Constructors cons ->
+            mapM_ (checkConstructorPositivity typName) cons
+        _ -> pure ()
+checkTypePositivity _ _ = pure ()
+
+checkConstructorPositivity :: Name -> Lambda -> IntState ()
+checkConstructorPositivity typName conLam = do
+    let conName = lamName conLam
+        paramTypes = Prelude.map typ (params conLam)
+    mapM_ (\paramTy ->
+        case checkPositive typName Positive paramTy of
+            Just path -> logWarning (LogPayload 0 0 ""
+                ("[positivity] type " ++ typName ++ " occurs in negative position in constructor "
+                 ++ conName ++ ": " ++ path ++ "\n"))
+            Nothing -> pure ()
+        ) paramTypes
+
+-- | Check that typName occurs only in positive positions in the given expression.
+-- Returns Just errorPath if a violation is found, Nothing if OK.
+checkPositive :: Name -> Polarity -> Expr -> Maybe String
+checkPositive typName Negative (Id n)
+    | n == typName = Just (typName ++ " in negative position")
+checkPositive typName Negative (App (Id n) _)
+    | n == typName = Just (typName ++ " in negative position (applied)")
+-- Arrow types: domain is contravariant (flipped), codomain is covariant
+checkPositive typName pol (Pi _ domain codomain) =
+    case checkPositive typName (flipPolarity pol) domain of
+        Just path -> Just ("in function domain: " ++ path)
+        Nothing -> checkPositive typName pol codomain
+-- Type applications: check each argument in the current polarity
+-- (conservative — a more precise check would look at variance of each param)
+checkPositive typName pol (App _ args) =
+    checkPositiveList typName pol args
+checkPositive typName pol (NTuple fields) =
+    checkPositiveList typName pol (Prelude.map snd fields)
+checkPositive _ _ _ = Nothing
+
+checkPositiveList :: Name -> Polarity -> [Expr] -> Maybe String
+checkPositiveList _ _ [] = Nothing
+checkPositiveList typName pol (e:es) =
+    case checkPositive typName pol e of
+        Just path -> Just path
+        Nothing -> checkPositiveList typName pol es
+
+-- ============================================================================
+-- TERMINATION CHECKING (Pass 2.2)
+-- ============================================================================
+-- Checks that recursive functions make structurally decreasing calls.
+-- A call is structurally decreasing if at least one argument is a strict
+-- subterm of the corresponding parameter (obtained by pattern matching).
+
+-- | Check all top-level functions for termination.
+terminationCheckPass :: IntState ()
+terminationCheckPass = do
+    s <- get
+    let flags = currentFlags s
+    when (State.checkTermination flags) $ do
+        let env = currentEnvironment s
+        let lambdas = topLambdas env
+        mapM_ (checkFuncTermination env) (Map.toList lambdas)
+
+checkFuncTermination :: Environment -> (Name, Lambda) -> IntState ()
+checkFuncTermination env (funcName, lam) = do
+    -- Collect all names referenced in the body
+    let refs = Set.fromList (collectIdRefs (body lam))
+    -- Check if function is self-recursive
+    when (funcName `Set.member` refs) $ do
+        -- Get the function's parameter names
+        let paramNames = Set.fromList (Prelude.map name (params lam))
+        -- Find all pattern-destructured bindings (constructor subterms)
+        let subterms = collectSubterms (body lam) paramNames
+        -- Find all recursive call sites
+        let callArgs = collectRecursiveCallArgs funcName (body lam)
+        -- Check that at least one recursive call has a structurally smaller argument
+        let allSafe = Prelude.all (hasDecreasingArg subterms) callArgs
+        when (not allSafe && not (Prelude.null callArgs)) $
+            logWarning (LogPayload 0 0 ""
+                ("[termination] function " ++ funcName
+                 ++ " may not terminate: no structurally decreasing argument detected in recursive call(s)\n"))
+
+-- | Collect names that are structural subterms of function parameters.
+-- When we see a pattern like | Succ(n) -> ..., then n is a subterm of the
+-- matched parameter.
+collectSubterms :: Expr -> Set.Set Name -> Set.Set Name
+collectSubterms (PatternMatches cases) paramNames =
+    Set.unions (Prelude.map (`collectSubtermsCase` paramNames) cases)
+collectSubterms _ _ = Set.empty
+
+collectSubtermsCase :: Expr -> Set.Set Name -> Set.Set Name
+-- CaseOf: patterns bind subterms when matching constructors
+collectSubtermsCase (CaseOf pats bodyExpr _) paramNames =
+    let -- Variables bound by constructor patterns whose matched value is a parameter
+        newSubterms = Set.fromList [name v | v <- pats,
+                                    isConstructorPattern (val v),
+                                    matchesParam (val v) paramNames]
+        -- Also, variables bound inside constructor applications
+        innerSubterms = Set.fromList (concatMap extractInnerBindings pats)
+    in Set.union newSubterms innerSubterms
+-- ExpandedCase: the expanded form after pass 2
+collectSubtermsCase (ExpandedCase _ bodyExpr _) paramNames =
+    collectSubterms bodyExpr paramNames
+collectSubtermsCase _ _ = Set.empty
+
+-- | Check if a value is a constructor application pattern
+isConstructorPattern :: Expr -> Bool
+isConstructorPattern (App (Id n) _) = isUpperName n
+isConstructorPattern (ConTuple _ _) = True
+isConstructorPattern _ = False
+
+-- | Check if a pattern matches (destructures) a parameter
+matchesParam :: Expr -> Set.Set Name -> Bool
+matchesParam _ _ = True  -- conservative: any constructor pattern creates subterms
+
+-- | Extract variable names bound inside constructor pattern applications
+extractInnerBindings :: Var -> [Name]
+extractInnerBindings (Var _ _ (App (Id _) args)) =
+    [n | Id n <- args, not (isUpperName n)]
+extractInnerBindings (Var _ _ (ConTuple _ args)) =
+    [n | Id n <- args, not (isUpperName n)]
+extractInnerBindings _ = []
+
+-- | Collect argument lists from recursive calls: f(arg1, arg2, ...)
+collectRecursiveCallArgs :: Name -> Expr -> [[Expr]]
+collectRecursiveCallArgs funcName = go
+  where
+    go (App (Id n) args) | n == funcName = [args] ++ concatMap go args
+    go (App f args) = go f ++ concatMap go args
+    go (NTuple fields) = concatMap (go . snd) fields
+    go (ConTuple _ es) = concatMap go es
+    go (BinaryOp _ e1 e2) = go e1 ++ go e2
+    go (UnaryOp _ e) = go e
+    go (Function lam) = go (body lam)
+    go (PatternMatches cases) = concatMap go cases
+    go (CaseOf _ e _) = go e
+    go (ExpandedCase _ e _) = go e
+    go (Typed e _) = go e
+    go _ = []
+
+-- | Check if at least one argument is a known structural subterm
+hasDecreasingArg :: Set.Set Name -> [Expr] -> Bool
+hasDecreasingArg subterms args =
+    Prelude.any isSubtermArg args
+  where
+    isSubtermArg (Id n) = n `Set.member` subterms
+    isSubtermArg _ = False
+
+isUpperName :: Name -> Bool
+isUpperName [] = False
+isUpperName (c:_) = c >= 'A' && c <= 'Z'
+
+-- ============================================================================
+-- PATTERN MATCH COVERAGE CHECKING (Pass 2.3)
+-- ============================================================================
+-- Checks that pattern matches over algebraic data types are exhaustive:
+-- all constructors of the matched type are covered, or a wildcard/default
+-- case is present.
+
+-- | Check all functions for pattern match coverage.
+coverageCheckPass :: IntState ()
+coverageCheckPass = do
+    s <- get
+    let flags = currentFlags s
+    when (State.checkCoverage flags) $ do
+        let env = currentEnvironment s
+        let lambdas = topLambdas env
+        mapM_ (checkLambdaCoverage env) (Map.elems lambdas)
+        let instLambdas = instanceLambdas env
+        mapM_ (checkLambdaCoverage env) (Map.elems instLambdas)
+
+checkLambdaCoverage :: Environment -> Lambda -> IntState ()
+checkLambdaCoverage env lam = case body lam of
+    PatternMatches cases -> checkCasesCoverage env (lamName lam) cases
+    _ -> pure ()
+
+checkCasesCoverage :: Environment -> Name -> [Expr] -> IntState ()
+checkCasesCoverage env funcName cases = do
+    -- Check if there's a wildcard/default case
+    let hasWildcard = Prelude.any isCoverageWildcard cases
+    if hasWildcard
+        then pure ()  -- wildcard covers everything
+        else do
+            -- Extract matched constructor names from all cases
+            let matchedCons = Data.List.nub [nm | ExpandedCase checks _ _ <- cases
+                                                , ExprConsTagCheck (ConsTag nm _) _ <- checks]
+            -- For each matched constructor, find its parent type
+            let parentTypes = Data.List.nub [pn | nm <- matchedCons
+                                                , Just pn <- [lookupTypeOfConstructor nm env]]
+            -- For each parent type, check exhaustiveness
+            mapM_ (checkTypeCoverage env funcName matchedCons) parentTypes
+
+checkTypeCoverage :: Environment -> Name -> [Name] -> Name -> IntState ()
+checkTypeCoverage env funcName matchedCons typName = do
+    -- Get all constructors of this type
+    case lookupType typName env of
+        Just (SumType lam) -> case body lam of
+            Constructors cons -> do
+                let allConsNames = Prelude.map lamName cons
+                    missing = Prelude.filter (`Prelude.notElem` matchedCons) allConsNames
+                when (not (Prelude.null missing)) $
+                    logWarning (LogPayload 0 0 ""
+                        ("[coverage] non-exhaustive pattern match in " ++ funcName
+                         ++ ": missing " ++ Data.List.intercalate ", " missing
+                         ++ " from type " ++ typName ++ "\n"))
+            _ -> pure ()
+        _ -> pure ()
+
+-- A case with empty checks is a wildcard/default case
+isCoverageWildcard :: Expr -> Bool
+isCoverageWildcard (ExpandedCase [] _ _) = True
+isCoverageWildcard (CaseOf [] _ _)       = True
+isCoverageWildcard _                     = False

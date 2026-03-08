@@ -36,18 +36,18 @@ data CLMExpr =
   | CLMID Name
   | CLMLAM CLMLam
   | CLMBIND Name CLMExpr
-  | CLMAPP CLMExpr [CLMExpr] -- saturated application first expr to the tuple of exprs
-  | CLMPAP CLMExpr [CLMExpr] -- partial application (When we know the types!)
-  | CLMCON ConsTag [CLMExpr] -- saturated constructor application, value in a sense
-  | CLMIAP CLMExpr [CLMExpr] -- application of a function with implicit params,
-  -- most often - part of a structure. For further type checking!
+  | CLMAPP CLMExpr [CLMExpr] -- direct function application (no dispatch needed)
+  | CLMPAP CLMExpr [CLMExpr] -- partial application (type-known, no dispatch)
+  | CLMCON ConsTag [CLMExpr] -- saturated constructor application (value)
+  | CLMIAP CLMExpr [CLMExpr] -- implicit-param application: dispatches at runtime via
+  -- type inference on args → intrinsic/instance lookup. Used for structure functions.
   | CLMFieldAccess (Name, Int) CLMExpr -- accessing a field of an expr by name or number
   | CLMCASE [CLMPatternCheck] CLMExpr -- list of pattern checks that must all fold to True bound to an expr
   | CLMPROG [CLMExpr] -- list of expressions, for now used for Action but needs to change
   | CLMTYPED CLMExpr CLMExpr -- in case we want to give a type to an expression
   | CLMPRIMCALL -- body of the function that is a primitive call
   | CLMLIT Literal
-  | CLMU Int -- Universe hierarchy: CLMU 0 = Type, CLMU 1 = Kind, etc.
+  | CLMU Level -- Universe hierarchy: CLMU (LConst 0) = Type, CLMU (LConst 1) = Kind, etc.
   | CLMARRAY [CLMExpr] -- array of CLM expressions
   | CLMREF Int -- opaque mutable reference handle (backed by IORef at runtime)
   | CLMMUTARRAY Int -- opaque mutable array handle (backed by IORef [CLMExpr] at runtime)
@@ -82,14 +82,6 @@ runPatternCheck (CLMCheckLit lit (CLMFieldAccess (nm, n) (CLMCON _ tuple)))
     | n >= 0 && n < length tuple = runPatternCheck (CLMCheckLit lit (tuple !! n))
 runPatternCheck _ = False
 
--- legacy alias for backward compatibility
-evalConsTagChecks :: [CLMConsTagCheck] -> Bool
-evalConsTagChecks [] = True
-evalConsTagChecks (ct:cts) = if (runConsTagCheck ct)
-    then evalConsTagChecks cts else False
-
-runConsTagCheck (ConsTag nm i, CLMCON (ConsTag nm1 i1) _) = (i == i1)
-runConsTagCheck _ = False
 
 resolveCase :: CLMExpr -> Maybe CLMExpr
 resolveCase (CLMCASE cts ex) = if evalPatternChecks cts then Just ex else Nothing
@@ -271,8 +263,9 @@ instance PrettyPrint CLMExpr where
     ppr (CLMFieldAccess (nm, _) ex) = ppr ex ++ "." ++ nm
     ppr (CLMPROG exs) = showListWFormat ppr "{\n" "\n}" ",\n" "{}" exs
     ppr (CLMBIND nm ex) = (as [bold] nm) ++ " = " ++ (ppr ex)
-    ppr (CLMU 0) = "Type"
-    ppr (CLMU n) = "Type" ++ show n
+    ppr (CLMU (LConst 0)) = "Type"
+    ppr (CLMU (LConst n)) = "Type" ++ show n
+    ppr (CLMU l) = "U(" ++ showLevel l ++ ")"
     ppr (CLMLIT (LInt n)) = show n
     ppr (CLMLIT (LFloat f)) = show f
     ppr (CLMLIT (LString s)) = show s
@@ -309,8 +302,59 @@ pprVar1 (nm,ex) = nm
 instance PrettyPrint CLMVar where
     ppr (nm,ex) = nm
 
-instance PrettyPrint CLMLam where 
+instance PrettyPrint CLMLam where
     ppr (CLMLam args ex) = "λ " ++ (showListRoBr ppr args) ++ ". " ++ ppr ex
     ppr (CLMLamCases args exs) = "λ " ++ (showListRoBr ppr args) ++ ". "
         ++ (showListWFormat ppr "{\n" "\n}" ",\n" "{}" exs)
+
+-- | Pure CLM evaluator for type-level normalization.
+-- Reuses applyCLMLam/resolveCases — no code duplication with the runtime evaluator.
+-- Handles: function application, pattern matching, constructor evaluation, field access.
+-- Does NOT handle: IO intrinsics, mutable refs, effect handlers, CLMIAP dispatch.
+-- The lookupFn parameter abstracts over where function definitions come from
+-- (topLambdas during type checking, clmLambdas at runtime).
+evalCLMPure :: (Name -> Maybe CLMLam) -> Int -> CLMExpr -> CLMExpr
+evalCLMPure lookupFn = go
+  where
+    maxDepth = 1000
+    go d _ | d > maxDepth = CLMERR "type-level evaluation depth exceeded" SourceInteractive
+    -- Direct application to lambda value
+    go d (CLMAPP (CLMLAM lam) args) =
+        let args' = Prelude.map (go (d+1)) args
+        in go (d+1) (applyCLMLam lam args')
+    -- Named function application: look up and apply
+    go d (CLMAPP (CLMID name) args) =
+        let args' = Prelude.map (go (d+1)) args
+        in case lookupFn name of
+            Just clmLam -> go (d+1) (applyCLMLam clmLam args')
+            Nothing     -> CLMAPP (CLMID name) args'
+    -- Nested application: evaluate the function part first
+    go d (CLMAPP f args) =
+        let f' = go (d+1) f
+            args' = Prelude.map (go (d+1)) args
+        in case f' of
+            CLMLAM lam -> go (d+1) (applyCLMLam lam args')
+            _          -> CLMAPP f' args'
+    -- Constructor: evaluate fields
+    go d (CLMCON ct fields) = CLMCON ct (Prelude.map (go (d+1)) fields)
+    -- Field access on known constructor
+    go d (CLMFieldAccess (_, i) inner) =
+        case go (d+1) inner of
+            CLMCON _ fs | i >= 0 && i < Prelude.length fs -> go (d+1) (fs !! i)
+            inner' -> CLMFieldAccess ("", i) inner'
+    -- Let binding: substitute value into body
+    go d (CLMBIND nm ex) =
+        let val = go (d+1) ex
+        in CLMBIND nm val  -- can't reduce further without knowing the continuation
+    -- Universe: normalize level
+    go _ (CLMU l) = CLMU (normalizeLevel l)
+    -- Everything else: already a value or can't reduce purely
+    go _ e = e
+
+-- | Normalize a level by evaluating concrete arithmetic
+normalizeLevel :: Level -> Level
+normalizeLevel (LConst n) = LConst n
+normalizeLevel (LVar n) = LVar n
+normalizeLevel (LSucc l) = levelSucc (normalizeLevel l)
+normalizeLevel (LMax l1 l2) = levelMax (normalizeLevel l1) (normalizeLevel l2)
 

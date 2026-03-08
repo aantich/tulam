@@ -32,20 +32,20 @@ Effects are named sets of side-effecting operations. They are distinct from alge
 
 ```tulam
 effect Console = {
-    function readLine() : String,
-    function putStrLn(s:String) : Unit,
+    function readLine() : String;
+    function putStrLn(s:String) : Unit;
     function putStr(s:String) : Unit
 };
 
 effect FileIO = {
-    function readFile(path:String) : String,
-    function writeFile(path:String, content:String) : Unit,
-    function appendFile(path:String, content:String) : Unit,
+    function readFile(path:String) : String;
+    function writeFile(path:String, content:String) : Unit;
+    function appendFile(path:String, content:String) : Unit;
     function fileExists(path:String) : Bool
 };
 
 effect Timer = {
-    function sleep(ms:Int) : Unit,
+    function sleep(ms:Int) : Unit;
     function now() : Int
 };
 ```
@@ -56,8 +56,8 @@ Effects can take type parameters:
 
 ```tulam
 effect State(s:Type) = {
-    function get() : s,
-    function put(x:s) : Unit,
+    function get() : s;
+    function put(x:s) : Unit;
     function modify(f: s -> s) : Unit
 };
 
@@ -66,7 +66,7 @@ effect Exception(e:Type) = {
 };
 
 effect Reader(r:Type) = {
-    function ask() : r,
+    function ask() : r;
     function local(f: r -> r, body: Eff { reader: Reader(r) | e } a) : Eff { reader: Reader(r) | e } a
 };
 ```
@@ -143,7 +143,7 @@ A function returning `Eff {} a` is equivalent to one returning `a`. The type che
 
 ```tulam
 function greet() : Eff { console: Console | r } Unit = action {
-    name <- readLine(),
+    name <- readLine();
     putStrLn("Hello, " ++ name)
 };
 
@@ -158,7 +158,7 @@ When no explicit effect annotation is given, the compiler **infers the effect ro
 ```tulam
 // No effect annotation — compiler infers { console: Console }
 function greet() = action {
-    name <- readLine(),
+    name <- readLine();
     putStrLn("Hello, " ++ name)
 };
 ```
@@ -180,8 +180,8 @@ function greet() : Eff { console: Console | r } Unit = action {
 
 // Can be called from a context with more effects
 function main() : Eff { console: Console, fileio: FileIO } Unit = action {
-    greet(),                          // OK: { console | r } unifies with { console, fileio }
-    config <- readFile("app.cfg"),
+    greet(); // OK: { console | r } unifies with { console, fileio }
+    config <- readFile("app.cfg");
     putStrLn(config)
 };
 ```
@@ -199,7 +199,7 @@ function readConfig(path:String) : Eff { fileio: FileIO | r } String =
     readFile(path);
 
 function showConfig() : Eff { console: Console, fileio: FileIO | r } Unit = action {
-    config <- readConfig("app.cfg"),   // contributes fileio
+    config <- readConfig("app.cfg"); // contributes fileio
     putStrLn(config)                   // contributes console
 };
 ```
@@ -216,8 +216,8 @@ Within an `action` block, each statement's effects are merged into the block's o
 
 ```tulam
 action doWork() : Eff { console: Console, fileio: FileIO, net: NetworkIO } Unit = {
-    config <- readFile("config.txt"),          // + fileio
-    data <- httpGet("https://api.example.com"), // + net
+    config <- readFile("config.txt"); // + fileio
+    data <- httpGet("https://api.example.com"); // + net
     putStrLn("Got: " ++ data)                  // + console
 };
 ```
@@ -232,8 +232,8 @@ function pureGreet(name:String) : Eff { console: Console | r } Unit =
 
 // OK: { console | r } is a subset of { console, fileio, net }
 function main() : Eff { console: Console, fileio: FileIO, net: NetworkIO } Unit = action {
-    pureGreet("Alice"),
-    data <- readFile("data.txt"),
+    pureGreet("Alice");
+    data <- readFile("data.txt");
     putStrLn(data)
 };
 ```
@@ -250,9 +250,9 @@ The `action` keyword provides do-notation for sequencing effectful operations. T
 
 ```tulam
 action functionName(params) : ReturnType = {
-    name <- effectfulExpr,       // monadic bind: run expr, bind result to name
-    localName = pureExpr,        // let-binding: pure computation
-    effectfulExpr,               // monadic sequence: run for side effect, discard result
+    name <- effectfulExpr; // monadic bind: run expr, bind result to name
+    localName = pureExpr; // let-binding: pure computation
+    effectfulExpr; // monadic sequence: run for side effect, discard result
     lastExpr                     // final expression: the return value
 };
 ```
@@ -264,8 +264,8 @@ Action blocks desugar to chains of `bind`, `seq`, and `let`:
 ```tulam
 // Source:
 action main() : Eff { console: Console } Unit = {
-    name <- readLine(),
-    greeting = "Hello, " ++ name,
+    name <- readLine();
+    greeting = "Hello, " ++ name;
     putStrLn(greeting)
 };
 
@@ -293,10 +293,10 @@ Action blocks can be nested:
 ```tulam
 action main() = {
     result <- action {
-        x <- readLine(),
-        y <- readLine(),
+        x <- readLine();
+        y <- readLine();
         pure(x ++ " " ++ y)
-    },
+    };
     putStrLn(result)
 };
 ```
@@ -331,18 +331,18 @@ For testing, mocking, and custom interpretations:
 ```tulam
 // Handler declaration
 handler StdConsole : Console = {
-    function readLine() = intrinsic,
+    function readLine() = intrinsic;
     function putStrLn(s) = intrinsic
 };
 
 handler MockConsole(inputs:List(String)) : Console = {
-    state lines = inputs,
+    state lines = inputs;
     function readLine() = action {
-        current <- get(),
+        current <- get();
         match current
             | Cons(h, t) -> action { put(t), pure(h) }
             | Nil -> pure("")
-    },
+    };
     function putStrLn(s) = pure(())  // silently discard output
 };
 
@@ -410,7 +410,7 @@ Users can override or extend this mapping:
 ```tulam
 // Project-level effect mapping configuration
 effect_map {
-    "MyCompany.Logging.*" -> logging: Logging,
+    "MyCompany.Logging.*" -> logging: Logging;
     "MyCompany.Cache.*" -> cache: CacheIO
 };
 ```
@@ -433,10 +433,10 @@ The existing `action` blocks from `InteropDesign.md` Section 8.3 gain precise ef
 
 ```tulam
 action setupUI() : Eff { gui: GUI } Unit = {
-    let form = Form.new("My App"),
-    let btn = Button.new("Click me"),
-    btn.Location = Point.new(10, 10),
-    form.Controls.Add(btn),
+    let form = Form.new("My App");
+    let btn = Button.new("Click me");
+    btn.Location = Point.new(10, 10);
+    form.Controls.Add(btn);
     form.ShowDialog()
 };
 ```
@@ -463,8 +463,8 @@ Effects and Monads **coexist**:
 ```tulam
 // Eff is a Monad (for each fixed effect row)
 instance Monad(Eff(e)) = {
-    function pure(x) = ...,
-    function bind(m, f) = ...,
+    function pure(x) = ...;
+    function bind(m, f) = ...;
     function seq(m1, m2) = bind(m1, \_ -> m2)
 };
 
@@ -516,9 +516,9 @@ Located in `lib/Effect/`:
 module Effect.Console;
 
 effect Console = {
-    function readLine() : String,
-    function putStrLn(s:String) : Unit,
-    function putStr(s:String) : Unit,
+    function readLine() : String;
+    function putStrLn(s:String) : Unit;
+    function putStr(s:String) : Unit;
     function readChar() : Char
 };
 ```
@@ -529,11 +529,11 @@ effect Console = {
 module Effect.FileIO;
 
 effect FileIO = {
-    function readFile(path:String) : String,
-    function writeFile(path:String, content:String) : Unit,
-    function appendFile(path:String, content:String) : Unit,
-    function fileExists(path:String) : Bool,
-    function deleteFile(path:String) : Unit,
+    function readFile(path:String) : String;
+    function writeFile(path:String, content:String) : Unit;
+    function appendFile(path:String, content:String) : Unit;
+    function fileExists(path:String) : Bool;
+    function deleteFile(path:String) : Unit;
     function listDirectory(path:String) : List(String)
 };
 ```
@@ -544,8 +544,8 @@ effect FileIO = {
 module Effect.State;
 
 effect State(s:Type) = {
-    function get() : s,
-    function put(x:s) : Unit,
+    function get() : s;
+    function put(x:s) : Unit;
     function modify(f: s -> s) : Unit
 };
 ```
@@ -570,8 +570,8 @@ function catch(body: Eff { exception: Exception(e) | r } a, handler: e -> Eff { 
 module Effect.Random;
 
 effect Random = {
-    function randomInt(lo:Int, hi:Int) : Int,
-    function randomFloat() : Float64,
+    function randomInt(lo:Int, hi:Int) : Int;
+    function randomFloat() : Float64;
     function randomBool() : Bool
 };
 ```
@@ -582,7 +582,7 @@ effect Random = {
 module Effect.NetworkIO;
 
 effect NetworkIO = {
-    function httpGet(url:String) : String,
+    function httpGet(url:String) : String;
     function httpPost(url:String, body:String) : String
 };
 ```
@@ -593,8 +593,8 @@ effect NetworkIO = {
 module Effect.Async;
 
 effect Async = {
-    function fork(body: Eff { async: Async | r } a) : Task(a),
-    function await(task:Task(a)) : a,
+    function fork(body: Eff { async: Async | r } a) : Task(a);
+    function await(task:Task(a)) : a;
     function sleep(ms:Int) : Unit
 };
 
@@ -766,10 +766,10 @@ action main() = {
 
 ```tulam
 action main() = {
-    putStr("What is your name? "),
-    name <- readLine(),
-    putStr("How old are you? "),
-    ageStr <- readLine(),
+    putStr("What is your name? ");
+    name <- readLine();
+    putStr("How old are you? ");
+    ageStr <- readLine();
     putStrLn("Hello, " ++ name ++ "! You are " ++ ageStr ++ " years old.")
 };
 // Inferred type: Eff { console: Console } Unit
@@ -779,9 +779,9 @@ action main() = {
 
 ```tulam
 action processFile(input:String, output:String) = {
-    content <- readFile(input),
-    let processed = toUpper(content),
-    writeFile(output, processed),
+    content <- readFile(input);
+    let processed = toUpper(content);
+    writeFile(output, processed);
     putStrLn("Processed " ++ input ++ " -> " ++ output)
 };
 // Inferred type: Eff { fileio: FileIO, console: Console } Unit
@@ -794,9 +794,9 @@ action counter(n:Int) : Eff { state: State(Int), console: Console } Unit = {
     match n
         | 0 -> pure(())
         | _ -> action {
-            current <- get(),
-            put(current + 1),
-            putStrLn("Count: " ++ toString(current + 1)),
+            current <- get();
+            put(current + 1);
+            putStrLn("Count: " ++ toString(current + 1));
             counter(n - 1)
         }
 };
@@ -811,35 +811,35 @@ let result = handle (counter 5) with StateHandler(0);
 ```tulam
 // Production handler
 handler StdConsole : Console = {
-    function readLine() = intrinsic,
-    function putStrLn(s) = intrinsic,
+    function readLine() = intrinsic;
+    function putStrLn(s) = intrinsic;
     function putStr(s) = intrinsic
 };
 
 // Test handler — captures output, provides scripted input
 handler TestConsole(inputs:List(String)) : Console = {
-    state inputQueue = inputs,
-    state outputLog = Nil,
+    state inputQueue = inputs;
+    state outputLog = Nil;
 
     function readLine() = action {
-        queue <- get(),
+        queue <- get();
         match queue
             | Cons(h, t) -> action { put(t), pure(h) }
             | Nil -> pure("")
-    },
+    };
     function putStrLn(s) = action {
-        log <- get(),
+        log <- get();
         put(Cons(s, log))
-    },
+    };
     function putStr(s) = action {
-        log <- get(),
+        log <- get();
         put(Cons(s, log))
     }
 };
 
 // Test
 action testGreeting() = {
-    let (result, state) = handle greet() with TestConsole(["Alice"]),
+    let (result, state) = handle greet() with TestConsole(["Alice"]);
     assert(state.outputLog == ["Hello, Alice!"])
 };
 ```
@@ -850,8 +850,8 @@ action testGreeting() = {
 import System.IO target dotnet;
 
 action readAndParse(path:String) : Eff { fileio: FileIO } List(Int) = {
-    content <- File.ReadAllText(path),   // .NET call, auto-tagged as fileio
-    let lines = String.Split(content, "\n"),
+    content <- File.ReadAllText(path); // .NET call, auto-tagged as fileio
+    let lines = String.Split(content, "\n");
     pure(map(parseInt, lines))
 };
 ```
@@ -891,8 +891,8 @@ When linear types are added (future phase), they can complement effects for reso
 ```tulam
 // Linear effect for resources that must be closed
 effect Resource(r:Type) = {
-    function open(path:String) : !r,    // returns linear handle
-    function close(handle: !r) : Unit,  // consumes linear handle
+    function open(path:String) : !r; // returns linear handle
+    function close(handle: !r) : Unit; // consumes linear handle
     function read(handle: &r) : String  // borrows handle (doesn't consume)
 };
 ```
@@ -905,7 +905,7 @@ Async/await can be modeled as an effect:
 
 ```tulam
 action fetchAll(urls:List(String)) : Eff { async: Async, net: NetworkIO } List(String) = {
-    tasks <- mapM(\url -> fork(httpGet(url)), urls),  // fork = Async effect
+    tasks <- mapM(\url -> fork(httpGet(url)), urls); // fork = Async effect
     mapM(await, tasks)                                 // await = Async effect
 };
 ```

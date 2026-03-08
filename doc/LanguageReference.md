@@ -116,14 +116,25 @@ Square brackets with comma-separated elements:
 []
 ```
 
-### Tuples
+### Tuples (NTuple)
 
-Curly braces with comma-separated elements:
+Curly braces with comma-separated elements. Tuples and record literals are unified: both are `NTuple` values with optional field names.
+
+**Positional tuple** (unnamed fields):
 
 ```
 {1, 2, 3}
 {True, Z}
 ```
+
+**Named tuple** (record literal):
+
+```
+{x = 1, y = 2}
+{name = "Alice", age = 30}
+```
+
+Positional tuples infer as product types (TSigma chain); named tuples infer as structural record types (TRecord with row polymorphism). At runtime, both compile to `CLMCON` — the same underlying representation.
 
 Tuples are one of the two fundamental primitives in tulam.
 
@@ -346,6 +357,33 @@ function isOrigin(p:Point) : Bool = match
 ```
 
 Unspecified fields become wildcards. Field punning is supported: `{ x }` means `{ x = x }` (binds field to same-name variable).
+
+### Sum-of-Records
+
+When a sum type constructor name matches an existing record type, the constructor automatically inherits that record's fields:
+
+```
+record Rect = { w:Int, h:Int };
+record Circle = { radius:Int };
+type Shape = Rect | Circle;   // Rect(w:Int, h:Int) | Circle(radius:Int)
+```
+
+This allows pattern matching on the inherited fields:
+
+```
+function area(s:Shape) : Int = match
+    | Rect(w, h) -> w * h
+    | Circle(r) -> r * r * 3;
+```
+
+### Structural Subtyping
+
+Nominal record types are structurally compatible with matching structural record types. A function expecting `{x:Int, y:Int}` can accept a `Point` value:
+
+```
+function getX(p: {x:Int, y:Int}) : Int = p.x;
+getX(Point(3, 4))   // returns 3
+```
 
 ---
 
@@ -571,8 +609,8 @@ The `repr` declaration defines a mapping between a user-defined type and a machi
 
 ```
 repr UserType as ReprType [default] where {
-    function toRepr(x:UserType) : ReprType = ...,
-    function fromRepr(x:ReprType) : UserType = ...[,
+    function toRepr(x:UserType) : ReprType = ...;
+    function fromRepr(x:ReprType) : UserType = ...[;
     invariant(x:ReprType) = expr]
 };
 ```
@@ -593,7 +631,7 @@ repr Nat as Int default where {
     function toRepr(n:Nat) : Int =
         match
         | Z       -> 0
-        | Succ(m) -> 1 + toRepr(m),
+        | Succ(m) -> 1 + toRepr(m);
     function fromRepr(i:Int) : Nat = if i == 0 then Z else Succ(fromRepr(i - 1))
 };
 ```
@@ -654,7 +692,7 @@ The `repr` declaration supports parameterized types as the user type. This enabl
 
 ```
 repr Array(Byte) as PackedBytes where {
-    function toRepr(a:Array(Byte)) : PackedBytes = ...,
+    function toRepr(a:Array(Byte)) : PackedBytes = ...;
     function fromRepr(p:PackedBytes) : Array(Byte) = ...
 };
 ```
@@ -754,6 +792,181 @@ Operators can be defined as functions by wrapping the operator in parentheses:
 function (==)(x, y:a) : Bool = not(x != y);
 function (!=)(x, y:a) : Bool = not(x == y);
 ```
+
+---
+
+## Pi Types (Dependent Function Types)
+
+tulam's type system is built on **Pi types** — the type-theoretic foundation for function types. A Pi type `(x:A) -> B(x)` describes a function that takes an argument `x` of type `A` and returns a value of type `B`, where `B` can depend on the value of `x`. This is the key enabler for dependent typing.
+
+### Non-Dependent Arrow Types
+
+The familiar arrow type `A -> B` is just a Pi type where the return type does not depend on the argument:
+
+```
+Int -> Bool              -- function from Int to Bool
+Int -> Int -> Int        -- curried: Int -> (Int -> Int), right-associative
+(Int -> Bool) -> Int     -- higher-order: takes a function as argument
+```
+
+These are unchanged from earlier tulam versions. Internally, `A -> B` is represented as `Pi Nothing A B`.
+
+### Dependent Pi Types
+
+A **dependent Pi type** binds a name so the return type can reference the argument:
+
+```
+(n:Nat) -> Vec(a, n)                    -- return type depends on n
+(n:Nat) -> (m:Nat) -> Vec(a, plus(n,m)) -- chained dependent bindings
+(a:Type) -> (x:a) -> a                  -- polymorphic identity type
+(n:Nat) -> Int -> Nat                   -- mixed: first dep, second non-dep
+```
+
+**Syntax rule**: `(lowercase_name : Type) -> Body` in a type position is a dependent Pi binding. The parenthesized `(name:Type)` part binds the name for use in the body. This is unambiguous because type names start uppercase and variable names start lowercase.
+
+### In Function Definitions
+
+Function parameters naturally create Pi types. The type checker preserves parameter names, enabling dependent return types:
+
+```
+// Return type references parameter n
+function replicate(n:Nat, x:a) : Vec(a, n) = ...;
+
+// Return type uses type-level function call (requires normalizer, future)
+function concat(n:Nat, m:Nat, xs:Vec(a,n), ys:Vec(a,m)) : Vec(a, plus(n,m)) = ...;
+
+// Later parameter's type depends on earlier parameter
+function lookup(n:Nat, xs:Vec(a, Succ(n))) : a = ...;
+```
+
+The type checker infers the function's type as a nested Pi:
+- `replicate : (n:Nat) -> (x:a) -> Vec(a, n)` — `TPi (Just "n") Nat (TPi (Just "x") a (Vec a n))`
+- Parameters with names `""` or `"_"` produce non-dependent arrows `TPi Nothing`
+
+### In Parameter Types (Higher-Order Dependent Functions)
+
+Dependent Pi types can appear as parameter types, enabling higher-order functions that accept dependent functions:
+
+```
+// Accept a dependent function as an argument
+function applyDep(f: (n:Nat) -> Nat, k:Nat) : Nat = f(k);
+
+// Chained dependent Pi as parameter type
+function applyDep2(f: (n:Nat) -> (m:Nat) -> Nat, a:Nat, b:Nat) : Nat = f(a)(b);
+
+// Polymorphic map that preserves length
+function vmap(n:Nat, f: a -> b, xs:Vec(a, n)) : Vec(b, n) = ...;
+```
+
+### With Operators
+
+Operators are functions and support dependent types in their signatures:
+
+```
+infixr 5 (++);
+
+// Length-indexed append (n, m are explicit until implicit inference lands)
+function (++)[a:Type](n:Nat, m:Nat, x:Vec(a,n), y:Vec(a,m)) : Vec(a, plus(n,m)) = ...;
+```
+
+### In Structure/Algebra Signatures
+
+Dependent types in algebra member signatures enable indexed-type operations:
+
+```
+algebra VectorSpace(a:Type) = {
+    function zero(n:Nat) : Vec(a, n);
+    function add(n:Nat, x:Vec(a,n), y:Vec(a,n)) : Vec(a, n);
+    function scale(n:Nat, s:a, x:Vec(a,n)) : Vec(a, n);
+};
+```
+
+### Dependent Substitution in Type Checking
+
+When applying a dependent function, the type checker substitutes the bound variable in the return type:
+
+```
+// Given: f : (n:Nat) -> Vec(Int, n)
+// Applying: f(Succ(Succ(Z)))
+// Type checker substitutes n := Succ(Succ(Z)) in return type
+// Result type: Vec(Int, Succ(Succ(Z)))
+```
+
+This is the core mechanism that makes dependent types work. For each `TPi (Just name) paramTy retTy`, application to an argument substitutes `name` with the argument's type throughout `retTy`.
+
+### Type-Level Computation
+
+The type checker can evaluate tulam functions at the type level. When a type expression contains a function application with concrete arguments, the normalizer reduces it using the same evaluation logic as runtime:
+
+```
+// The type checker evaluates plus(Succ(Z), Succ(Z)) during type checking:
+function g(n:Nat, m:Nat) : Vec(Int, plus(n, m)) = ...;
+g(Succ(Z), Succ(Z))
+// TC substitutes n:=Succ(Z), m:=Succ(Z)
+// Return type: Vec(Int, plus(Succ(Z), Succ(Z)))
+// Normalizer evaluates: plus(Succ(Z), Succ(Z)) → Succ(Succ(Z))
+// Final type: Vec(Int, Succ(Succ(Z)))
+```
+
+This works because:
+1. The universe hierarchy (`Type : Type1 : Type2 : ...`) allows values like `Succ(Z)` to appear in type positions
+2. Functions like `plus` are ordinary tulam functions that operate on these values
+3. The normalizer (`evalCLMPure`) reuses the same evaluation core as the runtime — `applyCLMLam`, `resolveCases`, `simultBetaReduce` from CLM.hs
+4. No separate "type-level language" is needed — tulam programs execute at all universe levels
+
+**What the normalizer handles:**
+- Pattern matching on constructors (e.g., `plus(Z, n) → n`)
+- Function application with beta reduction
+- Nested evaluation (e.g., `plus(plus(Z,Z), Succ(Z))`)
+- Constructor field access
+
+**What it does NOT handle (yet):**
+- IO intrinsics (type-level computation is pure)
+- Mutable references and effects
+- Implicit-parameter dispatch (CLMIAP)
+
+**Normalization is lazy** — the type checker only invokes the normalizer when standard unification fails, or after dependent variable substitution. This avoids unnecessary computation for the common case where types match structurally.
+
+### Universe Cumulativity
+
+tulam has a hierarchy of universes: `Type` (= `U 0`), `Type1` (= `U 1`), `Type2`, etc. Values live at level 0, types of values at level 1, kinds at level 2, and so on.
+
+**Cumulativity** means a type at universe level `n` is automatically valid at any higher level `m ≥ n`:
+
+```
+Nat : Type              -- Nat lives at U 0
+Nat : Type1             -- also valid at U 1 (by cumulativity)
+Type : Type1            -- types of types live at U 1
+Type : Type2            -- also valid at U 2
+```
+
+This is crucial for type-level computation: functions like `plus : Nat -> Nat -> Nat` are defined at level 0, but `Nat` values appear inside type-level expressions at level 1 (e.g., `Vec(a, plus(n,m))`). Cumulativity ensures these level crossings are well-typed — `plus` works at the type level because `Nat` lifts from `U 0` to `U 1` automatically.
+
+**Rules:**
+- `U n` unifies with `U m` when `n ≤ m` (lower levels are subtypes of higher levels)
+- `U n` does NOT unify with `U m` when `n > m` (higher levels don't collapse downward)
+- This is one-directional: lifting is implicit, lowering is not
+
+**Future: Explicit Level Polymorphism (Option C)**
+
+For fully principled universe polymorphism, tulam plans to eventually support explicit `Level` parameters:
+
+```
+// Future syntax — not yet implemented:
+function id[l:Level](a:U(l), x:a) : a = x;
+```
+
+This would allow writing functions that are explicitly parametric over universe levels, as in Agda. Cumulativity covers the common cases; level polymorphism handles the rare edge cases where functions must be truly level-generic.
+
+### Relationship to the Internal Type System
+
+| Surface AST | Internal `Ty` | Meaning |
+|-------------|---------------|---------|
+| `Pi Nothing A B` | `TPi Nothing ta tb` | Non-dependent: `A -> B` |
+| `Pi (Just "x") A B` | `TPi (Just "x") ta tb` | Dependent: `(x:A) -> B(x)` |
+| `ArrowType A B` | `TArrow ta tb` | Pattern synonym for `Pi Nothing A B` |
+
+The pattern synonym `ArrowType a b = Pi Nothing a b` ensures full backward compatibility. Existing code using `ArrowType` continues to work unchanged.
 
 ---
 
@@ -913,7 +1126,7 @@ Structures are tulam's equivalent of Haskell's typeclasses. They define a set of
 
 ```
 structure Name(args) = {
-  function fn1(params) : ReturnType = defaultImpl,
+  function fn1(params) : ReturnType = defaultImpl;
   function fn2(params) : ReturnType = defaultImpl
 };
 ```
@@ -950,9 +1163,9 @@ The compiler issues a warning (not an error) if:
 
 ```
 algebra Eq(a:Type) = {
-  function (==)(x, y:a) : Bool = not(x != y),
-  function (!=)(x, y:a) : Bool = not(x == y),
-  law reflexivity(x:a) = (x == x) === True,
+  function (==)(x, y:a) : Bool = not(x != y);
+  function (!=)(x, y:a) : Bool = not(x == y);
+  law reflexivity(x:a) = (x == x) === True;
   law symmetry(x:a, y:a) = (x == y) === (y == x)
 };
 ```
@@ -1069,7 +1282,7 @@ algebra Child(a:Type) extends Parent1(a), Parent2(a) = {
 
 ```
 algebra Semigroup(a:Type) = {
-    function combine(x:a, y:a) : a,
+    function combine(x:a, y:a) : a;
     law associativity(x:a, y:a, z:a) =
         combine(x, combine(y, z)) === combine(combine(x, y), z)
 };
@@ -1079,7 +1292,7 @@ algebra Monoid(a:Type) extends Semigroup(a) = {
 };
 
 instance Monoid(Nat) = {
-    function combine(x:Nat, y:Nat) : Nat = plus(x, y),
+    function combine(x:Nat, y:Nat) : Nat = plus(x, y);
     function empty() : Nat = Z
 };
 // combine is now available via both Semigroup(Nat) and Monoid(Nat)
@@ -1203,7 +1416,7 @@ When you declare an instance, tulam automatically validates that you have provid
 
 ```tulam
 algebra Eq(a:Type) = {
-  function (==)(x, y:a) : Bool = not(x != y),
+  function (==)(x, y:a) : Bool = not(x != y);
   function (!=)(x, y:a) : Bool = not(x == y)
 };
 
@@ -1225,10 +1438,10 @@ instance Eq(BadType) = {};
 
 ```tulam
 algebra Ord(a:Type) extends Eq(a) = {
-  function compare(x:a, y:a) : Ordering,
-  function (<)(x:a, y:a) : Bool = match compare(x, y) | LessThan -> True | _ -> False,
-  function (>)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | _ -> False,
-  function (>=)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | Equal -> True | _ -> False,
+  function compare(x:a, y:a) : Ordering;
+  function (<)(x:a, y:a) : Bool = match compare(x, y) | LessThan -> True | _ -> False;
+  function (>)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | _ -> False;
+  function (>=)(x:a, y:a) : Bool = match compare(x, y) | GreaterThan -> True | Equal -> True | _ -> False;
   function (<=)(x:a, y:a) : Bool = match compare(x, y) | LessThan -> True | Equal -> True | _ -> False
 };
 
@@ -1266,7 +1479,7 @@ A class bundles data fields with methods:
 
 ```
 class Animal(name:String, age:Int) = {
-    function speak(self:Animal) : String = "...",
+    function speak(self:Animal) : String = "...";
     function info(self:Animal) : String = self.name
 };
 ```
@@ -1296,7 +1509,7 @@ Single inheritance via `extends`:
 
 ```
 class Dog(breed:String) extends Animal = {
-    override function speak(self:Dog) : String = "Woof!",
+    override function speak(self:Dog) : String = "Woof!";
     function fetch(self:Dog, item:String) : String =
         self.name ++ " fetches " ++ item
 };
@@ -1339,7 +1552,7 @@ The object carries its actual class tag (`ConsTag`). The interpreter looks up th
 
 ```
 abstract class Shape(color:String) = {
-    function area(self:Shape) : Float64,        // abstract — no body
+    function area(self:Shape) : Float64; // abstract — no body
     function describe(self:Shape) : String =    // concrete — has body
         "A " ++ self.color ++ " shape"
 };
@@ -1384,8 +1597,8 @@ Classes can implement algebras (typeclasses) via the `implements` clause:
 
 ```
 class Circle(radius:Float64) extends Shape implements Eq, Show = {
-    function area(self:Circle) : Float64 = 3.14159 * self.radius * self.radius,
-    function (==)(self:Circle, other:Circle) : Bool = self.radius == other.radius,
+    function area(self:Circle) : Float64 = 3.14159 * self.radius * self.radius;
+    function (==)(self:Circle, other:Circle) : Bool = self.radius == other.radius;
     function show(self:Circle) : String = "Circle(r=" ++ show(self.radius) ++ ")"
 };
 ```
@@ -1504,17 +1717,17 @@ Algebras can include a `derive { }` block that provides generic implementations 
 
 ```
 algebra Eq(a:Type) = {
-    function (==)(x:a, y:a) : Bool,
-    function (!=)(x:a, y:a) : Bool = not(x == y),
+    function (==)(x:a, y:a) : Bool;
+    function (!=)(x:a, y:a) : Bool = not(x == y);
 
     derive {
-        function (==)(x, y:a) : Bool = structuralEq(x, y),
+        function (==)(x, y:a) : Bool = structuralEq(x, y);
         function (!=)(x, y:a) : Bool = not(structuralEq(x, y))
     }
 };
 ```
 
-The `derive { }` block appears after the algebra's function declarations (separated by a comma). It contains function definitions that will be instantiated when a user writes `instance AlgebraName(Type) = derive;`.
+The `derive { }` block appears after the algebra's function declarations (separated by a semicolon). It contains function definitions that will be instantiated when a user writes `instance AlgebraName(Type) = derive;`.
 
 ### Standard Library Derive Blocks
 
@@ -1557,20 +1770,20 @@ See `doc/EffectDesign.md` for the full design rationale and worked examples.
 
 ```
 effect Console = {
-    function readLine() : String,
-    function putStrLn(s:String) : Unit,
+    function readLine() : String;
+    function putStrLn(s:String) : Unit;
     function putStr(s:String) : Unit
 };
 
 effect FileIO = {
-    function readFile(path:String) : String,
+    function readFile(path:String) : String;
     function writeFile(path:String, content:String) : Unit
 };
 
 // Parameterized effects
 effect State(s:Type) = {
-    function get() : s,
-    function put(x:s) : Unit,
+    function get() : s;
+    function put(x:s) : Unit;
     function modify(f: s -> s) : Unit
 };
 ```
@@ -1590,13 +1803,13 @@ Eff {} Unit                                       // pure: no effects (≅ plain
 ```
 // Explicit effect annotation
 function greet() : Eff { console: Console | r } Unit = action {
-    name <- readLine(),
+    name <- readLine();
     putStrLn("Hello, " ++ name)
 };
 
 // Effect inference — compiler infers effect row from body
 function greet() = action {
-    name <- readLine(),
+    name <- readLine();
     putStrLn("Hello, " ++ name)
 };
 
@@ -1610,7 +1823,7 @@ When effectful functions are composed, their effect rows are automatically merge
 
 ```
 function showConfig() : Eff { console: Console, fileio: FileIO | r } Unit = action {
-    config <- readFile("app.cfg"),   // contributes fileio
+    config <- readFile("app.cfg"); // contributes fileio
     putStrLn(config)                 // contributes console
 };
 ```
@@ -1625,7 +1838,7 @@ Handlers provide implementations for effect operations and eliminate effect labe
 
 ```
 handler StdConsole : Console = {
-    function readLine() = intrinsic,
+    function readLine() = intrinsic;
     function putStrLn(s) = intrinsic
 };
 
@@ -1641,8 +1854,8 @@ Handlers can take parameters, enabling stateful or configurable effect implement
 
 ```
 handler RefState(init:a) : State = {
-    let state = newRef(init),
-    function get() = readRef(state),
+    let state = newRef(init);
+    function get() = readRef(state);
     function put(x) = writeRef(state, x)
 };
 
@@ -1658,14 +1871,14 @@ The `let` bindings inside a handler are evaluated once when the handler is insta
 ```
 // Simple handler (no parameters)
 handler Name : Effect = {
-    function op(args) = body,
+    function op(args) = body;
     ...
 };
 
 // Parameterized handler (with let bindings)
 handler Name(params) : Effect = {
-    let binding = expr,
-    function op(args) = body,
+    let binding = expr;
+    function op(args) = body;
     ...
 };
 
@@ -1704,9 +1917,9 @@ Actions provide syntactic sugar for sequencing effectful operations, similar to 
 
 ```
 action name(args) : ReturnType = {
-    name <- effectfulExpr,       // monadic bind
-    localName = pureExpr,        // let-binding
-    effectfulExpr,               // execute for side effect
+    name <- effectfulExpr; // monadic bind
+    localName = pureExpr; // let-binding
+    effectfulExpr; // execute for side effect
     lastExpr                     // return value
 };
 ```
@@ -1730,16 +1943,16 @@ action main() = {
 
 // Interactive program
 action main() = {
-    putStr("Name? "),
-    name <- readLine(),
+    putStr("Name? ");
+    name <- readLine();
     putStrLn("Hello, " ++ name)
 };
 
 // File processing
 action processFile(input:String, output:String) = {
-    content <- readFile(input),
-    processed = toUpper(content),
-    writeFile(output, processed),
+    content <- readFile(input);
+    processed = toUpper(content);
+    writeFile(output, processed);
     putStrLn("Done")
 };
 ```
@@ -1750,9 +1963,9 @@ The older action syntax (without `<-`) still works for pure sequencing:
 
 ```
 action main = {
-  one = Succ(Z),
-  three = Succ(Succ(one)),
-  res = plus(three, one),
+  one = Succ(Z);
+  three = Succ(Succ(one));
+  res = plus(three, one);
   print#(res)
 };
 ```
@@ -2038,26 +2251,26 @@ Example algebra definitions:
 
 ```
 algebra Semigroup(a:Type) = {
-    function combine(x:a, y:a) : a,
+    function combine(x:a, y:a) : a;
     law associativity(x:a, y:a, z:a) = combine(combine(x, y), z) === combine(x, combine(y, z))
 };
 
 algebra Group(a:Type) extends Monoid(a) = {
-    function inverse(x:a) : a,
-    law left_inverse(x:a) = combine(inverse(x), x) === empty,
+    function inverse(x:a) : a;
+    law left_inverse(x:a) = combine(inverse(x), x) === empty;
     law right_inverse(x:a) = combine(x, inverse(x)) === empty
 };
 
 algebra Semiring(a:Type) extends AdditiveMonoid(a), MultiplicativeMonoid(a) = {
-    law left_distributivity(x:a, y:a, z:a)  = x * (y + z) === x * y + x * z,
-    law right_distributivity(x:a, y:a, z:a) = (x + y) * z === x * z + y * z,
-    law annihilation(x:a) = zero * x === zero,
+    law left_distributivity(x:a, y:a, z:a)  = x * (y + z) === x * y + x * z;
+    law right_distributivity(x:a, y:a, z:a) = (x + y) * z === x * z + y * z;
+    law annihilation(x:a) = zero * x === zero;
     law additive_commutativity(x:a, y:a) = x + y === y + x
 };
 
 algebra EuclideanDomain(a:Type) extends CommutativeRing(a) = {
-    function div(x:a, y:a) : a,
-    function mod(x:a, y:a) : a,
+    function div(x:a, y:a) : a;
+    function mod(x:a, y:a) : a;
     law division(x:a, y:a) = div(x, y) * y + mod(x, y) === x
 };
 
@@ -2070,19 +2283,19 @@ algebra Field(a:Type) extends CommutativeRing(a), MultiplicativeGroup(a) = {
 
 ```
 algebra Eq(a:Type) = {
-    function (==)(x,y:a) : Bool = not(x != y),
-    function (!=)(x,y:a) : Bool = not(x == y),
-    law reflexivity(x:a)  = (x == x) === True,
-    law symmetry(x:a, y:a) = (x == y) === (y == x),
+    function (==)(x,y:a) : Bool = not(x != y);
+    function (!=)(x,y:a) : Bool = not(x == y);
+    law reflexivity(x:a)  = (x == x) === True;
+    law symmetry(x:a, y:a) = (x == y) === (y == x);
     law transitivity(x:a, y:a, z:a) = ((x == y) === True) ==> ((y == z) === True) ==> ((x == z) === True)
 };
 
 algebra Ord(a:Type) extends Eq(a) = {
-    function compare(x:a, y:a) : Ordering,
-    function (<)(x:a, y:a) : Bool,  function (>)(x:a, y:a) : Bool,
-    function (<=)(x:a, y:a) : Bool, function (>=)(x:a, y:a) : Bool,
-    law trichotomy(x:a, y:a)    = (x < y) === not(x >= y),
-    law antisymmetry(x:a, y:a)  = ((x <= y) === True) ==> ((y <= x) === (x == y)),
+    function compare(x:a, y:a) : Ordering;
+    function (<)(x:a, y:a) : Bool;  function (>)(x:a, y:a) : Bool;
+    function (<=)(x:a, y:a) : Bool; function (>=)(x:a, y:a) : Bool;
+    law trichotomy(x:a, y:a)    = (x < y) === not(x >= y);
+    law antisymmetry(x:a, y:a)  = ((x <= y) === True) ==> ((y <= x) === (x == y));
     law transitivity(x:a, y:a, z:a) = ((x <= y) === True) ==> ((y <= z) === True) ==> ((x <= z) === True)
 };
 ```
@@ -2091,8 +2304,8 @@ algebra Ord(a:Type) extends Eq(a) = {
 
 ```
 algebra Functor(f:Type1) = {
-    function fmap(g: a -> b, x:f(a)) : f(b),
-    law identity(x:f(a)) = fmap(id, x) === x,
+    function fmap(g: a -> b, x:f(a)) : f(b);
+    law identity(x:f(a)) = fmap(id, x) === x;
     law composition(f:b -> c, g:a -> b, x:f(a)) =
         fmap(compose(f, g), x) === fmap(f, fmap(g, x))
 };
@@ -2100,10 +2313,10 @@ algebra Functor(f:Type1) = {
 algebra Applicative(f:Type1) extends Functor(f) = { ... };
 
 algebra Monad(m:Type1) extends Applicative(m) = {
-    function bind(x:m(a), f: a -> m(b)) : m(b),
-    function seq(x:m(a), y:m(b)) : m(b),
-    law left_identity(x:a, f: a -> m(b))  = bind(pure(x), f) === f(x),
-    law right_identity(x:m(a)) = bind(x, pure) === x,
+    function bind(x:m(a), f: a -> m(b)) : m(b);
+    function seq(x:m(a), y:m(b)) : m(b);
+    law left_identity(x:a, f: a -> m(b))  = bind(pure(x), f) === f(x);
+    law right_identity(x:m(a)) = bind(x, pure) === x;
     law associativity(x:m(a), f: a -> m(b), g: b -> m(c)) =
         bind(bind(x, f), g) === bind(x, \y -> bind(f(y), g))
 };
@@ -2135,10 +2348,10 @@ The `StringLike` algebra defines universal string operations:
 
 ```
 algebra StringLike(s:Type) extends Eq(s), Ord(s), Monoid(s) = {
-    function byteLength(s:s) : Int,
-    function strSlice(s:s, start:Int, end:Int) : s,
-    function strDecodeAt(s:s, byteOffset:Int) : Maybe(Pair(Char, Int)),
-    function strIndexOf(haystack:s, needle:s) : Int,
+    function byteLength(s:s) : Int;
+    function strSlice(s:s, start:Int, end:Int) : s;
+    function strDecodeAt(s:s, byteOffset:Int) : Maybe(Pair(Char, Int));
+    function strIndexOf(haystack:s, needle:s) : Int;
     function strFromChar(c:Char) : s
     // ... plus ~25 defaulted methods: strStartsWith, strEndsWith,
     // charCount, nthChar, strSplit, strJoin, strReplace, etc.
@@ -2206,9 +2419,9 @@ The `Eq` algebra provides overloaded equality with law declarations:
 
 ```
 algebra Eq(a:Type) = {
-  function (==)(x, y:a) : Bool = not(x != y),
-  function (!=)(x, y:a) : Bool = not(x == y),
-  law reflexivity(x:a) = (x == x) === True,
+  function (==)(x, y:a) : Bool = not(x != y);
+  function (!=)(x, y:a) : Bool = not(x == y);
+  law reflexivity(x:a) = (x == x) === True;
   law symmetry(x:a, y:a) = (x == y) === (y == x)
 };
 
@@ -2232,10 +2445,10 @@ instance Eq(Bool) = {
 type Ordering = LessThan | Equal | GreaterThan;
 
 algebra Ord(a:Type) extends Eq(a) = {
-    function compare(x:a, y:a) : Ordering,
-    function (<)(x:a, y:a) : Bool,
-    function (>)(x:a, y:a) : Bool,
-    function (<=)(x:a, y:a) : Bool,
+    function compare(x:a, y:a) : Ordering;
+    function (<)(x:a, y:a) : Bool;
+    function (>)(x:a, y:a) : Bool;
+    function (<=)(x:a, y:a) : Bool;
     function (>=)(x:a, y:a) : Bool
 };
 ```

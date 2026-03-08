@@ -2,10 +2,11 @@
 {-# LANGUAGE OverloadedStrings, RecordWildCards, MultiParamTypeClasses #-}
 
 
-module Util.IOLogger 
+module Util.IOLogger
 (
     LogMessage(..),
     LogLevel(..),
+    LogState(..),
     LoggerMonadIO,
 
     initLogState,

@@ -106,7 +106,7 @@ Override how the compiler sees specific methods — primarily for tulam-ifying t
 extern class Dictionary(K:Type, V:Type) =
     System.Collections.Generic.Dictionary target dotnet {
     // Override: Get returns Maybe instead of throwing KeyNotFoundException
-    method Get(key:K) : Maybe(V),
+    method Get(key:K) : Maybe(V);
     // Override: indexer also returns Maybe
     method get(index:K) : Maybe(V)
 };
@@ -120,8 +120,8 @@ When no `.d.ts` is available, the user provides the shape:
 
 ```
 extern type lodash target js {
-    method chunk(arr:List(a), size:Int) : List(List(a)),
-    method flatten(arr:List(List(a))) : List(a),
+    method chunk(arr:List(a), size:Int) : List(List(a));
+    method flatten(arr:List(List(a))) : List(a);
     method uniq(arr:List(a)) : List(a)
 };
 ```
@@ -130,8 +130,8 @@ extern type lodash target js {
 
 ```
 extern struct Vec3 target native {
-    field x : Float64,
-    field y : Float64,
+    field x : Float64;
+    field y : Float64;
     field z : Float64
 };
 
@@ -765,9 +765,9 @@ function Counter() = {
     let (count, setCount) = useState(0);
 
     createElement("div", {},
-        createElement("p", {}, "Count: " ++ toString(count)),
+        createElement("p", {}, "Count: " ++ toString(count));
         createElement("button",
-            { onClick = \e -> setCount(\c -> c + 1) },
+            { onClick = \e -> setCount(\c -> c + 1) };
             "Increment"
         )
     )
@@ -790,9 +790,9 @@ import { malloc, free, memcpy } from stdlib target native;
 import { printf } from stdio target native;
 
 extern struct Vec4f target native {
-    field x : Float64,
-    field y : Float64,
-    field z : Float64,
+    field x : Float64;
+    field y : Float64;
+    field z : Float64;
     field w : Float64
 };
 

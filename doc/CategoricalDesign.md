@@ -50,19 +50,19 @@ tulam distinguishes these with two keywords: **`extends`** and **`requires`**.
 
 ```tulam
 algebra Semigroup(a:Type) = {
-    function combine(x:a, y:a) : a,
+    function combine(x:a, y:a) : a;
     law associativity(x:a, y:a, z:a) = combine(x, combine(y,z)) === combine(combine(x,y), z)
 };
 
 algebra Monoid(a:Type) extends Semigroup(a) = {
-    function empty() : a,
-    law leftIdentity(x:a)  = combine(empty(), x) === x,
+    function empty() : a;
+    law leftIdentity(x:a)  = combine(empty(), x) === x;
     law rightIdentity(x:a) = combine(x, empty()) === x
 };
 
 algebra Group(a:Type) extends Monoid(a) = {
-    function inverse(x:a) : a,
-    law leftInverse(x:a)  = combine(inverse(x), x) === empty(),
+    function inverse(x:a) : a;
+    law leftInverse(x:a)  = combine(inverse(x), x) === empty();
     law rightInverse(x:a) = combine(x, inverse(x)) === empty()
 };
 ```
@@ -87,7 +87,7 @@ morphism Convertible(a:Type, b:Type) = {
 
 // Requires a constraint with a DIFFERENT shape (Eq has 1 param, this has 2)
 morphism OrdConvertible(a:Type, b:Type) requires Ord(a), Ord(b) = {
-    function convert(x:a) : b,
+    function convert(x:a) : b;
     law preserveOrder(x:a, y:a) = (x < y) ==> (convert(x) < convert(y))
 };
 
@@ -102,16 +102,16 @@ algebra Monad(m:Type1) extends Applicative(m) = {
 
 // Kleisli category: the constraint (Monad) has a different shape than Category
 algebra Category(arr: Type -> Type -> Type) = {
-    function id(a:Type) : arr(a, a),
-    function compose(f:arr(b,c), g:arr(a,b)) : arr(a,c),
-    law leftId(f:arr(a,b))  = compose(id(b), f) === f,
-    law rightId(f:arr(a,b)) = compose(f, id(a)) === f,
+    function id(a:Type) : arr(a, a);
+    function compose(f:arr(b,c), g:arr(a,b)) : arr(a,c);
+    law leftId(f:arr(a,b))  = compose(id(b), f) === f;
+    law rightId(f:arr(a,b)) = compose(f, id(a)) === f;
     law assoc(f:arr(c,d), g:arr(b,c), h:arr(a,b)) =
         compose(f, compose(g, h)) === compose(compose(f, g), h)
 };
 
 instance Category(Kleisli(m)) requires Monad(m) = {
-    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x),
+    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x);
     function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = match
         | x -> bind(g(x), f)
 };
@@ -151,41 +151,41 @@ law <name>(<params>) = <LHS> === <RHS>
 
 ```tulam
 algebra Semigroup(a:Type) = {
-    function combine(x:a, y:a) : a,
+    function combine(x:a, y:a) : a;
     law associativity(x:a, y:a, z:a) =
         combine(x, combine(y, z)) === combine(combine(x, y), z)
 };
 
 algebra Monoid(a:Type) extends Semigroup(a) = {
-    function empty() : a,
-    law leftIdentity(x:a)  = combine(empty(), x) === x,
+    function empty() : a;
+    law leftIdentity(x:a)  = combine(empty(), x) === x;
     law rightIdentity(x:a) = combine(x, empty()) === x
 };
 
 algebra Eq(a:Type) = {
-    function (==)(x:a, y:a) : Bool = not(x != y),
-    function (!=)(x:a, y:a) : Bool = not(x == y),
-    law reflexivity(x:a)         = (x == x) === True,
-    law symmetry(x:a, y:a)       = (x == y) === (y == x),
+    function (==)(x:a, y:a) : Bool = not(x != y);
+    function (!=)(x:a, y:a) : Bool = not(x == y);
+    law reflexivity(x:a)         = (x == x) === True;
+    law symmetry(x:a, y:a)       = (x == y) === (y == x);
     law transitivity(x:a, y:a, z:a) =
         ((x == y) == True) ==> ((y == z) == True) ==> ((x == z) === True)
 };
 
 algebra Ord(a:Type) extends Eq(a) = {
-    function compare(x:a, y:a) : Ordering,
-    function (<)(x:a, y:a)  : Bool = compare(x,y) == LT,
-    function (>)(x:a, y:a)  : Bool = compare(x,y) == GT,
-    function (<=)(x:a, y:a) : Bool = not(x > y),
-    function (>=)(x:a, y:a) : Bool = not(x < y),
+    function compare(x:a, y:a) : Ordering;
+    function (<)(x:a, y:a)  : Bool = compare(x,y) == LT;
+    function (>)(x:a, y:a)  : Bool = compare(x,y) == GT;
+    function (<=)(x:a, y:a) : Bool = not(x > y);
+    function (>=)(x:a, y:a) : Bool = not(x < y);
     law totalOrder(x:a, y:a) = (x <= y) === True ==> True
-                             |  (y <= x) === True ==> True,
+                             |  (y <= x) === True ==> True;
     law antisymmetry(x:a, y:a) =
         ((x <= y) == True) ==> ((y <= x) == True) ==> ((x == y) === True)
 };
 
 morphism Iso(a:Type, b:Type) extends Convertible(a, b) = {
-    function unconvert(x:b) : a,
-    law roundtrip1(x:a) = unconvert(convert(x)) === x,
+    function unconvert(x:b) : a;
+    law roundtrip1(x:a) = unconvert(convert(x)) === x;
     law roundtrip2(y:b) = convert(unconvert(y)) === y
 };
 ```
@@ -219,17 +219,17 @@ An algebra equips a single carrier type with operations and laws.
 
 ```tulam
 algebra Monoid(a:Type) = {
-    function empty() : a,
-    function combine(x:a, y:a) : a,
-    law leftIdentity(x:a)    = combine(empty(), x) === x,
-    law rightIdentity(x:a)   = combine(x, empty()) === x,
+    function empty() : a;
+    function combine(x:a, y:a) : a;
+    law leftIdentity(x:a)    = combine(empty(), x) === x;
+    law rightIdentity(x:a)   = combine(x, empty()) === x;
     law associativity(x:a, y:a, z:a) =
         combine(x, combine(y, z)) === combine(combine(x, y), z)
 };
 
 algebra Group(a:Type) extends Monoid(a) = {
-    function inverse(x:a) : a,
-    law leftInverse(x:a)  = combine(inverse(x), x) === empty(),
+    function inverse(x:a) : a;
+    law leftInverse(x:a)  = combine(inverse(x), x) === empty();
     law rightInverse(x:a) = combine(x, inverse(x)) === empty()
 };
 ```
@@ -250,29 +250,29 @@ Identical to current `structure` compilation. `algebra` is sugar that tells the 
 
 ```tulam
 algebra Eq(a:Type) = {
-    function (==)(x:a, y:a) : Bool = not(x != y),
-    function (!=)(x:a, y:a) : Bool = not(x == y),
-    law reflexivity(x:a)    = (x == x) === True,
+    function (==)(x:a, y:a) : Bool = not(x != y);
+    function (!=)(x:a, y:a) : Bool = not(x == y);
+    law reflexivity(x:a)    = (x == x) === True;
     law symmetry(x:a, y:a)  = (x == y) === (y == x)
 };
 
 algebra Ord(a:Type) extends Eq(a) = {
-    function compare(x:a, y:a) : Ordering,
-    function (<)(x:a, y:a)  : Bool = compare(x,y) == LT,
-    function (>)(x:a, y:a)  : Bool = compare(x,y) == GT,
-    function (<=)(x:a, y:a) : Bool = not(x > y),
+    function compare(x:a, y:a) : Ordering;
+    function (<)(x:a, y:a)  : Bool = compare(x,y) == LT;
+    function (>)(x:a, y:a)  : Bool = compare(x,y) == GT;
+    function (<=)(x:a, y:a) : Bool = not(x > y);
     function (>=)(x:a, y:a) : Bool = not(x < y)
 };
 
 algebra Semigroup(a:Type) = {
-    function combine(x:a, y:a) : a,
+    function combine(x:a, y:a) : a;
     law associativity(x:a, y:a, z:a) =
         combine(x, combine(y, z)) === combine(combine(x, y), z)
 };
 
 algebra Monoid(a:Type) extends Semigroup(a) = {
-    function empty() : a,
-    law leftIdentity(x:a)  = combine(empty(), x) === x,
+    function empty() : a;
+    law leftIdentity(x:a)  = combine(empty(), x) === x;
     law rightIdentity(x:a) = combine(x, empty()) === x
 };
 ```
@@ -291,8 +291,8 @@ morphism Convertible(a:Type, b:Type) = {
 };
 
 morphism Iso(a:Type, b:Type) extends Convertible(a, b) = {
-    function unconvert(x:b) : a,
-    law roundtrip1(x:a) = unconvert(convert(x)) === x,
+    function unconvert(x:b) : a;
+    law roundtrip1(x:a) = unconvert(convert(x)) === x;
     law roundtrip2(y:b) = convert(unconvert(y)) === y
 };
 ```
@@ -326,8 +326,8 @@ Structures can also depend on values, creating *indexed* or *parameterized* morp
 
 ```tulam
 morphism LinearMap(k:Type, v:Type, w:Type) requires Field(k) = {
-    function apply(f:v -> w, x:v) : w,
-    function scale(s:k, x:v) : v,
+    function apply(f:v -> w, x:v) : w;
+    function scale(s:k, x:v) : v;
     law linearity(f:v -> w, s:k, x:v) =
         apply(f, scale(s, x)) === scale(s, apply(f, x))
 };
@@ -359,8 +359,8 @@ functor List(a:Type) : Type = Nil | Cons(head:a, tail:List(a));
 type Maybe(a:Type) = Just(x:a) | Nothing;
 
 algebra Functor(f:Type1) = {
-    function fmap(g: a -> b, x:f(a)) : f(b),
-    law identity(x:f(a))        = fmap(id, x) === x,
+    function fmap(g: a -> b, x:f(a)) : f(b);
+    law identity(x:f(a))        = fmap(id, x) === x;
     law composition(f:b -> c, g:a -> b, x:f(a)) =
         fmap(compose(f, g), x) === fmap(f, fmap(g, x))
 };
@@ -470,17 +470,17 @@ Other categories can be defined as structures. A category needs:
 // A category is parameterized by its morphism type
 // Objects are implicit (they're the types that arr connects)
 algebra Category(arr: Type -> Type -> Type) = {
-    function id(a:Type) : arr(a, a),
-    function compose(f:arr(b,c), g:arr(a,b)) : arr(a,c),
-    law leftId(f:arr(a,b))  = compose(id(b), f) === f,
-    law rightId(f:arr(a,b)) = compose(f, id(a)) === f,
+    function id(a:Type) : arr(a, a);
+    function compose(f:arr(b,c), g:arr(a,b)) : arr(a,c);
+    law leftId(f:arr(a,b))  = compose(id(b), f) === f;
+    law rightId(f:arr(a,b)) = compose(f, id(a)) === f;
     law assoc(f:arr(c,d), g:arr(b,c), h:arr(a,b)) =
         compose(f, compose(g, h)) === compose(compose(f, g), h)
 };
 
 // The default instance: plain functions form a category
 instance Category(Function) = {
-    function id(a:Type) : a -> a = match | x -> x,
+    function id(a:Type) : a -> a = match | x -> x;
     function compose(f, g) = match | x -> f(g(x))
 };
 ```
@@ -497,7 +497,7 @@ type Kleisli(m: Type -> Type, a:Type, b:Type) = a -> m(b);
 
 // Given a Monad(m), Kleisli(m) forms a Category
 instance Category(Kleisli(m)) requires Monad(m) = {
-    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x),
+    function id(a:Type) : Kleisli(m, a, a) = match | x -> return(x);
     function compose(f:Kleisli(m,b,c), g:Kleisli(m,a,b)) : Kleisli(m,a,c) = match
         | x -> bind(g(x), f)
 };
@@ -511,13 +511,13 @@ Arrows generalize both functions and monadic computations. An Arrow is a Categor
 
 ```tulam
 algebra Arrow(arr: Type -> Type -> Type) extends Category(arr) = {
-    function arr(f: a -> b) : arr(a, b),           // lift a function
-    function first(f:arr(a,b)) : arr({a,c}, {b,c}), // process first component
+    function arr(f: a -> b) : arr(a, b);           // lift a function
+    function first(f:arr(a,b)) : arr({a,c}, {b,c}); // process first component
     // derived:
-    function second(f:arr(a,b)) : arr({c,a}, {c,b}) = ...,
-    function split(f:arr(a,b), g:arr(c,d)) : arr({a,c}, {b,d}) = ...,
-    function fanout(f:arr(a,b), g:arr(a,c)) : arr(a, {b,c}) = ...,
-    law arrId() = arr(id) === id,
+    function second(f:arr(a,b)) : arr({c,a}, {c,b}) = ...;
+    function split(f:arr(a,b), g:arr(c,d)) : arr({a,c}, {b,d}) = ...;
+    function fanout(f:arr(a,b), g:arr(a,c)) : arr(a, {b,c}) = ...;
+    law arrId() = arr(id) === id;
     law arrCompose(f:a -> b, g:b -> c) = arr(compose(g, f)) === compose(arr(g), arr(f))
 };
 ```
@@ -573,25 +573,25 @@ Reasoning:
 ```tulam
 // Functor: can map over contents
 algebra Functor(f:Type1) = {
-    function fmap(g: a -> b, x:f(a)) : f(b),
-    law identity(x:f(a)) = fmap(id, x) === x,
+    function fmap(g: a -> b, x:f(a)) : f(b);
+    law identity(x:f(a)) = fmap(id, x) === x;
     law composition(f:b -> c, g:a -> b, x:f(a)) =
         fmap(compose(f, g), x) === fmap(f, fmap(g, x))
 };
 
 // Applicative: can lift multi-argument functions
 algebra Applicative(f:Type1) extends Functor(f) = {
-    function pure(x:a) : f(a),
-    function ap(ff:f(a -> b), fa:f(a)) : f(b),
-    law apIdentity(v:f(a)) = ap(pure(id), v) === v,
+    function pure(x:a) : f(a);
+    function ap(ff:f(a -> b), fa:f(a)) : f(b);
+    law apIdentity(v:f(a)) = ap(pure(id), v) === v;
     law apHomomorphism(f:a -> b, x:a) = ap(pure(f), pure(x)) === pure(f(x))
 };
 
 // Monad: can sequence dependent computations
 algebra Monad(m:Type1) extends Applicative(m) = {
-    function bind(x:m(a), f:a -> m(b)) : m(b),
-    law leftUnit(x:a, f:a -> m(b))  = bind(pure(x), f) === f(x),
-    law rightUnit(x:m(a))           = bind(x, pure) === x,
+    function bind(x:m(a), f:a -> m(b)) : m(b);
+    law leftUnit(x:a, f:a -> m(b))  = bind(pure(x), f) === f(x);
+    law rightUnit(x:m(a))           = bind(x, pure) === x;
     law associativity(x:m(a), f:a -> m(b), g:b -> m(c)) =
         bind(bind(x, f), g) === bind(x, \a -> bind(f(a), g))
 };
@@ -611,8 +611,8 @@ The `do`-notation desugars into `bind` calls, working with anything that has a `
 ```tulam
 // this:
 action main : IO(Unit) = {
-    name <- readLine(),
-    greeting = "Hello, " + name,
+    name <- readLine();
+    greeting = "Hello, " + name;
     putStrLn(greeting)
 };
 

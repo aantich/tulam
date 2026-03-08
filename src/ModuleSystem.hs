@@ -33,7 +33,7 @@ module ModuleSystem
 import Surface (Name, ModulePath, Expr(..), ImportSpec(..), Lambda(..))
 import State
 import Pipeline (afterparserPass, actionDesugarPass, stringLiteralDesugarPass, buildEnvPass, recordDesugarPass, lamToCLMPass, timedPass)
-import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness)
+import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, positivityCheckPass, terminationCheckPass, coverageCheckPass)
 import CLMOptimize (runCLMOptPasses)
 import Parser (parseWholeFile)
 import TypeCheck (typeCheckPass)
@@ -259,8 +259,11 @@ runModulePasses = do
     clearAllLogs
     timedPass "Pass 2 (case opt)" caseOptimizationPass
     checkSealedExhaustiveness
+    positivityCheckPass
+    coverageCheckPass
     clearAllLogs
     timedPass "Pass 3 (typecheck)" typeCheckPass
+    terminationCheckPass
     clearAllLogs
     timedPass "Pass 4 (CLM)" lamToCLMPass
     clearAllLogs

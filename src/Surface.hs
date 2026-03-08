@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, NamedFieldPuns, GADTs, PatternSynonyms, DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns, GADTs, PatternSynonyms, ViewPatterns, DeriveGeneric #-}
 
 -- This is our PRIMARY CORE LANGUAGE, based on HoTT with some changes and extensions, notably -
 -- we are using N-tuples explicitly, but there's more.
@@ -66,6 +66,61 @@ instance Binary ClassInfo
 
 defaultClassInfo :: ClassInfo
 defaultClassInfo = ClassInfo Nothing [] ClassNormal Nothing []
+-- | Universe levels for level polymorphism.
+-- LConst n = concrete level (0, 1, 2, ...)
+-- LVar name = level variable (for level-polymorphic functions)
+-- LSucc l = successor level (l + 1)
+-- LMax l1 l2 = max of two levels (needed for universe-polymorphic functions)
+data Level
+  = LConst !Int
+  | LVar Name
+  | LSucc Level
+  | LMax Level Level
+  deriving (Show, Eq, Generic)
+
+instance Binary Level
+
+-- | Smart constructors and helpers for Level
+levelZero :: Level
+levelZero = LConst 0
+
+levelOne :: Level
+levelOne = LConst 1
+
+levelSucc :: Level -> Level
+levelSucc (LConst n) = LConst (n + 1)
+levelSucc l = LSucc l
+
+levelMax :: Level -> Level -> Level
+levelMax (LConst a) (LConst b) = LConst (max a b)
+levelMax a b = LMax a b
+
+-- | Check if a level is concretely less than or equal to another
+levelLeq :: Level -> Level -> Maybe Bool
+levelLeq (LConst a) (LConst b) = Just (a <= b)
+levelLeq _ _ = Nothing  -- can't decide with variables
+
+-- | Check if a level is concretely equal to another
+levelEq :: Level -> Level -> Maybe Bool
+levelEq (LConst a) (LConst b) = Just (a == b)
+levelEq (LVar a) (LVar b) = Just (a == b)
+levelEq _ _ = Nothing
+
+-- | Pretty-print a Level
+showLevel :: Level -> String
+showLevel (LConst 0) = "0"
+showLevel (LConst n) = show n
+showLevel (LVar name) = name
+showLevel (LSucc l) = showLevel l ++ "+1"
+showLevel (LMax l1 l2) = "max(" ++ showLevel l1 ++ ", " ++ showLevel l2 ++ ")"
+
+-- | Substitute a level variable
+substLevel :: Name -> Level -> Level -> Level
+substLevel n r (LVar m) | n == m = r
+substLevel n r (LSucc l) = levelSucc (substLevel n r l)
+substLevel n r (LMax l1 l2) = levelMax (substLevel n r l1) (substLevel n r l2)
+substLevel _ _ l = l
+
 -- constructor tag placeholder type
 data ConsTag = ConsTag Name !Int deriving (Show, Eq, Generic)
 instance Binary ConsTag
@@ -100,7 +155,12 @@ instance Binary Assoc
 data OperatorFixity = OperatorFixity { fixAssoc :: Assoc, fixPrec :: Int } deriving (Show, Eq, Generic)
 instance Binary OperatorFixity
 
-data Literal = LInt !Int | LFloat !Double | LChar !Char | LString !String | LList [Expr] | LVec [Expr] | LTuple [Expr]
+-- | Pattern check for expanded case guards (mirrors CLMPatternCheck at CLM level)
+data PatternCheck = PCheckTag ConsTag | PCheckLit Literal
+  deriving (Show, Eq, Generic)
+instance Binary PatternCheck
+
+data Literal = LInt !Int | LFloat !Double | LChar !Char | LString !String | LList [Expr] | LVec [Expr] | LNTuple [(Maybe Name, Expr)]
   -- Fixed-width signed integers
   | LInt8 !Int8 | LInt16 !Int16 | LInt32 !Int32 | LInt64 !Int64
   -- Unsigned integers
@@ -131,7 +191,7 @@ mkLambda n p b t = Lambda n p b t SourceInteractive
 -- return type!
 isLambdaConstructor :: Lambda -> Bool
 isLambdaConstructor lam = case body lam of
-    Tuple _ -> lamType lam /= UNDEFINED
+    NTuple _ -> lamType lam /= UNDEFINED
     _ -> False
 
 data Expr =
@@ -148,8 +208,7 @@ data Expr =
   -- structure
   -- StructInfo carries classification (algebra/morphism/general), extends, requires, mandatory names
   | App Expr [Expr] -- application
-  | ExprConsTagCheck ConsTag Expr -- check if Expr was created with a given constructor
-  | ExprLiteralCheck Literal Expr -- check if Expr equals a literal value
+  | PatternGuard PatternCheck Expr -- pattern check: does Expr match a constructor tag or literal?
   | RecFieldAccess (Name,Int) Expr -- access a field of the Expr by name or index
   | CaseOf Record Expr SourceInfo -- in the course of optimizations we transfer pattern matches
   -- to the case x of val -> expr statements. However, since we prefer lists vs trees
@@ -166,7 +225,7 @@ data Expr =
   -- ALL of them need to be True for the case to work.
   
   | PatternMatches [Expr] -- only CaseOf or ExpandedCase is allowed inside this!!!
-  | Tuple [Expr] -- any tuple { ... , ... }
+  | NTuple [(Maybe Name, Expr)] -- unified tuple/record: {1,2} = positional, {x=1,y=2} = named
   | ConTuple ConsTag [Expr] -- only CONSTRUCTORS return it - tagged by the constructor tag!
   | DeclBlock [Expr] -- declaration block: list of members in structures/instances (NOT a value-level tuple)
   | Statements [Expr] -- for Action body, simply a list of statements to execute in order
@@ -175,8 +234,7 @@ data Expr =
   | UnaryOp Name Expr
   | BinaryOp Name Expr Expr
   | U Int -- Universe hierarchy: U 0 = Type, U 1 = Kind, etc.
-  | Prim Lambda -- primitive function that is handled "magically"
-  | PrimCall -- filler for the body of primitive functions
+  -- Prim/PrimCall removed: use Function + Intrinsic instead
   | Implicit Expr -- current solution for implicit parameter functions
   -- that result e.g. from structure (typeclass) expansions -
   -- only used in the TYPE place!!!
@@ -186,7 +244,7 @@ data Expr =
   | Law Lambda Expr -- law declaration: law name(params) = lawBody
   | PropEq Expr Expr -- propositional equality: lhs === rhs
   | Implies Expr Expr -- implication: premise ==> conclusion
-  | ArrowType Expr Expr -- non-dependent function type: a -> b
+  | Pi (Maybe Name) Expr Expr -- Pi type: Pi Nothing A B = A -> B, Pi (Just "x") A B = (x:A) -> B(x)
   | Value Var Expr -- value declaration: Var carries name+type, Expr is body (UNDEFINED for abstract)
   | Primitive Lambda -- primitive type declaration: primitive Int;
   | Intrinsic        -- intrinsic body marker for functions/instances
@@ -196,7 +254,6 @@ data Expr =
     -- userTypeExpr is Id "Name" for simple types, App (Id "Name") [args] for parameterized
   | ReprCast Expr Expr
     -- ReprCast exprToCast targetType (desugars to toRepr/fromRepr call)
-  | RecordLit [(Name, Expr)]    -- Record literal: {x = 1, y = 2}
   | RecordType [(Name, Expr)] Bool  -- Record type: {x:Int, y:Bool}, Bool = isOpen (has ..)
   -- Module system nodes
   | ModuleDecl ModulePath               -- module Algebra.Ring;
@@ -235,6 +292,55 @@ instance Binary Expr
 pattern Type :: Expr
 pattern Type = U 0
 
+-- | Non-dependent arrow type: A -> B = Pi Nothing A B
+-- Backward-compatible pattern synonym — existing code using ArrowType still works.
+pattern ArrowType :: Expr -> Expr -> Expr
+pattern ArrowType a b = Pi Nothing a b
+
+-- | Legacy pattern synonyms for pattern guards (backward compatibility)
+pattern ExprConsTagCheck :: ConsTag -> Expr -> Expr
+pattern ExprConsTagCheck ct e = PatternGuard (PCheckTag ct) e
+
+pattern ExprLiteralCheck :: Literal -> Expr -> Expr
+pattern ExprLiteralCheck lit e = PatternGuard (PCheckLit lit) e
+
+-- | Backward-compatible pattern: positional tuple {e1, e2, ...}
+-- Matches NTuple where all fields have Nothing names
+pattern Tuple :: [Expr] -> Expr
+pattern Tuple es <- NTuple (allPositional -> Just es)
+  where Tuple es = NTuple (map (\e -> (Nothing, e)) es)
+
+-- | Backward-compatible pattern: named record literal {x=1, y=2}
+-- Matches NTuple where all fields have Just names
+pattern RecordLit :: [(Name, Expr)] -> Expr
+pattern RecordLit fields <- NTuple (allNamed -> Just fields)
+  where RecordLit fields = NTuple (map (\(n,e) -> (Just n, e)) fields)
+
+-- | Backward-compatible pattern: LTuple for positional tuple types
+pattern LTuple :: [Expr] -> Literal
+pattern LTuple es <- LNTuple (allPositional -> Just es)
+  where LTuple es = LNTuple (map (\e -> (Nothing, e)) es)
+
+-- | Helper: extract positional fields (all Nothing names)
+allPositional :: [(Maybe Name, Expr)] -> Maybe [Expr]
+allPositional fields
+  | all (\(mn, _) -> mn == Nothing) fields = Just (map snd fields)
+  | otherwise = Nothing
+
+-- | Helper: extract named fields (all Just names)
+allNamed :: [(Maybe Name, Expr)] -> Maybe [(Name, Expr)]
+allNamed fields
+  | all (\(mn, _) -> case mn of Just _ -> True; Nothing -> False) fields = Just [(n, e) | (Just n, e) <- fields]
+  | otherwise = Nothing
+
+-- | Check if an NTuple has any named fields
+hasNamedFields :: [(Maybe Name, Expr)] -> Bool
+hasNamedFields = any (\(mn, _) -> case mn of Just _ -> True; Nothing -> False)
+
+-- | Get field expressions from NTuple (regardless of naming)
+ntupleExprs :: [(Maybe Name, Expr)] -> [Expr]
+ntupleExprs = map snd
+
 {-
 We will also handle types via Expr quite easily:
 - Id Name - concrete
@@ -257,12 +363,11 @@ traverseExpr f (CaseOf args ex si) = CaseOf args (f $ traverseExpr f ex) si
 traverseExpr f (PatternMatches exs) = PatternMatches (map f (map (traverseExpr f) exs))
 traverseExpr f (Lit (LList exs)) = Lit (LList (map f (map (traverseExpr f) exs)))
 traverseExpr f (Lit (LVec exs)) = Lit (LVec (map f (map (traverseExpr f) exs)))
-traverseExpr f (Lit (LTuple exs)) = Lit (LTuple (map f (map (traverseExpr f) exs)))
+traverseExpr f (Lit (LNTuple fields)) = Lit (LNTuple (map (\(mn,e) -> (mn, f $ traverseExpr f e)) fields))
 traverseExpr f (Lit e) = Lit e
 traverseExpr f (RecFieldAccess a ex) = RecFieldAccess a (f $ traverseExpr f ex)
-traverseExpr f (ExprConsTagCheck ct ex) = ExprConsTagCheck ct (f $ traverseExpr f ex)
-traverseExpr f (ExprLiteralCheck lit ex) = ExprLiteralCheck lit (f $ traverseExpr f ex)
-traverseExpr f (Tuple exs) = Tuple (map f (map (traverseExpr f) exs))
+traverseExpr f (PatternGuard pc ex) = PatternGuard pc (f $ traverseExpr f ex)
+traverseExpr f (NTuple fields) = NTuple (map (\(mn,e) -> (mn, f $ traverseExpr f e)) fields)
 traverseExpr f (ConTuple ct exs) = ConTuple ct (map f (map (traverseExpr f) exs))
 traverseExpr f (DeclBlock exs) = DeclBlock (map f (map (traverseExpr f) exs))
 traverseExpr f (ExpandedCase exs ex si) = ExpandedCase (map f (map (traverseExpr f) exs)) (f $ traverseExpr f ex) si
@@ -285,17 +390,14 @@ traverseExpr f (LetIn binds body) = LetIn (map (\(v,ex) -> (v, f $ traverseExpr 
 traverseExpr f (Law lam ex) = Law (lam { body = f $ traverseExpr f (body lam) }) (f $ traverseExpr f ex)
 traverseExpr f (PropEq e1 e2) = PropEq (f $ traverseExpr f e1) (f $ traverseExpr f e2)
 traverseExpr f (Implies e1 e2) = Implies (f $ traverseExpr f e1) (f $ traverseExpr f e2)
-traverseExpr f (ArrowType e1 e2) = ArrowType (f $ traverseExpr f e1) (f $ traverseExpr f e2)
+traverseExpr f (Pi mn e1 e2) = Pi mn (f $ traverseExpr f e1) (f $ traverseExpr f e2)
 traverseExpr f (Implicit e) = Implicit (f $ traverseExpr f e)
 traverseExpr f (Value v ex) = Value v (f $ traverseExpr f ex)
-traverseExpr _ e@(Prim _) = e
-traverseExpr _ PrimCall = PrimCall
 traverseExpr _ e@(Primitive _) = e
 traverseExpr _ Intrinsic = Intrinsic
 traverseExpr _ Derive = Derive
 traverseExpr f (Repr userTp tp def fns inv) = Repr (f $ traverseExpr f userTp) (f $ traverseExpr f tp) def (map (f . traverseExpr f) fns) (fmap (f . traverseExpr f) inv)
 traverseExpr f (ReprCast e tp) = ReprCast (f $ traverseExpr f e) (f $ traverseExpr f tp)
-traverseExpr f (RecordLit fields) = RecordLit (map (\(n,e) -> (n, f $ traverseExpr f e)) fields)
 traverseExpr f (RecordType fields isOpen) = RecordType (map (\(n,e) -> (n, f $ traverseExpr f e)) fields) isOpen
 -- Module system nodes (leaf nodes, no child expressions to traverse)
 traverseExpr _ e@(ModuleDecl _) = e
@@ -347,7 +449,7 @@ traverseExprDeep f = go
     go (PatternMatches exs) = PatternMatches (map (f . go) exs)
     go (Function lam) = Function $ lam { body = f $ go (body lam) }
     go (App ex exs) = App (f $ go ex) (map (f . go) exs)
-    go (Tuple exs) = Tuple (map (f . go) exs)
+    go (NTuple fields) = NTuple (map (\(mn,e) -> (mn, f $ go e)) fields)
     go (DeclBlock exs) = DeclBlock (map (f . go) exs)
     go (ConTuple ct exs) = ConTuple ct (map (f . go) exs)
     go (ExpandedCase exs ex si) = ExpandedCase (map (f . go) exs) (f $ go ex) si
@@ -393,7 +495,7 @@ collectIdRefs = go
   where
     go (Id n)             = [n]
     go (App e es)         = go e ++ concatMap go es
-    go (Tuple es)         = concatMap go es
+    go (NTuple fields)    = concatMap (go . snd) fields
     go (ConTuple _ es)    = concatMap go es
     go (BinaryOp _ e1 e2) = go e1 ++ go e2
     go (UnaryOp _ e)      = go e
@@ -429,15 +531,15 @@ instance PrettyPrint Expr where
   ppr UNDEFINED = ""
   ppr (Id v) = as [bold] v
   ppr (CaseOf e1 e2 _) = showListCuBr ppVarCaseOf e1 ++ " -> " ++ ppr e2
-  ppr (ExprConsTagCheck (ConsTag nm i) ex) = (as [bold,lblue] "checkConsTag")
+  ppr (PatternGuard (PCheckTag (ConsTag nm i)) ex) = (as [bold,lblue] "checkConsTag")
     ++ "(" ++ nm ++ ", " ++ ppr ex ++ ")"
-  ppr (ExprLiteralCheck lit ex) = (as [bold,lblue] "checkLit")
+  ppr (PatternGuard (PCheckLit lit) ex) = (as [bold,lblue] "checkLit")
     ++ "(" ++ show lit ++ ", " ++ ppr ex ++ ")"
   ppr (ExpandedCase exs ex _) = showListSqBr ppr exs ++ " -> " ++ ppr ex
   ppr (PatternMatches ps) = "match " ++ concatMap (\p -> "| " ++ ppr p ++ " ") ps
   ppr (RecFieldAccess (nm,i) e) = ppr e ++ "." ++ nm ++"("++show i ++")"
   ppr (App e ex) = (ppr e) ++ showListRoBr ppr ex
-  ppr (Tuple ex) = showListCuBr ppr ex
+  ppr (NTuple fields) = "{" ++ showListPlainSep pprNTupleField ", " fields ++ "}"
   ppr (DeclBlock ex) = showListCuBr ppr ex
   ppr (Structure lam si) = (as [bold,yellow] (pprStructKind (structKind si) ++ " "))
     ++ lamName lam ++ " "
@@ -470,7 +572,8 @@ instance PrettyPrint Expr where
   ppr (Law lam ex) = (as [bold,cyan] "law ") ++ ppr lam ++ " = " ++ ppr ex
   ppr (PropEq e1 e2) = ppr e1 ++ " === " ++ ppr e2
   ppr (Implies e1 e2) = ppr e1 ++ " ==> " ++ ppr e2
-  ppr (ArrowType e1 e2) = pprArrowLhs e1 ++ " -> " ++ ppr e2
+  ppr (Pi Nothing e1 e2) = pprArrowLhs e1 ++ " -> " ++ ppr e2
+  ppr (Pi (Just n) e1 e2) = "(" ++ n ++ ":" ++ ppr e1 ++ ") -> " ++ ppr e2
   ppr (Value v ex) = (as [bold,magenta] "value ") ++ ppr v ++ if ex == UNDEFINED then "" else " = " ++ ppr ex
   ppr (Primitive lam) = (as [bold,magenta] "primitive ") ++ ppr lam
   ppr Intrinsic = as [bold,cyan] "intrinsic"
@@ -478,7 +581,6 @@ instance PrettyPrint Expr where
   ppr (Repr nm tp def fns inv) = (as [bold,magenta] "repr ") ++ ppr nm ++ " as " ++ ppr tp
     ++ (if def then " default" else "") ++ " where { " ++ showListPlainSep ppr ", " fns ++ " }"
   ppr (ReprCast e tp) = ppr e ++ " as " ++ ppr tp
-  ppr (RecordLit fields) = "{" ++ showListPlainSep (\(n,e) -> n ++ " = " ++ ppr e) ", " fields ++ "}"
   ppr (RecordType fields isOpen) = "{" ++ showListPlainSep (\(n,e) -> n ++ ":" ++ ppr e) ", " fields ++ (if isOpen then ", .." else "") ++ "}"
   -- Module system
   ppr (ModuleDecl path) = "module " ++ showModPath path
@@ -517,8 +619,13 @@ pprConstructors :: Expr -> String
 pprConstructors (Constructors cs) = showListPlainSep ppr " | " cs
 pprConstructors e = ppr e
 
+-- Pretty-print a single NTuple field: named (x = expr) or positional (expr)
+pprNTupleField :: (Maybe Name, Expr) -> String
+pprNTupleField (Nothing, e) = ppr e
+pprNTupleField (Just n, e) = n ++ " = " ++ ppr e
+
 pprArrowLhs :: Expr -> String
-pprArrowLhs e@(ArrowType _ _) = "(" ++ ppr e ++ ")"
+pprArrowLhs e@(Pi _ _ _) = "(" ++ ppr e ++ ")"
 pprArrowLhs e = ppr e
 
 pprActionStmt :: ActionStmt -> String
