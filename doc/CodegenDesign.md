@@ -364,7 +364,7 @@ Each tulam module compiles to one target module:
 ### 7.1 Sum Types
 
 ```tulam
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 ```
 
 **Without repr (pure tulam representation):**
@@ -400,7 +400,7 @@ if (x !== null) { ... } else { ... }
 ### 7.3 Records
 
 ```tulam
-record Point(x:Int, y:Int);
+type Point = x:Int * y:Int;
 ```
 
 ```javascript
@@ -592,7 +592,7 @@ Only the JS branch survives in JS compilation. `TargetSwitch` resolved before em
 ### 8.1 Sum Types
 
 ```tulam
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 ```
 
 **Without repr (pure tulam):**
@@ -619,7 +619,7 @@ Emits as `T?` / `Nullable<T>`. Pattern matching adjusts to null checks.
 ### 8.3 Records
 
 ```tulam
-record Point(x:Int, y:Int);
+type Point = x:Int * y:Int;
 ```
 
 Emits as sealed class with readonly fields (CIL struct for small value types).
@@ -729,7 +729,7 @@ Resolved CLM
 ### 9.2 Sum Types → Tagged Unions
 
 ```tulam
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 ```
 
 **Without repr (monomorphized for `Maybe<int64_t>`):**

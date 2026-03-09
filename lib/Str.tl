@@ -13,7 +13,7 @@ import Morphism;
 // ============================================================================
 
 /// UTF-8 encoded immutable string.
-record Str = { bytes: Array(Byte), byteLen: Int };
+type Str = bytes: Array(Byte) * byteLen: Int;
 
 /// Empty string constant.
 function strEmpty() : Str = Str([], 0);

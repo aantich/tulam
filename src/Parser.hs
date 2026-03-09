@@ -50,14 +50,13 @@ pSumType = do
     reserved "type"
     name <- uIdentifier
     args <- try pVars <|> pure []
-    -- Default return type for constructors: Name(arg1, arg2, ...) or just Name
-    let defaultTp = if null args
-            then Id name
-            else App (Id name) (map (\v -> Id (Surface.name v)) args)
-    ex   <- reservedOp "=" *> sepBy1 (pConstructor defaultTp) (reservedOp "|")
+    -- Constructors are optional: `type Void;` has zero constructors (uninhabited type)
+    (allArgs, ex) <- option (args, []) $ do
+        reservedOp "="
+        pExistsOrTypeBody args name pos
     let lam = Lambda {
        lamName    = name
-     , params = args
+     , params = allArgs
      , body       = Constructors ex
      , lamType    = Type
      , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
@@ -71,17 +70,17 @@ pSumTypeWithDeriving = do
     reserved "type"
     name <- uIdentifier
     args <- try pVars <|> pure []
-    let defaultTp = if null args
-            then Id name
-            else App (Id name) (map (\v -> Id (Surface.name v)) args)
-    ex   <- reservedOp "=" *> sepBy1 (pConstructor defaultTp) (reservedOp "|")
+    -- Constructors are optional: `type Void;` has zero constructors (uninhabited type)
+    (allArgs, ex) <- option (args, []) $ do
+        reservedOp "="
+        pExistsOrTypeBody args name pos
     -- Optional deriving clause
     derivingNames <- option [] $ do
         reserved "deriving"
         sepBy1 identifier (reservedOp ",")
     let lam = Lambda {
        lamName    = name
-     , params = args
+     , params = allArgs
      , body       = Constructors ex
      , lamType    = Type
      , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
@@ -90,6 +89,55 @@ pSumTypeWithDeriving = do
     -- Generate Instance declarations for each derived algebra
     let deriveInstances = map (\algName -> Instance algName [Id name] [Derive] []) derivingNames
     return (sumType : deriveInstances)
+
+-- Parse exists binders or normal type body after '='
+-- Returns (allArgs, constructors) where allArgs includes any existential binders
+-- exists (a:Type)(b:Type). body → binders added to type params, body parsed normally
+pExistsOrTypeBody :: [Var] -> Name -> SourcePos -> Parser ([Var], [Lambda])
+pExistsOrTypeBody args name pos =
+    try pExistsTypeBody <|> pNormalTypeBody
+  where
+    mkDefaultTp allArgs = if null allArgs
+        then Id name
+        else App (Id name) (map (\v -> Id (Surface.name v)) allArgs)
+
+    pExistsTypeBody = do
+        try (reserved "exists") <|> reserved "∃"
+        binders <- many1 pExistsBinder
+        reservedOp "."
+        let allArgs = args ++ binders
+        let defaultTp = mkDefaultTp allArgs
+        constructors <- try (pTypeBody defaultTp name pos) <|> pExistsBodyAsType defaultTp name pos
+        return (allArgs, constructors)
+
+    -- Fallback: parse exists body as a bare type expression (e.g. `exists (a:Type). a`)
+    -- Creates an implicit constructor with a single unnamed field of that type
+    pExistsBodyAsType defaultTp typeName p = do
+        tp <- concreteType
+        return [Lambda {
+           lamName = typeName
+         , params = [Var "_payload" tp UNDEFINED]
+         , body = UNDEFINED
+         , lamType = defaultTp
+         , lamSrcInfo = SourceInfo (sourceLine p) (sourceColumn p) (sourceName p) ""
+        }]
+
+    pNormalTypeBody = do
+        let defaultTp = mkDefaultTp args
+        constructors <- pTypeBody defaultTp name pos
+        return (args, constructors)
+
+-- Parse a single exists binder: (name:Kind) or bare name (defaults to Type)
+pExistsBinder :: Parser Var
+pExistsBinder =
+    try (parens $ do
+        nm <- identifier
+        reservedOp ":"
+        kind <- concreteType
+        return $ Var nm kind UNDEFINED)
+    <|> (do
+        nm <- identifier
+        return $ Var nm (U 0) UNDEFINED)
 
 -- To properly parse the type definition we need to properly parse
 -- CONSTRUCTORS inside the sum type
@@ -112,6 +160,77 @@ pConstructor defaultTp = do
      , lamType    = tp
      , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
     }
+
+-- NEW SYNTAX: +/* for type definitions --------------------------------
+-- Field declaration: name:Type (used in +/* type syntax)
+-- Uses fieldType which stops at bare *, +, ; (they're separators in type defs)
+pFieldDecl :: Parser Var
+pFieldDecl = do
+    nm <- identifier
+    reservedOp ":"
+    tp <- fieldType
+    return $ Var nm tp UNDEFINED
+
+-- Spread field in +/* syntax: ..Name (inherits fields from another type)
+-- Stored as Var "..Name" UNDEFINED UNDEFINED, resolved in Pass 1 by resolveSpreadFields
+pSpreadFieldDecl :: Parser Var
+pSpreadFieldDecl = do
+    reservedOp ".."
+    nm <- uIdentifier
+    return $ Var (".." ++ nm) UNDEFINED UNDEFINED
+
+-- A field-or-spread in implicit constructor context
+pFieldOrSpread :: Parser Var
+pFieldOrSpread = try pSpreadFieldDecl <|> pFieldDecl
+
+-- New constructor parser for +/* syntax:
+-- ConstructorName followed by zero or more (* field:Type), optional (: RetType)
+pConstructorNew :: Expr -> Parser Lambda
+pConstructorNew defaultTp = do
+    pos <- getPosition
+    name <- uIdentifier
+    fields <- many (try (symbol "*" >> pFieldOrSpread))
+    -- GADT return type: `: RetType` — uses fieldType to stop at + (constructor separator)
+    tp <- try (reservedOp ":" >> fieldType) <|> pure defaultTp
+    return Lambda {
+       lamName    = name
+     , params = fields
+     , body       = UNDEFINED
+     , lamType    = tp
+     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+    }
+
+-- Implicit constructor: when type body starts with lowercase field or ..spread,
+-- create a single constructor named after the type itself.
+-- e.g. `type Pt = x:Float64 * y:Float64;` → constructor Pt(x:Float64, y:Float64)
+-- e.g. `type Pt3D = ..Point * z:Float64;` → constructor Pt3D(..Point, z:Float64)
+pImplicitConstructor :: Expr -> Name -> SourcePos -> Parser [Lambda]
+pImplicitConstructor defaultTp typeName pos = do
+    first <- pFieldOrSpread
+    rest <- many (try (symbol "*" >> pFieldOrSpread))
+    let fields = first : rest
+    return [Lambda {
+       lamName    = typeName
+     , params = fields
+     , body       = UNDEFINED
+     , lamType    = defaultTp
+     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+    }]
+
+-- Orchestrate type body parsing: detect implicit vs explicit constructors
+-- Implicit: body starts with lowercase:Type or ..Spread
+-- Explicit: body starts with uppercase constructor name, separated by '+'
+pTypeBody :: Expr -> Name -> SourcePos -> Parser [Lambda]
+pTypeBody defaultTp typeName pos =
+    try (lookAhead (reservedOp "..") >> pImplicitConstructor defaultTp typeName pos)
+    <|> try (lookAhead (lowerIdentifier >> reservedOp ":") >> pImplicitConstructor defaultTp typeName pos)
+    <|> sepBy1 (pConstructorNew defaultTp) (symbol "+")
+  where
+    lowerIdentifier = do
+        nm <- identifier
+        let c = head nm
+        guard (not (null nm) && (c >= 'a' && c <= 'z' || c == '_'))
+        return nm
 
 -- STRUCTURES ---------------------------------------------------------
 pStructureWith :: String -> StructKind -> Parser Expr
@@ -735,8 +854,31 @@ concreteType :: Parser Expr
 concreteType = pTypeArrow
 
 -- Pi types: (x:A) -> B(x) (dependent) or A -> B (non-dependent), right-associative
+-- Also: forall/∀ binders . body (desugars to nested Pi)
 pTypeArrow :: Parser Expr
-pTypeArrow = try pDependentPi <|> pSimpleArrow
+pTypeArrow = try pForallType <|> try pDependentPi <|> pSimpleArrow
+
+-- forall a b. body  OR  forall (a:Type)(b:Type). body  OR  ∀ a. body
+-- Desugars to nested Pi (Just name) kind body
+pForallType :: Parser Expr
+pForallType = do
+    try (reserved "forall") <|> reserved "∀"
+    binders <- many1 pForallBinder
+    reservedOp "."
+    bdy <- pTypeArrow
+    return $ foldr (\(nm, kind) acc -> Pi (Just nm) kind acc) bdy binders
+
+-- A forall binder: bare name (kind defaults to Type) or (name:Kind)
+pForallBinder :: Parser (Name, Expr)
+pForallBinder =
+    try (parens $ do
+        nm <- identifier
+        reservedOp ":"
+        kind <- concreteType
+        return (nm, kind))
+    <|> (do
+        nm <- identifier
+        return (nm, U 0))
 
 -- Dependent Pi: (x:A) -> B(x)
 -- Disambiguated by: lowercase identifier followed by ':' inside parens, then '->'
@@ -755,11 +897,66 @@ pDependentPi = do
     isLowerFirst (c:_) = c >= 'a' && c <= 'z' || c == '_'
     isLowerFirst _     = False
 
--- Non-dependent arrow: A -> B -> C
+-- Non-dependent arrow: A -> B -> C (right-associative)
+-- In full mode: precedence -> < + < * < type application
+-- In field mode: no +/* operators (they're separators in type definitions)
 pSimpleArrow :: Parser Expr
 pSimpleArrow = do
-    lhs <- pTypeApp
+    lhs <- pTypeSumOp
     rest <- optionMaybe (reservedOp "->" >> pTypeArrow)
+    case rest of
+        Nothing  -> return lhs
+        Just rhs -> return $ Pi Nothing lhs rhs
+
+-- Type-level sum: A + B + C (left-associative)
+pTypeSumOp :: Parser Expr
+pTypeSumOp = do
+    first <- pTypeProdOp
+    rest <- many (try (symbol "+" >> pTypeProdOp))
+    return $ foldl (\acc t -> BinaryOp "+" acc t) first rest
+
+-- Type-level product: A * B * C (left-associative)
+pTypeProdOp :: Parser Expr
+pTypeProdOp = do
+    first <- pTypeApp
+    rest <- many (try (symbol "*" >> pTypeApp))
+    return $ foldl (\acc t -> BinaryOp "*" acc t) first rest
+
+-- Field type parser: like concreteType but stops at bare * and + (they're separators in type defs)
+-- Used by pFieldDecl for type definition field types
+fieldType :: Parser Expr
+fieldType = pFieldTypeArrow
+
+pFieldTypeArrow :: Parser Expr
+pFieldTypeArrow = try pFieldForallType <|> try pFieldDependentPi <|> pFieldSimpleArrow
+
+pFieldForallType :: Parser Expr
+pFieldForallType = do
+    try (reserved "forall") <|> reserved "∀"
+    binders <- many1 pForallBinder
+    reservedOp "."
+    bdy <- pFieldTypeArrow
+    return $ foldr (\(nm, kind) acc -> Pi (Just nm) kind acc) bdy binders
+
+pFieldDependentPi :: Parser Expr
+pFieldDependentPi = do
+    (nm, domTy) <- parens $ do
+        nm <- identifier
+        Control.Monad.guard (not (null nm) && isLowerFirst nm)
+        reservedOp ":"
+        ty <- concreteType  -- inside parens, full type parser is safe
+        return (nm, ty)
+    reservedOp "->"
+    bdy <- pFieldTypeArrow
+    return $ Pi (Just nm) domTy bdy
+  where
+    isLowerFirst (c:_) = c >= 'a' && c <= 'z' || c == '_'
+    isLowerFirst _     = False
+
+pFieldSimpleArrow :: Parser Expr
+pFieldSimpleArrow = do
+    lhs <- pTypeApp  -- no +/* consumption in field types
+    rest <- optionMaybe (reservedOp "->" >> pFieldTypeArrow)
     case rest of
         Nothing  -> return lhs
         Just rhs -> return $ Pi Nothing lhs rhs
@@ -938,10 +1135,12 @@ pExprBase = try (Lit . LVec <$> angles (commaSep pFactor))  -- vector literals <
 pExpr :: Parser Expr
 pExpr = do
     e <- pExprBase
-    mCast <- optionMaybe (try (reserved "as" >> concreteType))
-    case mCast of
+    -- Try type annotation (expr : Type) or repr cast (expr as Type)
+    suffix <- optionMaybe (try (reservedOp ":" >> concreteType >>= \tp -> return (Typed e tp))
+                       <|> try (reserved "as" >> concreteType >>= \tp -> return (ReprCast e tp)))
+    case suffix of
         Nothing -> return e
-        Just tp -> return $ ReprCast e tp
+        Just e' -> return e'
 
 pIfThenElse :: Parser Expr
 pIfThenElse = do
@@ -1004,6 +1203,7 @@ pMatchCase = do
 pFactorBase :: Parser Expr
 pFactorBase = try pIfThenElse
     <|> try pLetIn
+    <|> try pUnpackExpr
     <|> try pAnonLambda
     <|> try pHandleExpr
     <|> try pActionBlockExpr
@@ -1019,6 +1219,24 @@ pFactorBase = try pIfThenElse
     <|> try (Lit <$> stringVal)
     <|> pContainers
     <?> "if/then/else, let/in, match, handle, container, literal, symbol id or parenthesized expression"
+
+-- Unpack expression: unpack expr as (tyVar, valVar) in body
+-- Desugars to LetIn with the value binding
+-- e.g. unpack s as (a, x) in x  →  let x = s in x (type var erased)
+pUnpackExpr :: Parser Expr
+pUnpackExpr = do
+    reserved "unpack"
+    e <- pExpr
+    reserved "as"
+    (tyVar, valVar) <- parens $ do
+        tv <- identifier
+        reservedOp ","
+        vv <- identifier
+        return (tv, vv)
+    reserved "in"
+    bdy <- pExpr
+    -- Desugar: bind valVar to the expression, type variable is erased
+    return $ LetIn [(Var valVar UNDEFINED UNDEFINED, e)] bdy
 
 -- Named record construction: Point { x = 1, y = 2 }
 pRecordConstruct :: Parser Expr

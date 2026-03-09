@@ -29,11 +29,11 @@ function testFmapEmpty() : Array = fmap(\x -> x, []);
 // === Universal Show ===
 
 // Test 9: show user-defined nullary constructor
-type Color = Red | Green | Blue;
+type Color = Red + Green + Blue;
 function testShowColor() : String = show(Red);
 
 // Test 10: show user-defined type with fields
-type Pair2 = MkPair(fst:Int, snd:Int);
+type Pair2 = MkPair * fst:Int * snd:Int;
 function testShowPair() : String = show(MkPair(1, 2));
 
 // Test 11: show array

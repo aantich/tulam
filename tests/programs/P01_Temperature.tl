@@ -1,4 +1,4 @@
-type TempScale = Celsius | Fahrenheit | Kelvin;
+type TempScale = Celsius + Fahrenheit + Kelvin;
 
 function scaleId(s:TempScale) : Nat = match
     | Celsius    -> Z

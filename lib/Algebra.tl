@@ -5,6 +5,7 @@
 /// StringOps, StringExt, StringLike.
 module Algebra;
 import Core;
+import Reflection;
 
 // ============================================================================
 // Semigroup / Monoid / Group

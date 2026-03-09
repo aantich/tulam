@@ -14,7 +14,7 @@ function t4() : Bool = Just(1) == Nothing;          // False
 // Note: lib already has Show(Maybe(a)) manually defined.
 // We test with a custom type instead.
 
-type Box = MkBox(a);
+type Box = MkBox * val:a;
 instance Eq(Box(a)) = derive;
 instance Show(Box(a)) = derive;
 
@@ -36,7 +36,7 @@ function t13() : Bool = Just(Just(1)) == Just(Just(2));   // False
 function t14() : Bool = Just(Nil) == Just(Nil);           // True (Maybe(List(a)))
 
 // --- Derive with multi-field constructors ---
-type Pair = MkPair(a, b);
+type Pair = MkPair * fst:a * snd:b;
 instance Eq(Pair(a, b)) = derive;
 instance Show(Pair(a, b)) = derive;
 
@@ -45,7 +45,7 @@ function t16() : Bool = MkPair(1, 2) == MkPair(1, 3);    // False
 function t17() : String = show(MkPair(1, True));           // "MkPair(1, True)"
 
 // --- Deriving syntax on parameterized types ---
-type Triple = MkTriple(a, b, c) deriving Eq, Show;
+type Triple = MkTriple * fst:a * snd:b * thd:c deriving Eq, Show;
 
 function t18() : Bool = MkTriple(1, 2, 3) == MkTriple(1, 2, 3);    // True
 function t19() : Bool = MkTriple(1, 2, 3) == MkTriple(1, 2, 4);    // False

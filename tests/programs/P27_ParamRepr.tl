@@ -1,7 +1,7 @@
 // P27: Parameterized Repr Tests
 
 // Simple wrapper type for testing
-type PackedInts = PackedInts(arr:Array(Int));
+type PackedInts = PackedInts * arr:Array(Int);
 
 // Helper to unwrap
 function unwrapPacked(p:PackedInts) : Array(Int) = match

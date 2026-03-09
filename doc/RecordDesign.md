@@ -6,9 +6,9 @@ In tulam, everything is tuples + lambdas. A lambda is a value. Therefore a recor
 
 | Concept | Other languages | tulam |
 |---------|----------------|-------|
-| Data record | `struct`, `data class` | `record` with value fields |
+| Data record | `struct`, `data class` | `type` with value fields (implicit constructor) |
 | Typeclass dictionary | `interface`, `trait` | `structure`/`algebra` (record parameterized over types, with laws) |
-| Object | `class` | `record` with function fields (explicit `self` parameter) |
+| Object | `class` | `type` with function fields (explicit `self` parameter), or `class` |
 
 All three are products with named projections. The keyword tells you what *kind* of product and what extra semantics the compiler should track.
 
@@ -19,10 +19,10 @@ All three are products with named projections. The keyword tells you what *kind*
 ### Declaration
 
 ```tulam
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 ```
 
-Note: `record` uses `{ }` for field declarations — this is unambiguous since Package A migrated sum types to `|` syntax and pattern matching to `match |` syntax. `{ }` is now exclusively used for records and declarations.
+> **Note**: The `record` keyword has been removed. Records are now declared with `type` using implicit constructors. When the right-hand side starts with a lowercase field name (not an uppercase constructor), the constructor inherits the type name. Fields are separated by `*`.
 
 This creates:
 - A nominal type `Point`
@@ -32,8 +32,8 @@ This creates:
 ### Parameterized records
 
 ```tulam
-record Pair(a:Type, b:Type) = { fst:a, snd:b };
-record Tagged(a:Type) = { tag:String, value:a };
+type Pair(a:Type, b:Type) = fst:a * snd:b;
+type Tagged(a:Type) = tag:String * value:a;
 ```
 
 ### Construction syntax
@@ -55,15 +55,15 @@ p.fst     // for Pair
 
 ### Compilation
 
-A named record desugars to a single-constructor sum type:
+A record desugars to a single-constructor sum type:
 
 ```tulam
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 // compiles identically to:
-type Point = Point(x:Nat, y:Nat);
+type Point = Point * x:Nat * y:Nat;
 ```
 
-Note: single-constructor sum types from records still use `{ }` for the field declaration block inside the record syntax, but the desugared sum type uses the standard `|` syntax (trivially, with a single constructor). This means records go through the existing pipeline — constructor extraction, field access via `CLMFieldAccess`, pattern matching. No new CLM nodes needed for Phase 2.
+Records go through the existing pipeline — constructor extraction, field access via `CLMFieldAccess`, pattern matching. No new CLM nodes needed.
 
 ---
 
@@ -72,10 +72,7 @@ Note: single-constructor sum types from records still use `{ }` for the field de
 Since functions are first-class values, any record can contain function fields:
 
 ```tulam
-record Counter = {
-    count : Nat;
-    step  : Nat
-};
+type Counter = count:Nat * step:Nat;
 
 function increment(self:Counter) : Counter =
     Counter { count = plus(self.count, self.step), step = self.step };
@@ -99,11 +96,7 @@ myCounter.increment        // if we add method syntax later, it's sugar for the 
 Functions can also be fields of the record itself, creating "object-like" records:
 
 ```tulam
-record Widget = {
-    label : String;
-    render(self:Widget) : String;
-    onClick(self:Widget) : Widget
-};
+type Widget = label:String * render:(Widget -> String) * onClick:(Widget -> Widget);
 
 // Different widgets can have different render/onClick behavior:
 let button = Widget {
@@ -122,32 +115,32 @@ This is dynamic dispatch — the function is stored in the record, not resolved 
 ### In declarations
 
 ```tulam
-record Point = { x:Nat, y:Nat };
-record Point3D = { ..Point, z:Nat };
-// expands to: { x:Nat, y:Nat, z:Nat }
+type Point = x:Nat * y:Nat;
+type Point3D = ..Point * z:Nat;
+// expands to: x:Nat * y:Nat * z:Nat
 ```
 
-`..Name` spreads all fields of the named record. Fields can be overridden:
+`..Name` spreads all fields of the named type. Fields can be overridden:
 
 ```tulam
-record FloatPoint = { ..Point, x:Float, y:Float };
+type FloatPoint = ..Point * x:Float * y:Float;
 // fields x and y overridden from Nat to Float
 ```
 
 ### Multiple spread
 
 ```tulam
-record HasName = { name:String };
-record HasAge  = { age:Nat };
-record Person  = { ..HasName, ..HasAge, email:String };
-// expands to: { name:String, age:Nat, email:String }
+type HasName = name:String;
+type HasAge  = age:Nat;
+type Person  = ..HasName * ..HasAge * email:String;
+// expands to: name:String * age:Nat * email:String
 ```
 
 Field conflicts (same name, different type from two spreads) are a compile-time error.
 
 ### Compilation
 
-Spread is resolved at parse time. `record Point3D = { ..Point, z:Nat }` looks up Point's fields and expands to a flat record. The result is a standard single-constructor sum type. No runtime overhead.
+Spread is resolved at parse time. `type Point3D = ..Point * z:Nat;` looks up Point's fields and expands to a flat record. The result is a standard single-constructor sum type. No runtime overhead.
 
 ---
 
@@ -177,7 +170,7 @@ Point(Succ(Z), p.y)
 
 ### The concept
 
-Anonymous records don't need a `record` declaration. The type IS the record:
+Anonymous records don't need a named type declaration. The type IS the record:
 
 ```tulam
 function origin() : {x:Nat, y:Nat} = {x = Z, y = Z};
@@ -217,7 +210,7 @@ In `mapX`, the row variable `r` is named — the output record has the same "res
 A named record `Point` with fields `{x:Nat, y:Nat}` is compatible with the anonymous type `{x:Nat, y:Nat, ..}`:
 
 ```tulam
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 let p = Point { x = Z, y = Z };
 greet_x(p);  // works — Point has field x
 ```
@@ -256,7 +249,7 @@ Structures and records are the same underlying concept at different levels:
 
 ```tulam
 // A record: product of VALUES with named fields
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 
 // A structure: product of FUNCTIONS parameterized over types, with laws
 algebra Monoid(a:Type) = {
@@ -287,21 +280,21 @@ This unification means:
 Records support pattern matching just like sum types:
 
 ```tulam
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 
 function isOrigin(p:Point) : Bool =
     match
     | Point(Z, Z) -> True
     | p -> False;
 
-// Or with named fields (future):
+// Or with named fields:
 function isOrigin(p:Point) : Bool =
     match
     | Point { x = Z, y = Z } -> True
     | _ -> False;
 ```
 
-Since records desugar to single-constructor sum types, positional pattern matching already works through the existing CaseOf/ExpandedCase/CLMCASE pipeline. Named field patterns are sugar for positional patterns in field-declaration order. The `match |` syntax is used for all pattern matching (both sum types and records), while `{ }` is reserved for record/declaration blocks.
+Since records desugar to single-constructor sum types, positional pattern matching already works through the existing CaseOf/ExpandedCase/CLMCASE pipeline. Named field patterns are sugar for positional patterns in field-declaration order.
 
 ---
 
@@ -313,11 +306,14 @@ The Package A syntax migration resolves all previous `{ }` ambiguity concerns:
 
 | Construct | Old syntax | New syntax |
 |-----------|-----------|------------|
-| Sum types | `type Bool = { True, False }` | `type Bool = True \| False;` |
+| Sum types | `type Bool = { True, False }` | `type Bool = True + False;` |
+| Sum types (intermediate) | `type Bool = True \| False;` | `type Bool = True + False;` |
+| Constructor fields | `Just(val:a)` | `Just * val:a` |
+| Records | `record Point = { x:Int, y:Int };` | `type Point = x:Int * y:Int;` |
 | Pattern matching | `{ {pat} -> expr, ... }` | `match \| pat -> expr \| ...` |
-| Records/declarations | `{ field:Type, ... }` | `{ field:Type, ... }` (unchanged) |
+| Records/declarations | `{ field:Type, ... }` | `{ field:Type, ... }` (for NTuples, declaration blocks) |
 
-`{ }` is now **exclusively** used for records and declaration blocks (record fields, structure members, instance bodies). Sum types use `|`-separated constructors and pattern matching uses the `match` keyword with `|`-separated arms. This eliminates the parsing ambiguity that previously existed between record literals, pattern match blocks, and anonymous record types. `match` is a reserved keyword.
+Sum types use `+` to separate constructors and `*` to introduce named fields. The `record` keyword has been removed — use `type` with implicit constructors instead. `{ }` is used for NTuples, declaration blocks (structure/instance/class bodies), and where-clauses. Pattern matching uses the `match` keyword with `|`-separated arms. `match` is a reserved keyword.
 
 ### Feature roadmap
 

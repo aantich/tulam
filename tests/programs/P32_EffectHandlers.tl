@@ -30,4 +30,4 @@ function t6() : Bool = True;
 // Test 7: SilentConsole putStr returns Unit
 function t7() : Bool =
     let r = handle putStr("suppressed") with SilentConsole in
-    eq(r, Unit);
+    r == Unit;

@@ -1,6 +1,6 @@
-type Priority = Low | Medium | High | Critical;
-type Status = Pending | InProgress | Done;
-type TaskItem = Task(pri:Priority, status:Status, effort:Nat);
+type Priority = Low + Medium + High + Critical;
+type Status = Pending + InProgress + Done;
+type TaskItem = Task * pri:Priority * status:Status * effort:Nat;
 
 algebra Scorable(a:Type) = {
     function score(x:a) : Int

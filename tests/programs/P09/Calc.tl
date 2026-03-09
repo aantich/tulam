@@ -1,7 +1,7 @@
 module P09.Calc;
 import P09.Token;
 
-type CalcResult = CalcOk(val:Int) | CalcErr;
+type CalcResult = CalcOk * val:Int + CalcErr;
 
 function applyOp(op:Token, a:Int, b:Int) : CalcResult = match
     | TPlus, a, b  -> CalcOk(a + b)

@@ -1,6 +1,6 @@
-record Point2D = { x:Int, y:Int };
+type Point2D = x:Int * y:Int;
 
-type Direction = North | South | East | West;
+type Direction = North + South + East + West;
 
 function origin() : Point2D = Point2D(0, 0);
 function makePoint(a:Int, b:Int) : Point2D = Point2D(a, b);

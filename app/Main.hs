@@ -29,6 +29,7 @@ import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 import Text.Pretty.Simple (pPrint, pShow)
 
 import Data.HashMap.Strict as Map
+import Data.List (sort, sortBy, intercalate, isPrefixOf)
 
 import Parser as Lambda
 
@@ -80,6 +81,7 @@ showHelp = do
     putStrLn ":e[nv]            -- show current environment"
     putStrLn ":clm              -- show CLM (core list machine) format functions"
     putStrLn ":clm-raw          -- show pre-optimization CLM (raw)"
+    putStrLn ":inspect <name>        -- show full detail of a type, function, or constructor"
     putStrLn ":list <types, functions, constructors> [-d] -- list all global functions / types / constructors"
     putStrLn ":cache status         -- show module cache stats"
     putStrLn ":cache clear          -- delete all cached modules"
@@ -95,10 +97,310 @@ _pprSomethingEnv sel str = do
     smth <- get >>= \s -> pure ( (sel . currentEnvironment) s)
     let tkeys = Map.keys smth
     liftIO $ mapM_ (fenv1 smth) tkeys
-    where fenv1 ts tk = do 
+    where fenv1 ts tk = do
                         let (Just tt) = Map.lookup tk ts
                         putStrLn $ (TC.as [bold,green] (tk ++ ":")) ++ "\n  " ++ (ppr tt)
- 
+
+-- | Pretty-print a function signature (no body)
+pprFuncSig :: String -> Lambda -> String
+pprFuncSig name lam =
+    "  " ++ TC.as [bold, green] name
+    ++ pprSigParams (params lam) (lamType lam) (body lam)
+
+-- | Show params and return type, handling implicit-param wrapper lambdas
+pprSigParams :: [Var] -> Expr -> Expr -> String
+pprSigParams outerPs (Function innerLam) _ =
+    -- Implicit-param function: show [outer] (inner_params) : inner_return
+    " " ++ showListSqBr ppr outerPs
+    ++ showListRoBr ppr (params innerLam)
+    ++ pprTyp (lamType innerLam)
+pprSigParams ps retTy _ =
+    -- Regular function
+    (if Prelude.null ps then "" else " " ++ showListRoBr ppr ps)
+    ++ pprTyp retTy
+
+-- | Pretty-print a type definition (summary, not full body)
+pprTypeDef :: String -> Expr -> String
+pprTypeDef name expr = case expr of
+    SumType lam ->
+        "  " ++ TC.as [bold, cyan] "type " ++ TC.as [bold] (lamName lam)
+        ++ pprTypeParams (params lam)
+        ++ " = " ++ pprConsNames (body lam)
+    Structure lam si ->
+        "  " ++ TC.as [bold, yellow] (pprStructKind (structKind si) ++ " ")
+        ++ TC.as [bold] (lamName lam)
+        ++ pprTypeParams (params lam)
+        ++ pprExtends (structExtends si)
+        ++ pprRequires (structRequires si)
+        ++ pprMethodNames (body lam)
+    Primitive lam ->
+        "  " ++ TC.as [bold, magenta] "primitive "
+        ++ TC.as [bold] (lamName lam)
+        ++ pprTypeParams (params lam)
+        ++ pprTyp (lamType lam)
+    ClassDecl lam ci ->
+        "  " ++ TC.as [bold, magenta] (pprClassMod (classModifier ci) ++ "class ")
+        ++ TC.as [bold] (lamName lam)
+        ++ pprTypeParams (params lam)
+        ++ pprClassParent (classParent ci)
+        ++ pprMethodNames (body lam)
+    _ -> "  " ++ TC.as [bold] name ++ pprTyp expr
+
+-- | Show type parameters
+pprTypeParams :: [Var] -> String
+pprTypeParams [] = ""
+pprTypeParams ps = showListRoBr ppr ps
+
+-- | Extract just constructor names from a Constructors body
+pprConsNames :: Expr -> String
+pprConsNames (Constructors cs) = intercalate " | " (Prelude.map (\lam -> TC.as [bold] (lamName lam)) cs)
+pprConsNames e = ppr e
+
+-- | Extract method/function names from a DeclBlock or body
+pprMethodNames :: Expr -> String
+pprMethodNames (DeclBlock exprs) =
+    let names = [lamName lam | Function lam <- exprs]
+              ++ [lamName lam | Law lam _ <- exprs]
+    in if Prelude.null names then ""
+       else TC.as [dim] (" { " ++ intercalate ", " names ++ " }")
+pprMethodNames _ = ""
+
+-- | Pretty-print a constructor entry
+pprConsDef :: String -> Lambda -> Int -> String
+pprConsDef name lam tag =
+    "  " ++ TC.as [bold, yellow] name
+    ++ TC.as [dim] (" #" ++ show tag)
+    ++ (if Prelude.null (params lam) then ""
+        else " " ++ showListRoBr ppr (params lam))
+    ++ pprTyp (lamType lam)
+
+-- | List types with nice formatting
+listTypes :: IntState ()
+listTypes = do
+    liftIO $ putStrLn $ "\n" ++ TC.as [bold, underlined] "Types"
+    types' <- gets (types . currentEnvironment)
+    let sorted = sort (Map.keys types')
+    liftIO $ mapM_ (\k -> let Just v = Map.lookup k types' in putStrLn (pprTypeDef k v)) sorted
+    liftIO $ putStrLn $ TC.as [dim] ("  (" ++ show (length sorted) ++ " types)")
+
+-- | List functions with nice formatting (signature only, no body)
+listFunctions :: IntState ()
+listFunctions = do
+    liftIO $ putStrLn $ "\n" ++ TC.as [bold, underlined] "Functions"
+    lambdas' <- gets (topLambdas . currentEnvironment)
+    let sorted = sort (Map.keys lambdas')
+    liftIO $ mapM_ (\k -> let Just v = Map.lookup k lambdas' in putStrLn (pprFuncSig k v)) sorted
+    liftIO $ putStrLn $ TC.as [dim] ("  (" ++ show (length sorted) ++ " functions)")
+
+-- | List constructors with nice formatting
+listConstructors :: IntState ()
+listConstructors = do
+    liftIO $ putStrLn $ "\n" ++ TC.as [bold, underlined] "Constructors"
+    cons' <- gets (constructors . currentEnvironment)
+    let sorted = sort (Map.keys cons')
+    liftIO $ mapM_ (\k -> let Just (lam, tag) = Map.lookup k cons' in putStrLn (pprConsDef k lam tag)) sorted
+    liftIO $ putStrLn $ TC.as [dim] ("  (" ++ show (length sorted) ++ " constructors)")
+
+-- ===================== :inspect — full detail, multi-line pretty printer =====================
+
+-- | Indented, multi-line pretty print for a Lambda
+ppLambdaFull :: Int -> Lambda -> String
+ppLambdaFull ind lam =
+    indent ind ++ TC.as [bold, green] (lamName lam) ++ " "
+    ++ showListRoBr ppr (params lam)
+    ++ pprTyp (lamType lam)
+    ++ ppBody ind (body lam)
+
+-- | Pretty-print body with proper indentation
+ppBody :: Int -> Expr -> String
+ppBody _ UNDEFINED = ""
+ppBody ind Intrinsic = " = " ++ TC.as [bold, cyan] "intrinsic"
+ppBody ind Derive = " = " ++ TC.as [bold, cyan] "derive"
+ppBody ind (DeclBlock exprs) = " =\n" ++ unlines' (Prelude.map (ppExprFull (ind + 2)) exprs)
+ppBody ind (Constructors cs) = " =\n" ++ intercalate "\n" (Prelude.map (ppConsLamFull (ind + 2)) cs)
+ppBody ind (PatternMatches ps) = " =\n" ++ indent (ind + 2) ++ "match\n"
+    ++ unlines' (Prelude.map (\c -> indent (ind + 2) ++ "| " ++ ppCaseFull (ind + 4) c) ps)
+ppBody ind expr = " = " ++ ppExprFull ind expr
+
+-- | Pretty-print a constructor Lambda in a sum type
+ppConsLamFull :: Int -> Lambda -> String
+ppConsLamFull ind lam =
+    indent ind ++ "| " ++ TC.as [bold, yellow] (lamName lam)
+    ++ (if Prelude.null (params lam) then "" else showListRoBr ppr (params lam))
+    ++ pprTyp (lamType lam)
+
+-- | Full multi-line pretty-print for any Expr
+ppExprFull :: Int -> Expr -> String
+ppExprFull ind (Function lam) =
+    indent ind ++ TC.as [bold, red] "function " ++ ppLambdaInline ind lam
+ppExprFull ind (Action lam) =
+    indent ind ++ TC.as [bold, blue] "action " ++ ppLambdaInline ind lam
+ppExprFull ind (Value v ex) =
+    indent ind ++ TC.as [bold, magenta] "value " ++ ppr v
+    ++ if ex == UNDEFINED then "" else " = " ++ ppr ex
+ppExprFull ind (Law lam ex) =
+    indent ind ++ TC.as [bold, cyan] "law " ++ TC.as [bold] (lamName lam) ++ " "
+    ++ showListRoBr ppr (params lam)
+    ++ pprTyp (lamType lam)
+    ++ " = " ++ ppr ex
+ppExprFull ind (SumType lam) =
+    indent ind ++ TC.as [bold, cyan] "type " ++ TC.as [bold] (lamName lam)
+    ++ pprTypeParams (params lam)
+    ++ pprTyp (lamType lam)
+    ++ ppBody ind (body lam)
+ppExprFull ind (Structure lam si) =
+    indent ind ++ TC.as [bold, yellow] (pprStructKind (structKind si) ++ " ")
+    ++ TC.as [bold] (lamName lam) ++ " "
+    ++ pprTypeParams (params lam)
+    ++ pprExtends (structExtends si)
+    ++ pprRequires (structRequires si)
+    ++ ppBody ind (body lam)
+ppExprFull ind (Instance nm targs impls reqs) =
+    indent ind ++ TC.as [bold, green] "instance " ++ nm
+    ++ showListRoBr ppr targs
+    ++ pprRequires reqs ++ " =\n"
+    ++ unlines' (Prelude.map (ppExprFull (ind + 2)) impls)
+ppExprFull ind (ClassDecl lam ci) =
+    indent ind ++ TC.as [bold, magenta] (pprClassMod (classModifier ci) ++ "class ")
+    ++ TC.as [bold] (lamName lam) ++ " "
+    ++ pprTypeParams (params lam)
+    ++ pprClassParent (classParent ci)
+    ++ ppBody ind (body lam)
+ppExprFull ind (Primitive lam) =
+    indent ind ++ TC.as [bold, magenta] "primitive "
+    ++ TC.as [bold] (lamName lam)
+    ++ pprTypeParams (params lam) ++ pprTyp (lamType lam)
+ppExprFull ind (EffectDecl nm ps ops) =
+    indent ind ++ TC.as [bold, cyan] "effect " ++ nm ++ showListRoBr ppr ps ++ " =\n"
+    ++ unlines' (Prelude.map (\o -> ppExprFull (ind + 2) (Function o)) ops)
+ppExprFull ind (Repr nm tp def fns _inv) =
+    indent ind ++ TC.as [bold, magenta] "repr " ++ ppr nm ++ " as " ++ ppr tp
+    ++ (if def then " default" else "") ++ " where\n"
+    ++ unlines' (Prelude.map (ppExprFull (ind + 2)) fns)
+ppExprFull ind (FixityDecl assoc prec ops) =
+    indent ind ++ pprAssocLocal assoc ++ " " ++ show prec ++ " "
+    ++ showListPlainSep (\o -> "(" ++ o ++ ")") ", " ops
+ppExprFull ind e = indent ind ++ ppr e
+
+-- | Lambda printed inline (for method declarations inside a body)
+ppLambdaInline :: Int -> Lambda -> String
+ppLambdaInline ind lam =
+    TC.as [bold] (lamName lam) ++ " "
+    ++ showListRoBr ppr (params lam)
+    ++ pprTyp (lamType lam)
+    ++ ppInlineBody ind (body lam)
+
+-- | Body for inline lambdas — short bodies stay on same line
+ppInlineBody :: Int -> Expr -> String
+ppInlineBody _ UNDEFINED = ""
+ppInlineBody _ Intrinsic = " = " ++ TC.as [bold, cyan] "intrinsic"
+ppInlineBody _ Derive = " = " ++ TC.as [bold, cyan] "derive"
+ppInlineBody ind (PatternMatches ps) = " =\n"
+    ++ unlines' (Prelude.map (\c -> indent (ind + 4) ++ "| " ++ ppCaseFull (ind + 6) c) ps)
+ppInlineBody ind expr
+    | length (ppr expr) < 60 = " = " ++ ppr expr
+    | otherwise = " =\n" ++ indent (ind + 4) ++ ppr expr
+
+-- | Pretty-print a case branch
+ppCaseFull :: Int -> Expr -> String
+ppCaseFull ind (CaseOf vars body _) =
+    showListPlainSep ppVarCaseOf ", " vars ++ " -> " ++ ppr body
+ppCaseFull ind (ExpandedCase checks body _) =
+    showListPlainSep ppr ", " checks ++ " -> " ++ ppr body
+ppCaseFull ind e = ppr e
+
+pprAssocLocal :: Assoc -> String
+pprAssocLocal AssocLeft  = "infixl"
+pprAssocLocal AssocRight = "infixr"
+pprAssocLocal AssocNone  = "infix"
+
+-- | Indentation helper
+indent :: Int -> String
+indent n = replicate n ' '
+
+-- | Join lines without trailing newline
+unlines' :: [String] -> String
+unlines' = intercalate "\n"
+
+-- | The :inspect command — look up a name in all environments and pretty-print it
+inspectName :: String -> IntState ()
+inspectName name = do
+    env <- gets currentEnvironment
+    let foundType = Map.lookup name (types env)
+        foundFunc = Map.lookup name (topLambdas env)
+        foundCons = Map.lookup name (constructors env)
+        foundInst = findInstances name env
+        foundClm  = Map.lookup name (clmLambdas env)
+    let noneFound = not (isJust' foundType) && not (isJust' foundFunc)
+                  && not (isJust' foundCons) && Prelude.null foundInst
+                  && not (isJust' foundClm)
+    if noneFound
+      then liftIO $ putStrLn $ TC.as [red] ("  Not found: " ++ name)
+      else do
+        -- Type definition
+        case foundType of
+          Just expr -> liftIO $ do
+            putStrLn $ TC.as [bold, underlined] "Type"
+            putStrLn $ ppExprFull 2 expr
+            putStrLn ""
+          Nothing -> return ()
+        -- Top-level function
+        case foundFunc of
+          Just lam -> liftIO $ do
+            putStrLn $ TC.as [bold, underlined] "Function"
+            putStrLn $ ppLambdaFull 2 lam
+            putStrLn ""
+          Nothing -> return ()
+        -- Constructor
+        case foundCons of
+          Just (lam, tag) -> liftIO $ do
+            putStrLn $ TC.as [bold, underlined] "Constructor"
+            putStrLn $ indent 2 ++ TC.as [bold, yellow] name
+              ++ TC.as [dim] (" (tag " ++ show tag ++ ")")
+              ++ " " ++ showListRoBr ppr (params lam)
+              ++ pprTyp (lamType lam)
+            putStrLn ""
+          Nothing -> return ()
+        -- Instance lambdas containing this name
+        if not (Prelude.null foundInst)
+          then liftIO $ do
+            putStrLn $ TC.as [bold, underlined] "Instances"
+            mapM_ (\(key, lam) -> do
+              putStrLn $ indent 2 ++ TC.as [bold, green] (prettyInstanceKey key)
+              putStrLn $ ppLambdaFull 4 lam
+              ) foundInst
+            putStrLn ""
+          else return ()
+        -- CLM lambda
+        case foundClm of
+          Just clm -> liftIO $ do
+            putStrLn $ TC.as [bold, underlined] "CLM"
+            putStrLn $ indent 2 ++ ppr clm
+            putStrLn ""
+          Nothing -> return ()
+  where
+    isJust' Nothing = False
+    isJust' (Just _) = True
+
+-- | Find instance lambdas whose key starts with the given function name
+findInstances :: String -> Environment -> [(String, Lambda)]
+findInstances name env =
+    [(k, lam) | (k, lam) <- Map.toList (instanceLambdas env),
+                name `isPrefixOf` k,
+                -- make sure it's an exact function name match (followed by \0 or end)
+                length k == length name || (k !! length name) == '\0']
+
+-- | Format instance key for display: "func\0Type1\0Type2" -> "func(Type1, Type2)"
+prettyInstanceKey :: String -> String
+prettyInstanceKey key = case break (== '\0') key of
+    (func, [])   -> func
+    (func, rest) -> func ++ "(" ++ intercalate ", " (splitOn '\0' (Prelude.tail rest)) ++ ")"
+  where
+    splitOn _ [] = []
+    splitOn c s  = let (w, rest) = break (== c) s
+                   in w : case rest of
+                            []    -> []
+                            (_:r) -> splitOn c r
 
 processCommand :: [String] -> IntState ()
 processCommand (":help":_) = liftIO showHelp
@@ -106,6 +408,8 @@ processCommand (":quit":_) = liftIO $ putStrLn "Goodbye." >> exitSuccess
 processCommand (":load":xs) = loadFileNew (head xs)
 processCommand (":set":s:xs) = processSet s xs
 processCommand (":compile":_) = compile2JSpass
+processCommand (":inspect":name:_) = inspectName name
+processCommand (":inspect":_) = liftIO $ putStrLn "Usage: :inspect <name>"
 processCommand (":list":"types":"-d":_) = do
     liftIO $ putStrLn "\n--------------- TYPES ----------------"
     types <- get >>= \s -> pure ( (types . currentEnvironment) s)
@@ -128,18 +432,9 @@ processCommand (":env":"-d":_) = do
     processCommand (":list":"constructors":"-d":[])
     processCommand (":list":"functions":"-d":[])
 
-processCommand (":list":"types":_) = 
-    _pprSomethingEnv types "\n--------------- TYPES ----------------"
-processCommand (":list":"functions":_) = 
-    _pprSomethingEnv topLambdas "\n--------------- LAMBDAS ----------------"    
-processCommand (":list":"constructors":_) = do
-    liftIO $ putStrLn "\n--------------- CONSTRUCTORS ----------------"
-    res <- get >>= \s -> pure ( (constructors . currentEnvironment) s)
-    let fkeys = Map.keys res
-    liftIO $ mapM_ (fenv1 res) fkeys
-    where fenv1 ts tk = do 
-                        let (Just (tt,constag)) = Map.lookup tk ts
-                        putStrLn $ (TC.as [bold,green] (tk ++ "(" ++ show constag ++ "):")) ++ "\n  " ++ (ppr tt)
+processCommand (":list":"types":_) = listTypes
+processCommand (":list":"functions":_) = listFunctions
+processCommand (":list":"constructors":_) = listConstructors
 
 processCommand (":clm":"-d":_) = do
     liftIO $ putStrLn "\n--------------- CLM LAMBDAS ----------------"

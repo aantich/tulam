@@ -340,9 +340,9 @@ type SelectCase(a) =
     /// Wait to receive from a channel, transform the value
     OnRecv(Channel(b), b -> a)
     /// Wait to send on a channel, then run continuation
-  | OnSend(Channel(b), b, Unit -> a)
+  + OnSend(Channel(b), b, Unit -> a)
     /// If no other case is ready, run the default
-  | Default(Unit -> a);
+  + Default(Unit -> a);
 
 /// Wait on multiple channel operations. The first ready case wins.
 /// If multiple cases are ready, one is chosen at random (fairness).
@@ -795,7 +795,7 @@ abstract class Actor(msg: Type) = {
 };
 
 /// An opaque reference to a running actor. Can only send messages.
-record ActorRef(msg: Type) = { sendChan : SendChan(msg) };
+type ActorRef(msg: Type) = sendChan : SendChan(msg);
 
 /// Spawn an actor in a scope. Returns a reference for sending messages.
 function spawnActor [msg:Type] (scope: Scope, actor: Actor(msg))
@@ -819,7 +819,7 @@ class CounterActor() extends Actor(CounterMsg) = {
         | GetCount(ch) -> send(ch, self.count);
 };
 
-type CounterMsg = Increment | Decrement | GetCount(Channel(Int));
+type CounterMsg = Increment + Decrement + GetCount * ch:Channel(Int);
 
 action main() : Eff { async: Async, chan: Chan, console: Console } Unit = {
     withScope(\scope -> {
@@ -848,7 +848,7 @@ Built on top of core effects, provided as standard library.
 module Concurrent.Semaphore;
 
 /// A counting semaphore backed by STM.
-record Semaphore = { count : TVar(Int) };
+type Semaphore = count:TVar(Int);
 
 function newSemaphore(permits: Int) : Eff { async: Async } Semaphore =
     atomically(\_ -> {
@@ -890,7 +890,7 @@ function withMutex [a:Type] (m: Semaphore, body: Unit -> Eff { async: Async } a)
 module Concurrent.Barrier;
 
 /// A cyclic barrier — N tasks must arrive before any can proceed.
-record Barrier = { remaining : TVar(Int), generation : TVar(Int) };
+type Barrier = remaining:TVar(Int) * generation:TVar(Int);
 
 function newBarrier(parties: Int) : Eff { async: Async } Barrier =
     atomically(\_ -> {
@@ -920,7 +920,7 @@ function arriveAndWait(barrier: Barrier) : Eff { async: Async } Unit =
 
 ```tulam
 /// CountDownLatch — wait until count reaches zero
-record CountDownLatch = { count : TVar(Int) };
+type CountDownLatch = count:TVar(Int);
 
 function newLatch(n: Int) : Eff { async: Async } CountDownLatch =
     atomically(\_ -> { tv <- newTVar(n), pure(CountDownLatch(tv)) });
@@ -932,8 +932,8 @@ function awaitLatch(latch: CountDownLatch) : Eff { async: Async } Unit =
     atomically(\_ -> { n <- readTVar(latch.count), if n > 0 then retry() else pure(Unit) });
 
 /// Once — execute a function exactly once, memoize the result
-record Once(a: Type) = { state : TVar(OnceState(a)) };
-type OnceState(a) = Uninitialized | Running | Done(a);
+type Once(a: Type) = state : TVar(OnceState(a));
+type OnceState(a) = Uninitialized + Running + Done * val:a;
 
 function newOnce() : Eff { async: Async } Once(a) =
     atomically(\_ -> { tv <- newTVar(Uninitialized), pure(Once(tv)) });
@@ -1217,7 +1217,7 @@ This would require serialization support and network IO, both significant extens
 
 ### Phase C8: Actor Library
 **Goal**: Actor pattern as a library on classes + channels.
-- Implement `Actor` abstract class, `ActorRef` record
+- Implement `Actor` abstract class, `ActorRef` type
 - Implement `spawnActor`, `tell`
 - Add `lib/Concurrent/Actor.tl`
 - Tests: counter actor, ping-pong actors, supervisor pattern

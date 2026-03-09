@@ -902,21 +902,21 @@ class Animal(...)              class Animal
 
 ### 10.1 Classes vs. Records
 
-Records remain for pure data. Classes add behavior + inheritance.
+Records (declared with `type` using implicit constructor) remain for pure data. Classes add behavior + inheritance.
 
 ```tulam
-record Point = Point(x:Float64, y:Float64);      // pure data, no methods
+type Point = x:Float64 * y:Float64;               // pure data, no methods
 class Shape(color:String) = { function area... };  // data + behavior
 ```
 
-A record can be promoted to a class by changing `record` to `class` and adding methods. No other syntax changes needed (field declarations are the same).
+A record (declared with `type` using implicit constructor, e.g. `type Point = x:Int * y:Int;`) can be promoted to a class by changing `type` to `class` and adding methods. No other syntax changes needed (field declarations are the same).
 
 ### 10.2 Classes vs. Sum Types
 
 Sum types are closed discriminated unions. Classes are open hierarchies.
 
 ```tulam
-type Maybe(a) = Just(a) | Nothing;   // closed — exhaustive matching guaranteed
+type Maybe(a) = Nothing + Just * val:a;   // closed — exhaustive matching guaranteed
 class Animal(...) = { ... };          // open — new subclasses can be added anytime
 sealed class Result(a) = {};          // middle ground — closed hierarchy with inheritance
 ```

@@ -24,7 +24,7 @@ module TypeCheck
   , resolveConstraints, showTCError, showExprBrief, showTy, showRow
   , tyToName, bindRow
     -- * Type-level normalization
-  , normalizeTy, tyToCLM, clmToTy, isConcreteTy
+  , normalizeTy, tyToCLM, clmToTy, isConcreteTy, lambdaToCLMLam
     -- * Rigid variable analysis (for existential escape checking)
   , freeRigidVars
     -- * GADT support
@@ -35,7 +35,7 @@ module TypeCheck
 
 import Surface
 import State
-import CLM (CLMExpr(..), CLMLam(..), CLMPatternCheck(..), evalCLMPure)
+import CLM (CLMExpr(..), CLMLam(..), CLMPatternCheck(..), evalCLMPure, inferTypePure)
 import Logs
 
 import Control.Monad (when, unless, zipWithM_, forM_, forM, foldM)
@@ -70,6 +70,7 @@ data Ty
   | TEffect Row Ty          -- ^ Effect type: Eff {console:Console, ..r} a
   | TU Level                -- ^ Universe: TU (LConst 0) = Type, TU (LConst 1) = Type1, etc.
   | TLevel                  -- ^ The type of universe levels themselves
+  | TLit Literal            -- ^ Value-level literal promoted to type level: TLit (LInt 3)
   deriving (Show, Eq)
 
 -- | Row types for structural records
@@ -230,6 +231,8 @@ freshRowVar _env st =
 exprToTy :: Expr -> TC Ty
 exprToTy UNDEFINED = freshTyVar  -- unknown type → fresh var
 exprToTy (U n) = tcPure (TU (LConst n))
+-- Literal promotion: value-level literals → type-level literals (for dependent types)
+exprToTy (Lit l) = tcPure (TLit l)
 exprToTy (Id "Int") = tcPure (TCon "Int")
 exprToTy (Id "Float64") = tcPure (TCon "Float64")
 exprToTy (Id "String") = tcPure (TCon "String")
@@ -259,8 +262,13 @@ exprToTy (Id name) = do
          else tcPure (TRigid name)  -- assume type variable even if not in scope
   where
     isUpper c = c >= 'A' && c <= 'Z'
--- PropEqT(A, x, y) → TId (must be before general App (Id name) case)
+-- PropEq(A, x, y) → TId (canonical name; PropEqT kept as legacy alias)
 exprToTy (App (Id "PropEqT") [tyExpr, lhs, rhs]) =
+  exprToTy tyExpr `tcBind` \t ->
+    exprToTy lhs `tcBind` \l ->
+      exprToTy rhs `tcBind` \r ->
+        tcPure (TId t l r)
+exprToTy (App (Id "PropEq") [tyExpr, lhs, rhs]) =
   exprToTy tyExpr `tcBind` \t ->
     exprToTy lhs `tcBind` \l ->
       exprToTy rhs `tcBind` \r ->
@@ -376,6 +384,7 @@ applySubst (TEffect row ty) =
       tcPure (TEffect row' ty')
 applySubst (TU l) = tcPure (TU l)
 applySubst TLevel = tcPure TLevel
+applySubst (TLit l) = tcPure (TLit l)
 
 applySubstRow :: Row -> TC Row
 applySubstRow REmpty = tcPure REmpty
@@ -418,6 +427,7 @@ occursIn v (TRecord row)  = occursInRow v row
 occursIn v (TEffect row ty) = occursInRow v row || occursIn v ty
 occursIn _ (TU _)         = False
 occursIn _ TLevel         = False
+occursIn _ (TLit _)       = False
 
 occursInRow :: TyVar -> Row -> Bool
 occursInRow _ REmpty          = False
@@ -475,6 +485,7 @@ unify' (TSigma mn1 a1 r1) (TSigma mn2 a2 r2) =
         in tcModify (\s -> s { nextVar = nextVar s + 1 }) `tcBind` \_ ->
           unify (substTyVar n1 rigid r1) (substTyVar n2 rigid r2)
     _ -> unify r1 r2
+unify' (TLit l1) (TLit l2) | l1 == l2 = tcPure ()
 unify' (TId t1 a1 b1) (TId t2 a2 b2) =
   unify t1 t2 `tcBind` \_ -> unify a1 a2 `tcBind` \_ -> unify b1 b2
 unify' (TApp c1 as1) (TApp c2 as2)
@@ -640,7 +651,7 @@ substTyVar n r (TU l) = TU (substLevel n (tyToLevel r) l)
   where
     tyToLevel (TU l') = l'
     tyToLevel _ = l  -- if replacement isn't a level, keep original
-substTyVar _ _ ty = ty  -- TVar, TCon, TLevel  -- TVar, TCon, TU don't contain rigid vars
+substTyVar _ _ ty = ty  -- TVar, TCon, TLevel, TLit — atoms don't contain rigid vars
 
 substTyVarRow :: Name -> Ty -> Row -> Row
 substTyVarRow _ _ REmpty = REmpty
@@ -771,6 +782,8 @@ gadtRefineWithParams typeParams conLam scrutExpr =
   -- Create fresh unification vars for each type parameter
   tcMapM (\_ -> freshTyVar) typeParams `tcBind` \freshVars ->
     let paramMapping = Prelude.zip typeParams freshVars
+        -- Build reverse map: TVar id → TRigid paramName (for resolving var chains)
+        reverseMap = [(v, TRigid n) | (n, TVar v) <- paramMapping]
         -- Convert the constructor's GADT return type, replacing type params with fresh vars
     in gadtExprToTy paramMapping (lamType conLam) `tcBind` \gadtRetTy ->
        -- Infer the scrutinee's type
@@ -786,7 +799,13 @@ gadtRefineWithParams typeParams conLam scrutExpr =
                applySubst tv `tcBind` \resolved ->
                  case resolved of
                    TVar v' | tv == TVar v' -> tcPure Nothing  -- unresolved, no refinement
-                   ty -> tcPure (Just (paramName, ty))
+                   ty ->
+                     -- Resolve any remaining fresh vars back to their original param rigids.
+                     -- E.g., if matching Refl : PropEq(a,x,x) against PropEq(a,x,y),
+                     -- y's fresh var resolves to x's fresh var. We map x's fresh var
+                     -- back to TRigid "x" so the refinement is y → TRigid "x".
+                     let resolvedTy = Prelude.foldl (\t' (v, rigid) -> replaceTVar v rigid t') ty reverseMap
+                     in tcPure (Just (paramName, resolvedTy))
              ) paramMapping `tcBind` \results ->
                tcPure [(n, t) | Just (n, t) <- results]
 
@@ -815,6 +834,7 @@ gadtExprToTy mapping (NTuple fields) =
       [t] -> tcPure t
       _   -> tcPure (Prelude.foldr1 TProd tys)
 gadtExprToTy _ (U n) = tcPure (TU (LConst n))
+gadtExprToTy _ (Lit l) = tcPure (TLit l)
 gadtExprToTy _ e = exprToTy e  -- fallback to normal conversion
 
 -- | Apply GADT refinements to the type environment.
@@ -863,10 +883,42 @@ normalizeTy env = go
     tryReduce name argTys
         | Prelude.all isConcreteTy argTys =
             let argCLMs = Prelude.map (tyToCLM env) argTys
+                -- Top-level function lookup (topLambdas + clmLambdas)
                 lookupFn n = case lookupLambda n env of
                     Just lam -> Just (lambdaToCLMLam env lam)
                     Nothing  -> Map.lookup n (clmLambdas env)
-                result = evalCLMPure lookupFn 0 (CLMAPP (CLMID name) argCLMs)
+                -- Instance lookup: infer types from concrete args, then find instance.
+                -- Mirrors runtime dispatchInstance: multi-param → prefix → single-param fallback.
+                -- Checks both clmInstances (available after Pass 4) and instanceLambdas
+                -- (available during Pass 3/type checking, converted on-the-fly).
+                consLookup cn = lookupTypeOfConstructor cn env
+                lookupInstanceFn funcNm args =
+                    let typeNames = [t | Just t <- Prelude.map (inferTypePure consLookup) args]
+                    in if Prelude.null typeNames then Nothing
+                       else tryInstanceLookup funcNm typeNames
+                -- Try CLM instance first, then Surface instanceLambda (convert on-the-fly)
+                tryInstance funcNm tns =
+                    case lookupCLMInstance funcNm tns env of
+                        Just clm -> Just clm
+                        Nothing  -> case lookupInstanceLambda funcNm tns env of
+                            Just lam -> Just (lambdaToCLMLam env lam)
+                            Nothing  -> Nothing
+                tryInstanceLookup funcNm typeNames =
+                    -- 1. Try full multi-param exact key
+                    case tryInstance funcNm typeNames of
+                        Just clm -> Just clm
+                        Nothing ->
+                            -- 2. Try prefix match (morphism dispatch, CLM only)
+                            case lookupCLMInstancePrefix funcNm typeNames env of
+                                Just clm -> Just clm
+                                Nothing ->
+                                    -- 3. Fall back to single-param: try each type
+                                    let tryKeys [] = Nothing
+                                        tryKeys (t:ts) = case tryInstance funcNm [t] of
+                                            Just clm -> Just clm
+                                            Nothing  -> tryKeys ts
+                                    in tryKeys (Data.List.nub typeNames)
+                result = evalCLMPure lookupFn lookupInstanceFn 0 (CLMAPP (CLMID name) argCLMs)
             in case clmToTy result of
                 Just ty -> ty
                 Nothing -> TApp (TCon name) argTys  -- can't convert back
@@ -931,6 +983,8 @@ tyToCLM _ (TRigid n) = CLMID n
 tyToCLM _ (TU l) = CLMU l
 tyToCLM _ TLevel = CLMID "__Level"
 tyToCLM env (TApp f args) = CLMAPP (tyToCLM env f) (Prelude.map (tyToCLM env) args)
+tyToCLM env (TId t a b) = CLMAPP (CLMID "PropEq") [tyToCLM env t, tyToCLM env a, tyToCLM env b]
+tyToCLM _ (TLit l) = CLMLIT l
 tyToCLM _ _ = CLMEMPTY
 
 -- | Convert CLMExpr → Ty (for reading back evaluation results).
@@ -940,6 +994,7 @@ clmToTy (CLMCON (ConsTag name _) args) = TApp (TCon name) <$> mapM clmToTy args
 clmToTy (CLMID "__Level")              = Just TLevel
 clmToTy (CLMID name)                   = Just (TCon name)
 clmToTy (CLMU l)                       = Just (TU l)
+clmToTy (CLMLIT l)                     = Just (TLit l)
 clmToTy CLMEMPTY                       = Nothing
 clmToTy _                              = Nothing
 
@@ -954,6 +1009,8 @@ isConcreteTy (TU _)         = True
 isConcreteTy TLevel         = True
 isConcreteTy (TPi _ a b)    = isConcreteTy a && isConcreteTy b
 isConcreteTy (TSigma _ a b) = isConcreteTy a && isConcreteTy b
+isConcreteTy (TId t a b)    = isConcreteTy t && isConcreteTy a && isConcreteTy b
+isConcreteTy (TLit _)       = True
 isConcreteTy _              = False
 
 -- ============================================================================
@@ -1645,6 +1702,7 @@ showTy TLevel = "Level"
 showTy (TU (LConst 0)) = "Type"
 showTy (TU (LConst n)) = "Type" ++ show n
 showTy (TU l) = "U(" ++ showLevel l ++ ")"
+showTy (TLit l) = show l
 
 showTyArg :: Ty -> String
 showTyArg t@(TPi Nothing _ _) = "(" ++ showTy t ++ ")"

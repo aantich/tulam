@@ -16,7 +16,7 @@ import ModuleSystem
 import Util.PrettyPrinting (ppr)
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Set as Set
-import Data.List (isInfixOf, isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf, nub)
 import Interpreter
 import Parser
 import Logs
@@ -236,12 +236,12 @@ main = do
 
         describe "End-to-end evaluation" $ do
             -- Nat operations
-            it "eq(Z, Z) = True" $ do
-                result <- evalExpr st "eq(Z, Z)"
+            it "Z == Z = True" $ do
+                result <- evalExpr st "Z == Z"
                 result `shouldBe` conTrue
 
-            it "eq(Z, Succ(Z)) = False" $ do
-                result <- evalExpr st "eq(Z, Succ(Z))"
+            it "Z == Succ(Z) = False" $ do
+                result <- evalExpr st "Z == Succ(Z)"
                 result `shouldBe` conFalse
 
             it "plus(Succ(Z), Succ(Z)) = Succ(Succ(Z))" $ do
@@ -1193,12 +1193,12 @@ main = do
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> pure ()
 
-                it "exprToTy catch-all emits warning for unknown forms" $ do
-                    -- Value(Var ...) in type position should warn
+                it "exprToTy promotes literals to TLit" $ do
+                    -- Lit (LInt 42) in type position now produces TLit (promoted to type level)
                     let result = runTC (exprToTy (Lit (LInt 42))) env0 st0
                     case result of
-                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
-                        Left _ -> pure ()
+                        Right (ty, _) -> ty `shouldBe` TLit (LInt 42)
+                        Left errs -> expectationFailure $ "Expected TLit, got errors: " ++ show errs
 
             -- ============================================================
             -- Step 3: TForall alpha-renaming
@@ -4670,18 +4670,17 @@ main = do
                         result = normalizeTy env (TApp (TCon "not") [inner])
                     result `shouldBe` TCon "True"
 
-                it "normalizeTy: eq(Z, Z) reduces to True" $ do
-                    let result = normalizeTy env (TApp (TCon "eq") [TCon "Z", TCon "Z"])
-                    result `shouldBe` TCon "True"
-
-                it "normalizeTy: eq(Z, Succ(Z)) reduces to False" $ do
-                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
-                        result = normalizeTy env (TApp (TCon "eq") [TCon "Z", natSZ])
+                it "normalizeTy: not(True) reduces to False" $ do
+                    let result = normalizeTy env (TApp (TCon "not") [TCon "True"])
                     result `shouldBe` TCon "False"
 
-                it "normalizeTy: eq(Succ(Z), Succ(Z)) reduces to True" $ do
-                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
-                        result = normalizeTy env (TApp (TCon "eq") [natSZ, natSZ])
+                it "normalizeTy: not(False) reduces to True" $ do
+                    let result = normalizeTy env (TApp (TCon "not") [TCon "False"])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: not(not(True)) reduces to True" $ do
+                    let inner = TApp (TCon "not") [TCon "True"]
+                        result = normalizeTy env (TApp (TCon "not") [inner])
                     result `shouldBe` TCon "True"
 
                 -- Larger computations
@@ -4718,6 +4717,26 @@ main = do
                     let ty = TPi (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
                         result = normalizeTy env ty
                     result `shouldBe` ty
+
+                -- Instance dispatch at type level (algebra methods usable as type-level functions)
+                it "normalizeTy: (==) on Nats via instance dispatch — Z == Z reduces to True" $ do
+                    let result = normalizeTy env (TApp (TCon "==") [TCon "Z", TCon "Z"])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: (==) on Nats via instance dispatch — Z == Succ(Z) reduces to False" $ do
+                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
+                        result = normalizeTy env (TApp (TCon "==") [TCon "Z", natSZ])
+                    result `shouldBe` TCon "False"
+
+                it "normalizeTy: (==) on Nats via instance dispatch — Succ(Z) == Succ(Z) reduces to True" $ do
+                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
+                        result = normalizeTy env (TApp (TCon "==") [natSZ, natSZ])
+                    result `shouldBe` TCon "True"
+
+                it "normalizeTy: compare on Nats via instance dispatch — compare(Z, Succ(Z)) reduces to LessThan" $ do
+                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
+                        result = normalizeTy env (TApp (TCon "compare") [TCon "Z", natSZ])
+                    result `shouldBe` TCon "LessThan"
 
                 -- tyToCLM edge cases
                 it "tyToCLM: function name → CLMID" $ do
@@ -6006,3 +6025,91 @@ main = do
                 st' <- loadTestProgram st "tests/programs/P35_NewSyntax.tl"
                 result <- evalExpr st' "t6()"
                 result `shouldBe` CLMLIT (LInt 99)
+
+        -- ==================================================================
+        -- P36: Propositional Equality (Identity Type)
+        -- ==================================================================
+        describe "P36: PropEq (Identity Type)" $ do
+            it "PropEq type is registered in stdlib" $ do
+                let env = currentEnvironment st
+                case lookupType "PropEq" env of
+                    Just (SumType _) -> return ()
+                    other -> expectationFailure $ "Expected PropEq type, got: " ++ show other
+
+            it "Refl constructor is registered" $ do
+                let env = currentEnvironment st
+                case lookupConstructor "Refl" env of
+                    Just _ -> return ()
+                    Nothing -> expectationFailure "Expected Refl constructor to be registered"
+
+            it "P36 loads without errors" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                let env = currentEnvironment st'
+                case lookupLambda "t1" env of
+                    Just _ -> return ()
+                    Nothing -> expectationFailure "Expected t1 function to be registered"
+
+            it "P36 t1: Refl for PropEq(Int, Z, Z)" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "t1()"
+                -- Refl is a nullary constructor — CLMCON (ConsTag "Refl" 0) []
+                case result of
+                    CLMCON (ConsTag "Refl" _) [] -> return ()
+                    other -> expectationFailure $ "Expected Refl, got: " ++ show other
+
+            it "P36 t2: Refl for PropEq(Nat, Succ(Z), Succ(Z))" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "t2()"
+                case result of
+                    CLMCON (ConsTag "Refl" _) [] -> return ()
+                    other -> expectationFailure $ "Expected Refl, got: " ++ show other
+
+            it "P36 mkRefl: polymorphic Refl construction" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "mkRefl(Z)"
+                case result of
+                    CLMCON (ConsTag "Refl" _) [] -> return ()
+                    other -> expectationFailure $ "Expected Refl, got: " ++ show other
+
+            it "P36 t7: match on Refl returns True" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "t7()"
+                result `shouldBe` conTrue
+
+            it "P36 t8: symmetry via Refl match" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "t8()"
+                result `shouldBe` conTrue
+
+            it "P36 t9: transitivity via double Refl match" $ do
+                st' <- loadTestProgram st "tests/programs/P36_PropEq.tl"
+                result <- evalExpr st' "t9()"
+                result `shouldBe` conTrue
+
+        -- ==================================================================
+        -- TypeCheck: TLit support
+        -- ==================================================================
+        describe "TypeCheck: TLit (value literals in types)" $ do
+            let tcSt0 = initTCState TCRelaxed
+                tcEnv0 = emptyTCEnv
+
+            it "TLit unifies with itself" $ do
+                let result = runTC (unify (TLit (LInt 3)) (TLit (LInt 3))) tcEnv0 tcSt0
+                case result of
+                    Right _ -> return ()
+                    Left errs -> expectationFailure $ "Unification failed: " ++ show errs
+
+            it "TLit fails to unify with different literal" $ do
+                let result = runTC (unify (TLit (LInt 3)) (TLit (LInt 4))) tcEnv0 tcSt0
+                case result of
+                    Left _ -> return ()
+                    Right _ -> expectationFailure "Expected unification to fail for 3 vs 4"
+
+            it "TLit is concrete" $ do
+                isConcreteTy (TLit (LInt 42)) `shouldBe` True
+
+            it "TId with concrete components is concrete" $ do
+                isConcreteTy (TId (TCon "Int") (TLit (LInt 3)) (TLit (LInt 3))) `shouldBe` True
+
+            it "TId with TVar component is not concrete" $ do
+                isConcreteTy (TId (TCon "Int") (TVar 0) (TLit (LInt 3))) `shouldBe` False

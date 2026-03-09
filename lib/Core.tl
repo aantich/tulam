@@ -1,33 +1,29 @@
 /// Core data types and combinators.
 ///
-/// Pure algebraic data types with no algebra imports.
-/// Bool, Unit, Void, Ordering, Nat, Maybe, Either, List, Pair, NonEmpty, Tree,
-/// and standard combinators (id, const, compose, flip, apply).
+/// The foundational types of the tulam type system, ordered by mathematical
+/// structure: initial/terminal objects, then finite types, then the identity
+/// type, then basic type constructors, then recursive data structures.
+///
+/// All operations on these types are defined as algebra instances in the
+/// Instances/ folder. This file contains only type definitions and
+/// universal combinators.
 module Core;
 
 // ============================================================================
-// Bool
+// Void (⊥) — The empty type / initial object
 // ============================================================================
 
-/// The boolean type with exactly two values.
-/// @example True
-/// @example False
-type Bool = True | False;
-
-/// Logical negation.
-/// @param b The boolean to negate
-/// @returns The opposite boolean value
-/// @example not(True) => False
-/// @example not(False) => True
-function not (b:Bool) : Bool = match
-    | True  -> False
-    | False -> True;
+/// The uninhabited type — has no constructors and no values.
+/// Corresponds to ⊥ (bottom) in logic, the initial object in category theory.
+/// A function `Void -> a` is vacuously true for any `a`.
+type Void;
 
 // ============================================================================
-// Unit
+// Unit (⊤) — The unit type / terminal object
 // ============================================================================
 
-/// The unit type with a single constructor.
+/// The unit type with exactly one value.
+/// Corresponds to ⊤ (top) in logic, the terminal object in category theory.
 type Unit = Unit;
 
 /// Discards any value and returns Unit.
@@ -36,182 +32,106 @@ type Unit = Unit;
 function unit(x:a) : Unit = Unit;
 
 // ============================================================================
-// Ordering
+// Bool (𝟐) — The boolean type
+// ============================================================================
+
+/// The boolean type with exactly two values.
+/// @example True
+/// @example False
+type Bool = True + False;
+
+/// Logical negation.
+/// Defined in Core because it's used by Algebra default methods (Eq, Ord).
+/// @param b The boolean to negate
+/// @returns The opposite boolean value
+function not (b:Bool) : Bool = match
+    | True  -> False
+    | False -> True;
+
+// ============================================================================
+// PropEq — Propositional equality (identity type)
+// ============================================================================
+
+/// Propositional equality: a proof that x and y are equal at type a.
+/// This is the fundamental type for expressing and proving equalities.
+/// Refl is the sole constructor, and can only be constructed when both
+/// indices are definitionally equal: Refl : PropEq(a, x, x).
+///
+/// @param a The type of the values being compared
+/// @param x The left-hand value
+/// @param y The right-hand value
+///
+/// Used by the `law` keyword: `law name(params) = lhs === rhs` desugars to
+/// a function returning `PropEq(_, lhs, rhs) = Refl`.
+type PropEq(a:Type, x:a, y:a) = Refl : PropEq(a, x, x);
+
+// ============================================================================
+// Ordering — Three-valued comparison result
 // ============================================================================
 
 /// Result of comparing two values.
 /// @example compare(1, 2) => LessThan
 /// @example compare(2, 2) => Equal
 /// @example compare(3, 2) => GreaterThan
-type Ordering = LessThan | Equal | GreaterThan;
+type Ordering = LessThan + Equal + GreaterThan;
 
 // ============================================================================
-// Nat
+// Nat (ℕ) — Natural numbers (Peano representation)
 // ============================================================================
 
 /// Natural numbers in Peano representation.
+/// Z is zero, Succ(n) is the successor of n.
 /// @example Z
 /// @example Succ(Z)
 /// @example Succ(Succ(Z))
-type Nat = Z | Succ(n:Nat);
-
-/// Structural equality on natural numbers.
-function eq(x:Nat,y:Nat):Bool = match
-  | Z, Z -> True
-  | Z, n -> False
-  | n, Z -> False
-  | Succ(m), Succ(n) -> eq(m,n);
-
-/// Addition of natural numbers.
-function plus (x:Nat,y:Nat):Nat = match
-  | Z, n -> n
-  | Succ(n), m -> Succ (plus(n, m));
-
-/// Multiplication of natural numbers.
-function mult (x:Nat,y:Nat):Nat = match
-  | Z, n -> Z
-  | Succ(n), m -> plus(mult(n, m), m);
+type Nat = Z + Succ * n:Nat;
 
 // ============================================================================
-// Maybe
+// Maybe (1 + a) — Optional values
 // ============================================================================
 
 /// Optional value — either Nothing or Just(value).
 /// @param a The type of the contained value
-type Maybe(a:Type) = Nothing | Just(val:a);
-
-/// Check if a Maybe is Nothing.
-function isNothing(m:Maybe(a)) : Bool = match
-    | Nothing -> True
-    | Just(x) -> False;
-
-/// Extract the value or use a default.
-function fromMaybe(def:a, m:Maybe(a)) : a = match
-    | d, Nothing -> d
-    | d, Just(x) -> x;
+type Maybe(a:Type) = Nothing + Just * val:a;
 
 // ============================================================================
-// Either
+// Either (a + b) — Coproduct / sum type
 // ============================================================================
 
 /// A value of type a (Left) or type b (Right).
 /// By convention, Left = error, Right = success.
-type Either(a:Type, b:Type) = Left(val:a) | Right(val:b);
+type Either(a:Type, b:Type) = Left * val:a + Right * val:b;
 
 // ============================================================================
-// List
+// Pair (a × b) — Product type
+// ============================================================================
+
+/// A pair of two values (product type).
+type Pair(a:Type, b:Type) = Pair * fst:a * snd:b;
+
+// ============================================================================
+// List (μX. 1 + a × X) — Singly-linked list
 // ============================================================================
 
 /// Singly-linked list — either empty (Nil) or head + tail (Cons).
 /// @param a Element type
-type List(a:Type) = Nil | Cons(hd:a, tl:List(a));
-
-/// Safe head — returns the first element wrapped in Maybe.
-function head(xs:List(a)) : Maybe(a) = match
-    | Nil -> Nothing
-    | Cons(h, t) -> Just(h);
-
-/// Safe tail — returns the rest of the list wrapped in Maybe.
-function tail(xs:List(a)) : Maybe(List(a)) = match
-    | Nil -> Nothing
-    | Cons(h, t) -> Just(t);
-
-/// Check if a list is empty.
-function isEmpty(xs:List(a)) : Bool = match
-    | Nil -> True
-    | Cons(h, t) -> False;
+type List(a:Type) = Nil + Cons * hd:a * tl:List(a);
 
 // ============================================================================
-// Pair
-// ============================================================================
-
-/// A pair of two values.
-type Pair(a:Type, b:Type) = Pair(fst:a, snd:b);
-
-/// First projection.
-function fst(p:Pair(a, b)) : a = match
-    | Pair(x, y) -> x;
-
-/// Second projection.
-function snd(p:Pair(a, b)) : b = match
-    | Pair(x, y) -> y;
-
-/// Exchanges the two components.
-function swap(p:Pair(a, b)) : Pair(b, a) = match
-    | Pair(x, y) -> Pair(y, x);
-
-/// Applies a function to the first component.
-function mapFst(f:a, p:Pair(a, b)) : Pair(c, b) = match
-    | f, Pair(x, y) -> Pair(f(x), y);
-
-/// Applies a function to the second component.
-function mapSnd(f:b, p:Pair(a, b)) : Pair(a, c) = match
-    | f, Pair(x, y) -> Pair(x, f(y));
-
-/// Applies the same function to both components of a homogeneous pair.
-function both(f:a, p:Pair(a, a)) : Pair(b, b) = match
-    | f, Pair(x, y) -> Pair(f(x), f(y));
-
-// ============================================================================
-// NonEmpty
+// NonEmpty — Non-empty list
 // ============================================================================
 
 /// Non-empty list — always has at least one element.
 /// @param a Element type
-type NonEmpty(a:Type) = NonEmpty(hd:a, tl:List(a));
-
-/// Returns the first element (always safe).
-function neHead(xs:NonEmpty(a)) : a = match
-    | NonEmpty(h, t) -> h;
-
-/// Converts to a regular List.
-function toList(xs:NonEmpty(a)) : List(a) = match
-    | NonEmpty(h, t) -> Cons(h, t);
-
-/// Creates a non-empty list with exactly one element.
-function singleton(x:a) : NonEmpty(a) = NonEmpty(x, Nil);
-
-/// Prepends an element to a non-empty list.
-function neCons(x:a, xs:NonEmpty(a)) : NonEmpty(a) = match
-    | x, NonEmpty(h, t) -> NonEmpty(x, Cons(h, t));
-
-/// Returns the tail as a regular List.
-function neTail(xs:NonEmpty(a)) : List(a) = match
-    | NonEmpty(h, t) -> t;
+type NonEmpty(a:Type) = NonEmpty * hd:a * tl:List(a);
 
 // ============================================================================
-// Tree
+// Tree — Binary tree
 // ============================================================================
 
 /// Binary tree — Leaf(value) or Branch(left, right).
 /// @param a The type of values stored at leaves
-type Tree(a:Type) = Leaf(val:a) | Branch(left:Tree(a), right:Tree(a));
-
-/// Counts the number of leaves in the tree.
-function treeSize(t:Tree(a)) : Nat = match
-    | Leaf(x) -> Succ(Z)
-    | Branch(l, r) -> plus(treeSize(l), treeSize(r));
-
-/// Computes the depth (height) of the tree.
-function treeDepth(t:Tree(a)) : Nat = match
-    | Leaf(x) -> Z
-    | Branch(l, r) -> Succ(natMax(treeDepth(l), treeDepth(r)));
-
-/// Returns the larger of two natural numbers.
-function natMax(x:Nat, y:Nat) : Nat = match
-    | Z, n -> n
-    | n, Z -> n
-    | Succ(m), Succ(n) -> Succ(natMax(m, n));
-
-/// Applies a function to every leaf value, preserving structure.
-function treeMap(f:a, t:Tree(a)) : Tree(b) = match
-    | f, Leaf(x) -> Leaf(f(x))
-    | f, Branch(l, r) -> Branch(treeMap(f, l), treeMap(f, r));
-
-/// Catamorphism — fold a tree by replacing Leaf and Branch with functions.
-function treeFold(f:a, g:b, t:Tree(a)) : b = match
-    | f, g, Leaf(x) -> f(x)
-    | f, g, Branch(l, r) -> g(treeFold(f, g, l), treeFold(f, g, r));
+type Tree(a:Type) = Leaf * val:a + Branch * left:Tree(a) * right:Tree(a);
 
 // ============================================================================
 // Combinators

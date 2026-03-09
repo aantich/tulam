@@ -62,7 +62,7 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 
 ### Key Design Decisions
 
-- **Constructor tags**: Integer tags on tuples for discriminated union pattern matching (needed for .NET/JS targets, unlike GHC's tagless approach). Sum types use pipe-separated constructors (`A | B | C`), pattern matching uses `match | pat -> expr` syntax.
+- **Constructor tags**: Integer tags on tuples for discriminated union pattern matching (needed for .NET/JS targets, unlike GHC's tagless approach). Sum types use `+`-separated constructors (`A + B + C`), with `*` for named fields (`Just * val:a`). Pattern matching uses `match | pat -> expr` syntax.
 - **Implicit parameters**: Structure (typeclass) functions generate implicit-parameter functions, e.g. `(+) [a:Type] (x:a,y:a):a`. Instance declarations expand the case body.
 - **Type-dependent functions execute at compile time only**: Only value-dependent simply-typed functions survive to runtime; type-dependent dispatch is resolved during compilation.
 - **Expression traversal**: `traverseExpr` (pure) and `traverseExprM` (monadic/stateful) for AST transformations throughout passes.
@@ -111,11 +111,11 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - Type and constructor names must start with a capital letter.
 - `#` suffix denotes legacy built-in operations (e.g., `print#`). New approach uses `intrinsic` keyword instead.
 - **Separator rule**: Semicolons = declaration/statement separators (top-level, structure/instance/class/effect/handler/where/derive/action bodies). Commas = data separators (args, tuples, record fields, let bindings). Trailing semicolons are allowed in declaration blocks.
-- Sum types use pipe-separated syntax: `type Bool = True | False;` (not curly braces).
+- Sum types use `+` to separate constructors and `*` to introduce named fields: `type Bool = True + False;`, `type Maybe(a:Type) = Nothing + Just * val:a;`. Implicit constructor: `type Point = x:Float64 * y:Float64;` creates constructor named `Point`.
 - Pattern matching uses `match` keyword with pipes: `match | pat1 -> expr1 | pat2 -> expr2`. Inline form: `match expr | pat -> body`.
 - `match` is a **reserved word**.
 - `{ }` braces are used for NTuples (positional `{1,2}` and named `{x=1,y=2}`), record types, and declaration blocks (structures, instances, repr where-clauses).
-- `structure` = typeclasses, `instance` = typeclass instances, `record` = single-constructor product type sugar.
+- `structure` = typeclasses, `instance` = typeclass instances. `record` keyword is removed — use `type` with implicit constructors instead.
 - `primitive` = machine-level type declaration, `intrinsic` = compiler-provided implementation body.
 - `algebra`/`trait` = single-type structures, `morphism`/`bridge` = multi-type structures.
 - `repr UserType as ReprType [default] where { ... }` = representation mapping between a user type and a primitive type. Requires `toRepr` and `fromRepr` function definitions. Optional `invariant`.
@@ -126,6 +126,12 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `class Child(fields) extends Parent = { ... }` = single inheritance. Child declares only own fields; parent fields are inherited.
 - `abstract class` = cannot be instantiated; `sealed class` = all subclasses must be in same module.
 - `override`, `final`, `static` = method modifiers inside class body. `super` = reserved for parent method calls.
+- `forall a. T` / `∀ a. T` = universal quantification in type annotations. Desugars to `Pi (Just name) (U 0) body`.
+- `exists (a:Type). body` / `∃ (a:Type). body` = existential quantification in type definitions. Binders become type params.
+- `expr : Type` = expression-level type annotation. Produces `Typed expr type` AST node.
+- `unpack e as (a, x) in body` = existential elimination. `unpack` is a **reserved word**.
+- `A * B` and `A + B` in type annotations = type-level product/sum operators. Precedence: `forall`/`exists` < `->` < `+` < `*` < type application.
+- Two type parser contexts: `concreteType` (full, with `+`/`*` as operators), `fieldType` (stops at bare `+`/`*` which are separators in type defs).
 - `ClassName.new(args)` = construction. `obj.method(args)` = method call (dynamic dispatch). `obj.field` = field access.
 - `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super` are reserved words.
 - `infixl N (op);` / `infixr N (op);` / `infix N (op);` = operator fixity declarations. N is precedence 0-9. Default for unknown ops is `infixl 9`. `infixl`, `infixr`, `infix` are reserved words.

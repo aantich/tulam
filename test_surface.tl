@@ -73,19 +73,19 @@ type Expr(a:Type) = {
 // =============================================================================
 
 // 4.1 Basic record
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 
 // 4.2 Parameterized record
-record Pair(a:Type, b:Type) = { fst:a, snd:b };
+type Pair(a:Type, b:Type) = fst:a * snd:b;
 
 // 4.3 Record spread (include fields from another record)
-record Point3D = { ..Point, z:Nat };
+type Point3D = ..Point * z:Nat;
 
 // 4.4 Parameterized record with spread
-record TaggedPoint(a:Type) = { ..Point, tag:a };
+type TaggedPoint(a:Type) = ..Point * tag:a;
 
 // 4.5 Deeply nested spread
-record Point4D = { ..Point3D, w:Nat };
+type Point4D = ..Point3D * w:Nat;
 
 // =============================================================================
 // SECTION 5: FUNCTIONS — basic

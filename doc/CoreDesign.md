@@ -73,7 +73,7 @@ types more specific than the parent type:
 ```
 type Vec(a:Type, n:Nat) =
     VNil : Vec(a, Z)
-  | VCons(head:a, tail:Vec(a, n)) : Vec(a, Succ(n));
+  + VCons * head:a * tail:Vec(a, n) : Vec(a, Succ(n));
 ```
 
 ### Parser Support
@@ -122,7 +122,7 @@ Parameterized types are registered as type-level lambdas in `topLambdas` during
 Pass 1 (environment building). For example:
 
 ```
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 ```
 
 Registers `Maybe` as a lambda: `Maybe(a:Type) : Type = Maybe(a)` in topLambdas.

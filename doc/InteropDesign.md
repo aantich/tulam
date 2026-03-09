@@ -637,7 +637,7 @@ constructor tags  → integer discriminator field on base class
 **Example:**
 ```
 // tulam:
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 
 // .NET output:
 public abstract class Maybe<A> {
@@ -667,7 +667,7 @@ tulam pattern match → switch on _tag or if/else chain
 **Example:**
 ```
 // tulam:
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 
 // JS output:
 const Nothing = () => ({ _tag: 0 });
@@ -689,7 +689,7 @@ tulam pattern match → switch on tag
 **Example:**
 ```
 // tulam:
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 
 // C output:
 typedef struct {

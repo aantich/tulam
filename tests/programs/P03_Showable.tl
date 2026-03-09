@@ -2,8 +2,8 @@ algebra Rankable(a:Type) = {
     function rank(x:a) : Int
 };
 
-type Color = Red | Green | Blue;
-type Shape = Circle(r:Nat) | Square(s:Nat) | Triangle(a:Nat, b:Nat, c:Nat);
+type Color = Red + Green + Blue;
+type Shape = Circle * r:Nat + Square * s:Nat + Triangle * a:Nat * b:Nat * c:Nat;
 
 instance Rankable(Color) = {
     function rank(x:Color) : Int = match

@@ -1,7 +1,7 @@
 /// Test program for automatic minimal definition checking.
 
 /// A simple type to test with.
-type Color3 = Red3 | Green3 | Blue3;
+type Color3 = Red3 + Green3 + Blue3;
 
 /// Provide only (==) — (!=) should be auto-derived from the default.
 instance Eq(Color3) = {
@@ -22,7 +22,7 @@ function t2() : Bool = Red3 != Green3;
 function t3() : Bool = Blue3 != Blue3;
 
 /// A type where we provide only compare — all operators should derive from it.
-type Priority = Low | Medium | High;
+type Priority = Low + Medium + High;
 
 instance Eq(Priority) = derive;
 

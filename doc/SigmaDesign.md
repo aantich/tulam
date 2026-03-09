@@ -88,7 +88,7 @@ The canonical internal representation is always the flat telescope.
 | **Algebras** (`algebra`) | **None** | Algebras provide implicit-parameter dispatch. Orthogonal to dependent data. |
 | **Morphisms** (`morphism`) | **None** | Same dispatch mechanism, different arity. Orthogonal. |
 | **Classes** (`class`) | **None** | OOP nominal types with inheritance. Different abstraction level. |
-| **Records** (`record`) | **Extended** | Records gain the ability to have dependent fields. Non-dependent records unchanged. |
+| **Records** (`type` with implicit constructor) | **Extended** | Records gain the ability to have dependent fields. Non-dependent records unchanged. |
 | **Repr** (`repr`) | **None** | Static compiler-known type mapping. Existentials hide at value level instead. |
 | **Effects** (`effect`) | **None** | Row-polymorphic effects are orthogonal. |
 | **Module system** | **None** | Compile-time file organization. Existentials are runtime values, not modules. |
@@ -482,9 +482,9 @@ Surface syntax, parser changes, and new AST constructors will be designed separa
 ## Future Extensions
 
 ### Dependent Records (Phase 2)
-Extend `record` declarations to allow field dependencies:
+Extend record declarations (implicit constructor `type`) to allow field dependencies:
 ```
-record SizedArray(a:Type) = { n:Nat, elems:Array(a) | length(elems) == n };
+type SizedArray(a:Type) = n:Nat * elems:Array(a) | length(elems) == n;
 ```
 This reuses the telescope machinery — each field is a telescope entry.
 

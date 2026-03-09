@@ -84,12 +84,12 @@ afterparse (LetIn [(v, val)] bdy) =
     App (Function (mkLambda "" [v] bdy UNDEFINED)) [val]
 afterparse (LetIn ((v,val):rest) bdy) =
     App (Function (mkLambda "" [v] (afterparse (LetIn rest bdy)) UNDEFINED)) [val]
--- Law desugaring: law declarations become functions returning PropEqT proof terms
+-- Law desugaring: law declarations become functions returning PropEq proof terms
 -- Curry-Howard: propositions are types, proofs are programs
 --   law name(params) = lhs === rhs
---     ==> function name(params) : PropEqT(_, lhs, rhs) = Refl
+--     ==> function name(params) : PropEq(_, lhs, rhs) = Refl
 --   law name(params) = P ==> lhs === rhs
---     ==> function name(params, __proof0: PropEqT(_, P, True)) : PropEqT(_, lhs, rhs) = Refl
+--     ==> function name(params, __proof0: PropEq(_, P, True)) : PropEq(_, lhs, rhs) = Refl
 afterparse (Law lam lawBody) = desugarLaw lam lawBody
 -- value declarations desugar to nullary functions
 afterparse (Value (Var nm tp _) val) = Function (mkLambda nm [] val tp)
@@ -97,7 +97,7 @@ afterparse (Value (Var nm tp _) val) = Function (mkLambda nm [] val tp)
 afterparse (ReprCast e tp) = ReprCast (afterparse e) tp
 afterparse e = e
 
--- Desugar a law declaration into a function returning a PropEqT proof term
+-- Desugar a law declaration into a function returning a PropEq proof term
 desugarLaw :: Lambda -> Expr -> Expr
 desugarLaw lam lawBody =
     let (premises, conclusion) = collectImplies lawBody
@@ -105,7 +105,7 @@ desugarLaw lam lawBody =
             PropEq l r -> (l, r)
             other      -> (other, Id "True")  -- bare expr treated as === True
         proofParams = imap mkProofParam premises
-        returnType = App (Id "PropEqT") [UNDEFINED, retLhs, retRhs]
+        returnType = App (Id "PropEq") [UNDEFINED, retLhs, retRhs]
         allParams = params lam ++ proofParams
     in Function (lam { params = allParams, body = Id "Refl", lamType = returnType })
 
@@ -117,14 +117,14 @@ collectImplies (Implies premise rest) =
 collectImplies e = ([], e)
 
 -- Create a proof parameter from a premise expression
--- If premise is PropEq l r, proof type is PropEqT(_, l, r)
--- If premise is a bare expression, proof type is PropEqT(_, expr, True)
+-- If premise is PropEq l r, proof type is PropEq(_, l, r)
+-- If premise is a bare expression, proof type is PropEq(_, expr, True)
 mkProofParam :: Int -> Expr -> Var
 mkProofParam i premise =
     let (lhs, rhs) = case premise of
             PropEq l r -> (l, r)
             other      -> (other, Id "True")
-        proofType = App (Id "PropEqT") [UNDEFINED, lhs, rhs]
+        proofType = App (Id "PropEq") [UNDEFINED, lhs, rhs]
     in Var ("__proof" ++ show i) proofType UNDEFINED
 
 

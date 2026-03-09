@@ -192,9 +192,9 @@ Apple uses many C structs (`NSRect`, `NSPoint`, `NSSize`, `CGRect`, etc.). These
 
 ```tulam
 // Auto-imported from headers:
-record NSPoint = { x:Float64, y:Float64 };
-record NSSize = { width:Float64, height:Float64 };
-record NSRect = { origin:NSPoint, size:NSSize };
+type NSPoint = x:Float64 * y:Float64;
+type NSSize = width:Float64 * height:Float64;
+type NSRect = origin:NSPoint * size:NSSize;
 
 // Used directly in pure code:
 function area(r:NSRect) : Float64 =
@@ -221,7 +221,7 @@ let style = NSWindowStyleMask.titled
     .union(NSWindowStyleMask.resizable);
 
 // NS_ENUM → tulam sum type with repr
-type NSComparisonResult = OrderedAscending | OrderedSame | OrderedDescending;
+type NSComparisonResult = OrderedAscending + OrderedSame + OrderedDescending;
 repr NSComparisonResult as Int where {
     function toRepr(x:NSComparisonResult) : Int =
         match | OrderedAscending -> neg(1) | OrderedSame -> 0 | OrderedDescending -> 1;

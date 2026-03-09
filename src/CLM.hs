@@ -309,12 +309,17 @@ instance PrettyPrint CLMLam where
 
 -- | Pure CLM evaluator for type-level normalization.
 -- Reuses applyCLMLam/resolveCases — no code duplication with the runtime evaluator.
--- Handles: function application, pattern matching, constructor evaluation, field access.
--- Does NOT handle: IO intrinsics, mutable refs, effect handlers, CLMIAP dispatch.
+-- Handles: function application, pattern matching, constructor evaluation, field access,
+-- and instance dispatch (via lookupInstanceFn for algebra method resolution).
+-- Does NOT handle: IO intrinsics, mutable refs, effect handlers.
 -- The lookupFn parameter abstracts over where function definitions come from
 -- (topLambdas during type checking, clmLambdas at runtime).
-evalCLMPure :: (Name -> Maybe CLMLam) -> Int -> CLMExpr -> CLMExpr
-evalCLMPure lookupFn = go
+-- The lookupInstanceFn parameter resolves algebra instances given a function name
+-- and evaluated arguments (infers types from constructor tags/literals).
+evalCLMPure :: (Name -> Maybe CLMLam)              -- ^ lookup top-level/clm lambda by name
+            -> (Name -> [CLMExpr] -> Maybe CLMLam)  -- ^ lookup instance lambda by name + args
+            -> Int -> CLMExpr -> CLMExpr
+evalCLMPure lookupFn lookupInstanceFn = go
   where
     maxDepth = 1000
     go d _ | d > maxDepth = CLMERR "type-level evaluation depth exceeded" SourceInteractive
@@ -322,12 +327,15 @@ evalCLMPure lookupFn = go
     go d (CLMAPP (CLMLAM lam) args) =
         let args' = Prelude.map (go (d+1)) args
         in go (d+1) (applyCLMLam lam args')
-    -- Named function application: look up and apply
+    -- Named function application: try instance dispatch first (more specific),
+    -- then fall back to top-level lookup (which may contain generic algebra defaults).
     go d (CLMAPP (CLMID name) args) =
         let args' = Prelude.map (go (d+1)) args
-        in case lookupFn name of
+        in case lookupInstanceFn name args' of
             Just clmLam -> go (d+1) (applyCLMLam clmLam args')
-            Nothing     -> CLMAPP (CLMID name) args'
+            Nothing     -> case lookupFn name of
+                Just clmLam -> go (d+1) (applyCLMLam clmLam args')
+                Nothing     -> CLMAPP (CLMID name) args'
     -- Nested application: evaluate the function part first
     go d (CLMAPP f args) =
         let f' = go (d+1) f
@@ -335,6 +343,20 @@ evalCLMPure lookupFn = go
         in case f' of
             CLMLAM lam -> go (d+1) (applyCLMLam lam args')
             _          -> CLMAPP f' args'
+    -- Implicit-param application: dispatch like named CLMAPP (instance-first)
+    go d (CLMIAP (CLMID name) args) =
+        let args' = Prelude.map (go (d+1)) args
+        in case lookupInstanceFn name args' of
+            Just clmLam -> go (d+1) (applyCLMLam clmLam args')
+            Nothing     -> case lookupFn name of
+                Just clmLam -> go (d+1) (applyCLMLam clmLam args')
+                Nothing     -> CLMIAP (CLMID name) args'
+    go d (CLMIAP f args) =
+        let f' = go (d+1) f
+            args' = Prelude.map (go (d+1)) args
+        in case f' of
+            CLMLAM lam -> go (d+1) (applyCLMLam lam args')
+            _          -> CLMIAP f' args'
     -- Constructor: evaluate fields
     go d (CLMCON ct fields) = CLMCON ct (Prelude.map (go (d+1)) fields)
     -- Field access on known constructor
@@ -350,6 +372,26 @@ evalCLMPure lookupFn = go
     go _ (CLMU l) = CLMU (normalizeLevel l)
     -- Everything else: already a value or can't reduce purely
     go _ e = e
+
+-- | Infer a type name from a CLMExpr purely (no Environment needed for literals).
+-- For constructors, requires a lookup function to map constructor name → type name.
+inferTypePure :: (Name -> Maybe Name) -> CLMExpr -> Maybe Name
+inferTypePure consLookup (CLMCON (ConsTag consNm _) _) = consLookup consNm
+inferTypePure _ (CLMLIT (LInt _))     = Just "Int"
+inferTypePure _ (CLMLIT (LFloat _))   = Just "Float64"
+inferTypePure _ (CLMLIT (LString _))  = Just "String"
+inferTypePure _ (CLMLIT (LChar _))    = Just "Char"
+inferTypePure _ (CLMLIT (LInt8 _))    = Just "Int8"
+inferTypePure _ (CLMLIT (LInt16 _))   = Just "Int16"
+inferTypePure _ (CLMLIT (LInt32 _))   = Just "Int32"
+inferTypePure _ (CLMLIT (LInt64 _))   = Just "Int64"
+inferTypePure _ (CLMLIT (LWord8 _))   = Just "UInt8"
+inferTypePure _ (CLMLIT (LWord16 _))  = Just "UInt16"
+inferTypePure _ (CLMLIT (LWord32 _))  = Just "UInt32"
+inferTypePure _ (CLMLIT (LWord64 _))  = Just "UInt64"
+inferTypePure _ (CLMLIT (LFloat32 _)) = Just "Float32"
+inferTypePure _ (CLMARRAY _)          = Just "Array"
+inferTypePure _ _                     = Nothing
 
 -- | Normalize a level by evaluating concrete arithmetic
 normalizeLevel :: Level -> Level

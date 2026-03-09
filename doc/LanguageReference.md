@@ -102,7 +102,7 @@ Standard escape sequences are supported (e.g., `\"`, `\\`, `\n`).
 "Hello" → Str([0x48, 0x65, 0x6C, 0x6C, 0x6F], 5)
 ```
 
-The `Str` type is a pure tulam record: `record Str = { bytes: Array(Byte), byteLen: Int }`. The `StringLike` algebra provides universal string operations. See the `FromString` algebra in `lib/String/FromString.tl` for the overloading mechanism.
+The `Str` type is a pure tulam type: `type Str = bytes:Array(Byte) * byteLen:Int;`. The `StringLike` algebra provides universal string operations. See the `FromString` algebra in `lib/String/FromString.tl` for the overloading mechanism.
 
 When `newstrings` is off (default), string literals pass through as `primitive String` with existing intrinsic-backed operations.
 
@@ -221,32 +221,41 @@ Sum types define a type as a choice between multiple constructors. This is tulam
 ### Syntax
 
 ```
-type Name = Constructor1 | Constructor2(args);
+type Name = Constructor1 + Constructor2 * field1:Type * field2:Type;
 ```
 
-Each constructor can optionally take arguments in parentheses. Arguments are comma-separated `name:Type` pairs.
+Constructors are separated by `+`. Named fields are introduced with `*` after the constructor name. If a type has only one constructor, the constructor name can be omitted (implicit constructor takes the type name).
+
+**Implicit constructor** — when the right-hand side starts with fields (no constructor name), the constructor inherits the type name:
+
+```
+type Point = x:Float64 * y:Float64;
+// equivalent to: type Point = Point * x:Float64 * y:Float64;
+```
 
 ### Examples
 
 **Simple enumeration:**
 
 ```
-type Bool = True | False;
+type Bool = True + False;
 ```
 
 **Recursive type:**
 
 ```
-type Nat = Z | Succ(n:Nat);
+type Nat = Z + Succ * n:Nat;
 ```
 
 `Nat` represents natural numbers. `Z` is zero, and `Succ(n)` is the successor of `n`. So `Succ(Succ(Z))` represents 2.
 
-**Parameterized type:**
+**Parameterized type (implicit constructor):**
 
 ```
-type ConstructorTag = ConstructorTag(n:Nat);
+type ConstructorTag = n:Nat;
 ```
+
+This creates a single constructor `ConstructorTag` with field `n:Nat`.
 
 ### How It Works
 
@@ -257,7 +266,7 @@ Under the hood, constructors create tagged tuples. Each constructor in a sum typ
 Constructors can specify their own return type, which may be more specific than the parent type. This is done with a `: ReturnType` annotation after the constructor:
 
 ```
-type Vec(a:Type, n:Nat) = VNil : Vec(a, Z) | VCons(head:a, tail:Vec(a, n)) : Vec(a, Succ(n));
+type Vec(a:Type, n:Nat) = VNil : Vec(a, Z) + VCons * head:a * tail:Vec(a, n) : Vec(a, Succ(n));
 ```
 
 Here `VNil` returns `Vec(a, Z)` (a vector of length zero) while `VCons` returns `Vec(a, Succ(n))` (a vector one longer). Without the `: ReturnType` annotation, the constructor's return type defaults to the parent type with its parameters (e.g., `Vec(a, n)`).
@@ -280,34 +289,30 @@ Note: This is distinct from `===` in law declarations, which is a syntactic mark
 
 ## Records (Product Types)
 
-Records are syntactic sugar for single-constructor sum types with named fields. They provide a convenient way to define product types.
+Records are single-constructor types with named fields — syntactic sugar for single-variant sum types. The `record` keyword has been removed; use `type` with implicit constructors instead.
 
 ### Basic Record
 
 ```
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 ```
 
-This desugars to:
-
-```
-type Point = Point(x:Nat, y:Nat);
-```
+When the type body starts with a lowercase field name (no uppercase constructor), the constructor name defaults to the type name (here, `Point`).
 
 ### Parameterized Record
 
 Records can take type parameters:
 
 ```
-record Pair(a:Type, b:Type) = { fst:a, snd:b };
+type Pair(a:Type, b:Type) = fst:a * snd:b;
 ```
 
 ### Record Spread
 
-You can include all fields from another record using the `..` spread syntax:
+You can include all fields from another type using the `..` spread syntax in declarations:
 
 ```
-record Point3D = { ..Point, z:Nat };
+type Point3D = ..Point * z:Nat;
 ```
 
 This expands to include all fields from `Point` (`x:Nat`, `y:Nat`) plus the new field `z:Nat`. Spread fields are resolved during compilation when the environment is available.
@@ -360,12 +365,12 @@ Unspecified fields become wildcards. Field punning is supported: `{ x }` means `
 
 ### Sum-of-Records
 
-When a sum type constructor name matches an existing record type, the constructor automatically inherits that record's fields:
+When a sum type constructor name matches an existing type with named fields, the constructor automatically inherits that type's fields:
 
 ```
-record Rect = { w:Int, h:Int };
-record Circle = { radius:Int };
-type Shape = Rect | Circle;   // Rect(w:Int, h:Int) | Circle(radius:Int)
+type Rect = w:Int * h:Int;
+type Circle = radius:Int;
+type Shape = Rect + Circle;   // Rect * w:Int * h:Int + Circle * radius:Int
 ```
 
 This allows pattern matching on the inherited fields:
@@ -970,6 +975,95 @@ The pattern synonym `ArrowType a b = Pi Nothing a b` ensures full backward compa
 
 ---
 
+## Quantifiers and Type Expressions
+
+### Universal Quantification (`forall` / `∀`)
+
+`forall` introduces universally quantified type variables in type annotations. Desugars to nested `Pi (Just name) (U 0) body`:
+
+```
+// In type annotations
+function applyToInt(f: forall a. a -> a) : Int = f(42);
+
+// Multiple variables
+function myConst(x: forall a b. a -> b -> a) : Int = x;
+
+// With explicit kind annotations
+function myF(x: forall (a:Type)(b:Type). a -> b) : Int = ...;
+
+// Unicode alias
+function myId(x: ∀ a. a -> a) : Int = x(42);
+```
+
+**Binder syntax**: bare name `a` (defaults to kind `Type`) or kinded `(a:Kind)`. Multiple binders before `.` produce nested `Pi`.
+
+### Existential Quantification (`exists` / `∃`)
+
+`exists` introduces existentially quantified types in type definitions. The binders become type parameters of the type:
+
+```
+type Showable = exists (a:Type). val:a * show:a -> String;
+// Equivalent to: type Showable(a:Type) = val:a * show:a -> String;
+// but with existential semantics (type variable is hidden/skolemized)
+
+type Hidden = ∃ (a:Type). a;
+
+type BiHidden = exists (a:Type)(b:Type). f:a -> b * val:a;
+```
+
+**Construction**: No `pack` keyword needed — existential values construct implicitly via type annotation. **Elimination**: Use field access or explicit `unpack`.
+
+### Unpack Expression
+
+`unpack` provides explicit existential elimination:
+
+```
+unpack s as (a, x) in x.show(x.val)
+// a = fresh skolem variable (the hidden type)
+// x = the payload
+// Result must not mention a
+```
+
+Desugars to `LetIn` with the value binding. `unpack` is a reserved keyword.
+
+### Type-Level Product and Sum Operators
+
+In type annotation positions (not type definitions), `*` and `+` are type-level operators:
+
+```
+val f : Int * Bool -> String;         // (Int * Bool) -> String
+val g : Int -> Int * Bool;            // Int -> (Int * Bool)
+val h : Int * Bool + String * Char;   // (Int * Bool) + (String * Char)
+val k : forall a. a -> a * a;         // forall a. (a -> (a * a))
+```
+
+**Precedence** (loosest to tightest):
+
+| Level | Operator | Associativity |
+|-------|----------|---------------|
+| 1 | `forall`/`exists` | Prefix (extends rightward) |
+| 2 | `->` | Right |
+| 3 | `+` | Left |
+| 4 | `*` | Left |
+| 5 | Type application | Left |
+| 6 | Atoms | — |
+
+**Two parsing contexts**: In type definitions, `*` and `+` are field/constructor separators (handled by `fieldType`). In type annotations, they are type-level operators (handled by `concreteType`). Inside parentheses within type definitions, the full `concreteType` parser is used, so `f:(Int * Bool) -> String` works.
+
+### Expression-Level Type Annotations
+
+Expressions can be annotated with types using `:`:
+
+```
+42 : Int                     // annotate a literal
+x : Maybe(Int)               // annotate a variable
+f(x) : Bool                  // annotate a function result
+```
+
+Produces a `Typed expr type` AST node.
+
+---
+
 ## Expressions
 
 ### Function Application
@@ -1387,7 +1481,7 @@ When `derive` is used, the compiler looks up the algebra's `derive { }` block an
 You can also derive instances inline with a type declaration using the `deriving` clause:
 
 ```
-type Direction = North | South | East | West deriving Eq, Show;
+type Direction = North + South + East + West deriving Eq, Show;
 ```
 
 This is equivalent to declaring the type and then writing separate `instance ... = derive;` declarations for each listed algebra.
@@ -1741,7 +1835,7 @@ The following standard library algebras support `derive`:
 ### Example
 
 ```
-type Color = Red | Green | Blue;
+type Color = Red + Green + Blue;
 
 instance Eq(Color) = derive;
 instance Show(Color) = derive;
@@ -1755,7 +1849,7 @@ instance Show(Color) = derive;
 Or equivalently with `deriving`:
 
 ```
-type Color = Red | Green | Blue deriving Eq, Show;
+type Color = Red + Green + Blue deriving Eq, Show;
 ```
 
 ---
@@ -2118,7 +2212,7 @@ private function helper(x:Int) : Int = x + 1;
 **`opaque`** — Exports a type name but hides its constructors:
 
 ```
-opaque type Handle = MkHandle(Int);
+opaque type Handle = MkHandle * val:Int;
 ```
 
 Importers can use `Handle` as a type but cannot construct or pattern-match on `MkHandle`.
@@ -2341,7 +2435,7 @@ instance Eq(String) = intrinsic;    instance Ord(String) = intrinsic;
 The pure tulam string library provides a `Str` type backed by UTF-8 encoded byte arrays:
 
 ```
-record Str = { bytes: Array(Byte), byteLen: Int };
+type Str = bytes:Array(Byte) * byteLen:Int;
 ```
 
 The `StringLike` algebra defines universal string operations:
@@ -2372,7 +2466,7 @@ algebra StringLike(s:Type) extends Eq(s), Ord(s), Monoid(s) = {
 ### Nat (Natural Numbers)
 
 ```
-type Nat = Z | Succ(n:Nat);
+type Nat = Z + Succ * n:Nat;
 ```
 
 - `Z` — zero
@@ -2401,7 +2495,7 @@ function eq(x:Nat, y:Nat) : Bool =
 ### Bool
 
 ```
-type Bool = True | False;
+type Bool = True + False;
 ```
 
 **Negation:**
@@ -2442,7 +2536,7 @@ instance Eq(Bool) = {
 ### Ordering and Ord
 
 ```
-type Ordering = LessThan | Equal | GreaterThan;
+type Ordering = LessThan + Equal + GreaterThan;
 
 algebra Ord(a:Type) extends Eq(a) = {
     function compare(x:a, y:a) : Ordering;
@@ -2465,7 +2559,7 @@ algebra Monoid(a:Type) extends Semigroup(a) = { value empty : a };
 ### Maybe
 
 ```
-type Maybe(a:Type) = Nothing | Just(val:a);
+type Maybe(a:Type) = Nothing + Just * val:a;
 ```
 
 **Utility functions:**
@@ -2491,13 +2585,13 @@ Z
 ### Either
 
 ```
-type Either(a:Type, b:Type) = Left(val:a) | Right(val:b);
+type Either(a:Type, b:Type) = Left * val:a + Right * val:b;
 ```
 
 ### List
 
 ```
-type List(a:Type) = Nil | Cons(hd:a, tl:List(a));
+type List(a:Type) = Nil + Cons * hd:a * tl:List(a);
 ```
 
 **Utility functions:**
@@ -2589,9 +2683,11 @@ Fixity declarations can appear at the top level of any module or file. They take
 
 The following words are reserved and cannot be used as identifiers:
 
-`type`, `function`, `if`, `then`, `else`, `in`, `action`, `structure`, `instance`, `let`, `case`, `of`, `where`, `exists`, `forall`, `record`, `algebra`, `trait`, `morphism`, `bridge`, `law`, `extends`, `requires`, `value`, `primitive`, `intrinsic`, `repr`, `invariant`, `as`, `default`, `match`, `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`, `effect`, `handler`, `handle`, `derive`, `deriving`, `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super`, `infixl`, `infixr`, `infix`
+`type`, `function`, `if`, `then`, `else`, `in`, `action`, `structure`, `instance`, `let`, `case`, `of`, `where`, `exists`, `forall`, `algebra`, `trait`, `morphism`, `bridge`, `law`, `extends`, `requires`, `value`, `primitive`, `intrinsic`, `repr`, `invariant`, `as`, `default`, `match`, `unpack`, `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`, `effect`, `handler`, `handle`, `derive`, `deriving`, `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super`, `infixl`, `infixr`, `infix`
 
-The Unicode symbols `∃` and `∀` are also reserved (for future quantifier support).
+The Unicode symbols `∃` and `∀` are reserved for existential and universal quantification respectively.
+
+Note: The `record` keyword has been removed. Use `type` with implicit constructors (lowercase field names) instead.
 
 ### Reserved Operators
 
@@ -2608,9 +2704,9 @@ module MyModule;                    // Module declaration (optional, must be fir
 import Other.Module;                // Imports (after module declaration)
 export (foo, bar);                  // Export list (optional)
 
-type Bool = True | False;
+type Bool = True + False;
 function not(b:Bool) : Bool = match | True -> False | False -> True;
-record Point = { x:Nat, y:Nat };
+type Point = x:Nat * y:Nat;
 class Animal(name:String) = { function speak(self:Animal) : String = "..." };
 class Dog(breed:String) extends Animal = { override function speak(self:Dog) : String = "Woof!" };
 abstract class Shape(color:String) = { function area(self:Shape) : Float64 };
@@ -2619,7 +2715,7 @@ structure Eq(a:Type) = { ... };
 instance Eq(Nat) = { ... };
 action main = { ... };
 private function helper(x:Int) : Int = x + 1;
-opaque type Handle = MkHandle(Int);
+opaque type Handle = MkHandle * val:Int;
 ```
 
 Pattern match cases use `|` as a separator/prefix and do not require commas or semicolons between them.
@@ -2644,13 +2740,14 @@ See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 
 | Feature | Syntax |
 |---------|--------|
-| Sum type | `type Name = Con1 \| Con2(args);` |
-| GADT constructor | `Con(args) : ReturnType` (inside sum type, separated by `\|`) |
+| Sum type | `type Name = Con1 + Con2 * field:Type;` |
+| Implicit constructor | `type Name = field1:Type * field2:Type;` |
+| GADT constructor | `Con * args : ReturnType` (inside sum type, separated by `+`) |
 | Arrow type | `a -> b`, `(a -> b) -> c` (in type position) |
 | Type application | `Vec(a, n)`, `Maybe(a)` (in type position) |
-| Record | `record Name = { field:Type };` |
-| Record spread | `record Name = { ..Other, field:Type };` |
-| Parameterized record | `record Name(a:Type) = { field:a };` |
+| Record (implicit ctor) | `type Name = field1:Type * field2:Type;` |
+| Record spread | `type Name = ..Other * field:Type;` |
+| Parameterized record | `type Name(a:Type) = field:a;` |
 | Dot-access | `expr.fieldName` |
 | Named construction | `ConsName { field = expr, ... }` |
 | Record update | `expr { field = newExpr, ... }` |
@@ -2670,7 +2767,7 @@ See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 | Instance | `instance Name(Type) = { functions };` |
 | Intrinsic instance | `instance Name(Type) = intrinsic;` |
 | Derived instance | `instance Name(Type) = derive;` |
-| Deriving clause | `type T = A \| B deriving Eq, Show;` |
+| Deriving clause | `type T = A + B deriving Eq, Show;` |
 | Class | `class Name(fields) = { function method(self:Name) : Type = body };` |
 | Inheritance | `class Child(fields) extends Parent = { ... };` |
 | Abstract class | `abstract class Name(fields) = { function method(self:Name) : Type };` |
@@ -2690,7 +2787,7 @@ See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 | Open | `open Foo.Bar;` |
 | Export | `export (name1, name2);` |
 | Private | `private function f(x:Int) : Int = ...;` |
-| Opaque type | `opaque type Handle = MkHandle(Int);` |
+| Opaque type | `opaque type Handle = MkHandle * val:Int;` |
 | Target block | `target js { extern function alert(msg:String) : Unit; };` |
 | Value declaration | `value name : Type = expr` (inside structures/instances) |
 | Effect declaration | `effect Name = { function op(args) : Type, ... };` |
@@ -2699,6 +2796,12 @@ See [doc/InteropPattern.md](InteropPattern.md) for the full design document.
 | Handler (parameterized) | `handler Name(params) : Effect = { let x = expr, function op(...) = ..., ... };` |
 | Handle expression | `handle expr with HandlerName` or `handle expr with HandlerName(args)` |
 | Action (do-notation) | `action name() = { name <- expr, ... };` |
+| Forall (universal) | `forall a. a -> a` or `∀ a. a -> a` or `forall (a:Type). ...` |
+| Exists (existential) | `type T = exists (a:Type). val:a * show:a -> String;` |
+| Unpack | `unpack e as (a, x) in body` |
+| Type annotation | `expr : Type` (expression-level) |
+| Type-level product | `A * B` (in type annotations, not type definitions) |
+| Type-level sum | `A + B` (in type annotations, not type definitions) |
 | Action (legacy) | `action name = { stmts };` |
 | Anonymous lambda | `\x -> expr`, `\x:Nat, y -> expr` |
 | Application | `f(x, y)` |

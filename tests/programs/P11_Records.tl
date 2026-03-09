@@ -1,7 +1,7 @@
 // Record system completion tests
 
-record Point = { x:Int, y:Int };
-record Color = { r:Int, g:Int, b:Int };
+type Point = x:Int * y:Int;
+type Color = r:Int * g:Int * b:Int;
 
 // Functions using dot-access
 function getX(p:Point) : Int = p.x;
@@ -30,9 +30,9 @@ function red() : Color = Color { r = 255, g = 0, b = 0 };
 function getR(c:Color) : Int = c.r;
 
 // Sum-of-records: type alias unions that inherit record fields
-record Rect = { w:Int, h:Int };
-record Circle = { radius:Int };
-type Shape = Rect | Circle;
+type Rect = w:Int * h:Int;
+type Circle = radius:Int;
+type Shape = Rect + Circle;
 
 function area(s:Shape) : Int = match
     | Rect(w, h) -> w * h

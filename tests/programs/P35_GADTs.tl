@@ -1,7 +1,7 @@
 // P35: GADTs — Generalized Algebraic Data Types
 
 // --- GADT 1: Length-indexed vectors ---
-type Vec(a:Type, n:Nat) = VNil : Vec(a, Z) | VCons(head:a, tail:Vec(a, n)) : Vec(a, Succ(n));
+type Vec(a:Type, n:Nat) = VNil : Vec(a, Z) + VCons * head:a * tail:Vec(a, n) : Vec(a, Succ(n));
 
 // Construct some vectors
 function emptyVec() : Vec(Int, Z) = VNil;
@@ -15,9 +15,9 @@ function t2() : Int = vecHead(doubleVec());
 
 // --- GADT 2: Well-typed expressions ---
 type TExpr(a:Type) =
-    TLitI(n:Int) : TExpr(Int)
-  | TLitB(b:Bool) : TExpr(Bool)
-  | TAdd(x:TExpr(Int), y:TExpr(Int)) : TExpr(Int);
+    TLitI * n:Int : TExpr(Int)
+  + TLitB * b:Bool : TExpr(Bool)
+  + TAdd * x:TExpr(Int) * y:TExpr(Int) : TExpr(Int);
 
 // Construct GADT expressions
 function mkLitI(n:Int) : TExpr(Int) = TLitI(n);
@@ -31,8 +31,8 @@ function mkRefl() : PropEq(Int, Int) = Refl;
 
 // --- GADT 4: Simple option-like GADT ---
 type SafeOption(a:Type, present:Bool) =
-    SomeVal(x:a) : SafeOption(a, True)
-  | NoVal : SafeOption(a, False);
+    SomeVal * x:a : SafeOption(a, True)
+  + NoVal : SafeOption(a, False);
 
 function mkSome(x:Int) : SafeOption(Int, True) = SomeVal(x);
 function mkNone() : SafeOption(Int, False) = NoVal;

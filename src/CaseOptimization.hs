@@ -45,8 +45,58 @@ caseOptimizationPass = do
         ++ show (Map.size instLambdas') ++ " instances"
     where f k lam@(Lambda nm args (PatternMatches exs) tp _) = do
                 exs' <- mapM (expandCase lam) exs
-                return lam {body = PatternMatches exs'}
-          f k e = return e
+                exs'' <- mapM expandNestedPM exs'
+                return lam {body = PatternMatches exs''}
+          f k lam = do
+                body' <- expandNestedPM (body lam)
+                return lam {body = body'}
+
+-- | Traverse an expression looking for nested Function nodes with PatternMatches
+-- bodies, and expand their CaseOf nodes. This handles the inline match pattern:
+--   match expr | pat -> body
+-- which desugars to App (Function (Lambda "__m" [] (PatternMatches [CaseOf ...]))) [expr]
+-- The case optimization pass only processes top-level lambda bodies, missing these.
+expandNestedPM :: Expr -> IntState Expr
+expandNestedPM (Function lam@(Lambda _ _ (PatternMatches exs) _ _)) = do
+    exs' <- mapM (expandCase lam) exs
+    exs'' <- mapM expandNestedPM exs'
+    return $ Function (lam {body = PatternMatches exs''})
+expandNestedPM (Function lam) = do
+    body' <- expandNestedPM (body lam)
+    return $ Function (lam {body = body'})
+expandNestedPM (App f args) = do
+    f' <- expandNestedPM f
+    args' <- mapM expandNestedPM args
+    return $ App f' args'
+expandNestedPM (PatternMatches exs) = do
+    exs' <- mapM expandNestedPM exs
+    return $ PatternMatches exs'
+expandNestedPM (CaseOf vs ex si) = do
+    ex' <- expandNestedPM ex
+    return $ CaseOf vs ex' si
+expandNestedPM (ExpandedCase checks ex si) = do
+    ex' <- expandNestedPM ex
+    return $ ExpandedCase checks ex' si
+expandNestedPM (Binding v) = do
+    val' <- expandNestedPM (val v)
+    return $ Binding (v {val = val'})
+expandNestedPM (Statements exs) = do
+    exs' <- mapM expandNestedPM exs
+    return $ Statements exs'
+expandNestedPM (BinaryOp op l r) = do
+    l' <- expandNestedPM l
+    r' <- expandNestedPM r
+    return $ BinaryOp op l' r'
+expandNestedPM (NTuple fields) = do
+    fields' <- mapM (\(n,e) -> do { e' <- expandNestedPM e; return (n, e') }) fields
+    return $ NTuple fields'
+expandNestedPM (ConTuple ct exs) = do
+    exs' <- mapM expandNestedPM exs
+    return $ ConTuple ct exs'
+expandNestedPM (Typed e ty) = do
+    e' <- expandNestedPM e
+    return $ Typed e' ty
+expandNestedPM e = return e  -- atoms and other leaf nodes
 
 -- choose which function to run
 localMaybeAlt :: Maybe a -> IntState b -> (a -> IntState b) -> IntState b

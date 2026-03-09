@@ -31,7 +31,7 @@ function t4() : Bool = mapTo(0);
 
 // Structure with requires on a param used in derive context
 // (When derive generates structural helpers, the inner Eq is needed)
-type Wrapper = MkWrapper(a);
+type Wrapper = MkWrapper * val:a;
 instance Eq(Wrapper(a)) = derive;
 
 // Eq(Wrapper) works because structuralEq recurses into fields

@@ -191,7 +191,7 @@ In a content-addressed world, we can go further: instead of saying "I depend on 
 module Collections.SortedSet;
 import Algebra.Ord;
 
-type SortedSet(a:Type) = Leaf | Node(left:SortedSet(a), value:a, right:SortedSet(a));
+type SortedSet(a:Type) = Leaf + Node * left:SortedSet(a) * value:a * right:SortedSet(a);
 
 function insert [a:Type] (x:a, s:SortedSet(a)) : SortedSet(a) = match
     | x, Leaf -> Node(Leaf, x, Leaf)
@@ -572,7 +572,7 @@ These are decisions to make during implementation, not upfront:
 module Collections.SortedSet;
 import Algebra.Ord;
 
-type SortedSet(a:Type) = Leaf | Node(left:SortedSet(a), value:a, right:SortedSet(a));
+type SortedSet(a:Type) = Leaf + Node * left:SortedSet(a) * value:a * right:SortedSet(a);
 
 function insert [a:Type] (x:a, s:SortedSet(a)) : SortedSet(a) = match
     | x, Leaf -> Node(Leaf, x, Leaf)

@@ -31,7 +31,7 @@ import GHC.Generics (Generic)
 -- | Cache format version. Bump this when Environment/CLM/Surface types change
 -- to auto-invalidate stale caches.
 cacheVersion :: Int
-cacheVersion = 6  -- v6: consolidated standard library (69 files -> 13 files)
+cacheVersion = 7  -- v7: type definition syntax migration (| -> +, parens -> *)
 
 -- | Cached module: an Environment slice + metadata for freshness checking.
 data ModuleCache = ModuleCache

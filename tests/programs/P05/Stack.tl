@@ -1,6 +1,6 @@
 module P05.Stack;
 
-type Stack(a:Type) = EmptyStack | Push(top:a, rest:Stack(a));
+type Stack(a:Type) = EmptyStack + Push * top:a * rest:Stack(a);
 
 function push(x:a, s:Stack(a)) : Stack(a) = Push(x, s);
 

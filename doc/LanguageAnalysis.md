@@ -6,12 +6,12 @@
 
 | Construct | Syntax | Purpose |
 |-----------|--------|---------|
-| **Sum type** | `type Bool = True \| False;` | Algebraic data type with tagged constructors |
-| **Parameterized type** | `type Maybe(a:Type) = Nothing \| Just(x:a);` | Generic ADT |
-| **GADT** | `type Vec(a:Type, n:Nat) = VNil : Vec(a,Z) \| VCons(h:a, t:Vec(a,n)) : Vec(a, Succ(n));` | Constructors with refined return types |
-| **Deriving** | `type Color = Red \| Blue deriving show, eq;` | Auto-generate algebra instances |
-| **Record** | `record Point = { x:Int, y:Int };` | Sugar for single-constructor sum type |
-| **Record spread** | `record Point3D = { ..Point, z:Int };` | Include fields from another record |
+| **Sum type** | `type Bool = True + False;` | Algebraic data type with tagged constructors |
+| **Parameterized type** | `type Maybe(a:Type) = Nothing + Just * x:a;` | Generic ADT |
+| **GADT** | `type Vec(a:Type, n:Nat) = VNil : Vec(a,Z) + VCons * h:a * t:Vec(a,n) : Vec(a, Succ(n));` | Constructors with refined return types |
+| **Deriving** | `type Color = Red + Blue deriving show, eq;` | Auto-generate algebra instances |
+| **Record** | `type Point = x:Int * y:Int;` | Implicit constructor (single-constructor product type) |
+| **Record spread** | `type Point3D = ..Point * z:Int;` | Include fields from another record |
 | **Primitive** | `primitive Int;` | Machine-level type, no constructors |
 | **Function** | `function f(x:Int) : Int = x + 1;` | Named function |
 | **Pattern match fn** | `function f(x:Nat) : Bool = match \| Z -> True \| Succ(n) -> False;` | Function with case arms |
@@ -102,7 +102,7 @@
 ### Reserved Keywords
 
 `type`, `function`, `if`, `then`, `else`, `in`, `action`, `structure`, `instance`,
-`let`, `where`, `exists`, `forall`, `record`,
+`let`, `where`, `exists`, `forall`,
 `algebra`, `trait`, `morphism`, `bridge`, `law`, `extends`, `requires`,
 `value`, `primitive`, `intrinsic`,
 `repr`, `invariant`, `as`, `default`,
@@ -215,9 +215,9 @@ Same keyword, very different semantics.
 
 **Severity**: Medium. Could confuse users working with both systems. The underlying concept (inheritance) is similar enough that this may be acceptable.
 
-### 15. Structural records `{x:Int}` vs nominal records `record R = {x:Int}` — **RESOLVED**
+### 15. Structural records `{x:Int}` vs nominal records `type R = x:Int * y:Int` — **RESOLVED**
 
-**Resolution**: Structural subtyping implemented. Nominal records (e.g., `Point`) can now unify with structural record types (e.g., `{x:Int, y:Int}`) via `expandNominalToRow` in the type checker. A `Point(3, 4)` value can be passed to a function expecting `{x:Int, y:Int}`. Additionally, sum-of-records now works: `type Shape = Rect | Circle` inherits fields from existing record declarations, so constructors carry the same data.
+**Resolution**: Structural subtyping implemented. Nominal records (e.g., `Point`) can now unify with structural record types (e.g., `{x:Int, y:Int}`) via `expandNominalToRow` in the type checker. A `Point(3, 4)` value can be passed to a function expecting `{x:Int, y:Int}`. Additionally, sum-of-records now works: `type Shape = Rect + Circle` inherits fields from existing record declarations, so constructors carry the same data.
 
 ### 16. `#` suffix convention is legacy but still in the lexer
 

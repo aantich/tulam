@@ -28,7 +28,7 @@ function benchSort() : Int =
     headOrZero(sorted);
 
 // Binary tree operations
-type BTree = BLeaf | BNode(val:Int, left:BTree, right:BTree);
+type BTree = BLeaf + BNode * val:Int * left:BTree * right:BTree;
 
 function treeInsert(x:Int, t:BTree) : BTree = match
     | x, BLeaf -> BNode(x, BLeaf, BLeaf)

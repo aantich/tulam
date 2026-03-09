@@ -1,11 +1,11 @@
 // Phase 2 test file
 
 // Test records
-record Point = { x:Nat, y:Nat };
-record Pair(a:Type, b:Type) = { fst:a, snd:b };
+type Point = x:Nat * y:Nat;
+type Pair(a:Type, b:Type) = fst:a * snd:b;
 
 // Test record spread
-record Point3D = { ..Point, z:Nat };
+type Point3D = ..Point * z:Nat;
 
 // Test if/then/else in a function
 function testIf(b:Bool) : Nat = if b then Succ(Z) else Z;

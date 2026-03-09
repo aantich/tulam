@@ -6,11 +6,14 @@ Incremental roadmap from current state to categorical type system. Each step is 
 
 ## Current State Summary (Updated after Effect Handler Runtime)
 
-**Package A Syntax Migration (completed):**
-- Sum types now use `type Bool = True | False;` instead of `type Bool = { True, False };` — curly braces freed for records exclusively.
-- Pattern matching now uses `match` keyword: `match | Pat -> expr | ...` instead of `{ {Pat} -> expr, ... }`.
-- Inline match expression supported: `match expr | Pat -> body | ...`.
-- `match` is now a reserved keyword.
+**Surface Language Syntax (completed):**
+- Sum types use `type Bool = True + False;` with `+` between constructors and `*` for named fields: `type Maybe(a:Type) = Nothing + Just * val:a;`.
+- Implicit constructors: `type Point = x:Float64 * y:Float64;` (constructor inherits type name). `record` keyword removed.
+- Pattern matching uses `match` keyword: `match | Pat -> expr | ...`.
+- Inline match expression: `match expr | Pat -> body | ...`.
+- `match` and `unpack` are reserved keywords.
+- `forall a. T` / `exists (a:Type). T` for quantification. `expr : Type` for annotations. `unpack e as (a, x) in body` for existential elimination.
+- `A * B` and `A + B` as type-level operators in annotations.
 
 **Module System (completed):**
 - New keywords: `module`, `import`, `open`, `export`, `private`, `opaque`, `hiding`, `target`, `extern`
@@ -333,45 +336,27 @@ Succ(Succ(Succ(Z)))
 
 ### Step 2.3: Named records with functions as fields
 
-**Files:** Lexer.hs, Parser.hs
+**Files:** Parser.hs
 
-Records are products with named fields. They can contain any values, including functions. They desugar to single-constructor sum types, so the existing pipeline handles them with no changes.
+Records are products with named fields declared using `type` with implicit constructors. They can contain any values, including functions. They desugar to single-constructor sum types, so the existing pipeline handles them with no changes.
 
-**Lexer.hs:** Add `"record"` to reserved words.
+> **Note:** The `record` keyword has been removed. Records are now declared with `type` using implicit constructors. When the right-hand side starts with a lowercase field name (not an uppercase constructor), the constructor inherits the type name. Fields are separated by `*`.
 
-**Parser.hs:**
-```haskell
-pRecord :: Parser Expr
-pRecord = do
-    reserved "record"
-    name <- identifier
-    -- optional type parameters
-    tparams <- optionMaybe (parens (sepBy1 pTypeParam (reservedOp ",")))
-    reservedOp "="
-    fields <- braces (sepBy1 pRecordField (reservedOp ","))
-    -- Desugar: record Foo = { x:A, y:B }  =>  type Foo = Foo(x:A, y:B);
-    let vars = map fieldToVar fields
-    let consLam = Lambda name vars EMPTY (Id name)
-    let tpVars = maybe [] id tparams
-    return $ SumType (Lambda name tpVars (Tuple [Function consLam]) (U 0))
+**Surface syntax:**
+```tulam
+type Point = x:Nat * y:Nat;
+type Pair(a:Type, b:Type) = fst:a * snd:b;
+```
 
-pRecordField :: Parser (Name, Expr)
-pRecordField = do
-    nm <- identifier
-    reservedOp ":"
-    tp <- concreteType
-    return (nm, tp)
-
-fieldToVar :: (Name, Expr) -> Var
-fieldToVar (nm, tp) = Var nm tp UNDEFINED
+**Parser (conceptual):** The parser detects implicit constructor records by seeing a lowercase identifier followed by `:` at the start of the RHS. It wraps the fields in a single constructor with the type's name. The result is a standard `SumType` with one constructor whose `Var` list has named fields separated by `*`.
 ```
 
 Add `try pRecord` to `pDef` before `pSumType`.
 
 **Test:**
 ```tulam
-record Point = { x:Nat, y:Nat };
-record Pair(a:Type, b:Type) = { fst:a, snd:b };
+type Point = x:Nat * y:Nat;
+type Pair(a:Type, b:Type) = fst:a * snd:b;
 ```
 ```
 > :load test.tl
@@ -400,9 +385,9 @@ When a spread `..Point` is encountered, look up `Point` in the parsed types, ext
 
 **Test:**
 ```tulam
-record Point = { x:Nat, y:Nat };
-record Point3D = { ..Point, z:Nat };
-// expands to: type Point3D = Point3D(x:Nat, y:Nat, z:Nat);
+type Point = x:Nat * y:Nat;
+type Point3D = ..Point * z:Nat;
+// expands to: type Point3D = Point3D * x:Nat * y:Nat * z:Nat;
 ```
 
 ### Step 2.5: Named record construction syntax
@@ -652,7 +637,7 @@ True
 
 4. **Intrinsic instance expansion**: When `instance Num(Int) = intrinsic` is encountered in Pass 1, the compiler looks up the Num structure, extracts all function/value names, and creates placeholder `Lambda fn [] Intrinsic UNDEFINED` entries for each. These are then propagated to parents via the existing `propagateToParent` mechanism.
 
-5. **Bool/Ordering constructor tags**: Intrinsic comparison functions must produce `CLMCON (ConsTag "True" 0) []` / `CLMCON (ConsTag "False" 1) []` matching base.tl's `type Bool = True | False;` tag ordering (True=0, False=1). Similarly, `compare` returns `LessThan`=0, `Equal`=1, `GreaterThan`=2.
+5. **Bool/Ordering constructor tags**: Intrinsic comparison functions must produce `CLMCON (ConsTag "True" 0) []` / `CLMCON (ConsTag "False" 1) []` matching base.tl's `type Bool = True + False;` tag ordering (True=0, False=1). Similarly, `compare` returns `LessThan`=0, `Equal`=1, `GreaterThan`=2.
 
 6. **CLMPAP handler added**: Partial application evaluation was missing from the interpreter. Added as part of this phase since it's needed for some numeric expression evaluation paths.
 
@@ -1067,7 +1052,7 @@ algebra Eq(a:Type) = {
 
 // Usage:
 instance Eq(Color) = derive;
-type Direction = North | South | East | West deriving Eq, Show;
+type Direction = North + South + East + West deriving Eq, Show;
 ```
 
 **Standard algebras with derive blocks:** Eq, Ord, Show, Hashable.
@@ -1250,7 +1235,7 @@ Added `RecordLit [(Name, Expr)]` and `RecordType [(Name, Expr)]` to the Surface 
 
 3. **Constraint generation vs. resolution**: Structure constraints (`CStructure`) are generated during type checking and resolved against the existing instance maps. This reuses the instance infrastructure from Phase 1 rather than building a separate constraint solver.
 
-4. **Surface AST additions**: `RecordLit` and `RecordType` were added to `Expr` in `Surface.hs` for record literal construction and record type annotations. These provide first-class record support beyond the `record` declaration sugar.
+4. **Surface AST additions**: `RecordLit` and `RecordType` were added to `Expr` in `Surface.hs` for record literal construction and record type annotations. These provide first-class record support beyond the implicit constructor `type` declaration.
 
 5. **Test suite growth**: 141 tests total (up from 95), covering type inference, type checking, constraint resolution, record types, and error reporting. All passing.
 

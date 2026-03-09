@@ -47,7 +47,7 @@ primitive Byte;        -- raw byte (unsigned 8-bit)
 primitive String;      -- UTF-8 string (opaque, compiler-internal literal carrier)
 ```
 
-**Note on Strings:** `primitive String` is retained as the compiler-internal string literal type. The user-facing string type is `Str` (a pure tulam record: `record Str = { bytes: Array(Byte), byteLen: Int }`). When `:s newstrings on`, string literals desugar to `Str` constructor calls. The `StringLike` algebra provides universal string operations, and `FromString` enables string literal overloading. See `lib/String/` and `doc/InteropPattern.md`.
+**Note on Strings:** `primitive String` is retained as the compiler-internal string literal type. The user-facing string type is `Str` (a pure tulam record: `type Str = bytes:Array(Byte) * byteLen:Int;`). When `:s newstrings on`, string literals desugar to `Str` constructor calls. The `StringLike` algebra provides universal string operations, and `FromString` enables string literal overloading. See `lib/String/` and `doc/InteropPattern.md`.
 
 After declaration, a primitive type is used identically to any user-defined type. `Int` is just a type name — no magic syntax anywhere it appears.
 
@@ -335,7 +335,7 @@ For a type `T` to accept integer literals, it needs `Num(T)` which includes `fro
 
 ```tulam
 -- User-defined complex numbers can use literals:
-record Complex = { re:Float64, im:Float64 };
+type Complex = re:Float64 * im:Float64;
 
 instance Num(Complex) = {
     function fromInt(n:Int) : Complex = Complex(fromInt(n), 0.0);
@@ -370,7 +370,7 @@ repr <UserType> as <ReprType> [default] where {
 **Full isomorphism (Nat ↔ Int):**
 
 ```tulam
-type Nat = Z | Succ(n:Nat);
+type Nat = Z + Succ * n:Nat;
 
 repr Nat as Int default where {
     function toRepr(n:Nat) : Int =
@@ -386,7 +386,7 @@ repr Nat as Int default where {
 **Packed representation (Color ↔ UInt32):**
 
 ```tulam
-type Color = RGBA(r:Byte, g:Byte, b:Byte, a:Byte);
+type Color = RGBA * r:Byte * g:Byte * b:Byte * a:Byte;
 
 repr Color as UInt32 where {
     function toRepr(c:Color) : UInt32 =
@@ -582,7 +582,7 @@ instance Bulk(Array) = intrinsic;
 **Why Bulk matters**: Any user type that implements `Bulk` and ultimately delegates to Array operations can participate in GPU acceleration:
 
 ```tulam
-type Matrix(a:Type) = MatrixImpl(rows:Int, cols:Int, data:Array(a));
+type Matrix(a:Type) = MatrixImpl * rows:Int * cols:Int * data:Array(a);
 
 instance Bulk(Matrix) = {
     function length(m:Matrix(a)) : Int = m.rows * m.cols;
@@ -867,7 +867,7 @@ Only `SafeConvertible` instances are eligible for implicit insertion.
 -- Everything below uses the primitives and algebras from prelude.tl
 
 -- Peano naturals with efficient representation
-type Nat = Z | Succ(n:Nat);
+type Nat = Z + Succ * n:Nat;
 repr Nat as Int default where {
     function toRepr(n:Nat) : Int =
         match | Z -> 0

@@ -1,6 +1,6 @@
 // Test the derive system with reflection
 
-type Color = Red | Green | Blue;
+type Color = Red + Green + Blue;
 
 // All instances auto-derived from algebra derive blocks
 instance Eq(Color) = derive;
@@ -16,7 +16,7 @@ function testColorShow() : String = show(Green);
 function testColorHash() : Bool = hash(Red) != hash(Blue);
 
 // Test deriving syntax on type declarations
-type Direction = North | South | East | West deriving Eq, Show;
+type Direction = North + South + East + West deriving Eq, Show;
 
 function testDirEq() : Bool = North == North;
 function testDirNeq() : Bool = North != South;

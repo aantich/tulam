@@ -346,17 +346,17 @@ A functor is a type constructor `F : Type -> Type` that also maps functions: if 
 **Option A: Functor as a declaration that combines type + mapping**
 
 ```tulam
-functor Maybe(a:Type) : Type = Just(x:a) | Nothing;
+functor Maybe(a:Type) : Type = Nothing + Just * x:a;
 // This BOTH defines the sum type AND declares fmap exists.
 // fmap must be provided or derived.
 
-functor List(a:Type) : Type = Nil | Cons(head:a, tail:List(a));
+functor List(a:Type) : Type = Nil + Cons * head:a * tail:List(a);
 ```
 
 **Option B: Functor as an algebra on type constructors**
 
 ```tulam
-type Maybe(a:Type) = Just(x:a) | Nothing;
+type Maybe(a:Type) = Nothing + Just * x:a;
 
 algebra Functor(f:Type1) = {
     function fmap(g: a -> b, x:f(a)) : f(b);
@@ -385,9 +385,9 @@ However, we could add `functor` as **sugar** that expands to Option B:
 
 ```tulam
 // this:
-functor Maybe(a:Type) : Type = Just(x:a) | Nothing;
+functor Maybe(a:Type) : Type = Nothing + Just * x:a;
 // expands to:
-type Maybe(a:Type) = Just(x:a) | Nothing;
+type Maybe(a:Type) = Nothing + Just * x:a;
 // plus auto-derived: instance Functor(Maybe) = { ... }
 ```
 
