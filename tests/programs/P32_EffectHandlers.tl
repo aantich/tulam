@@ -10,7 +10,7 @@ function t2() : String =
 function t3() : Int =
     handle action {
         put(10);
-        modify(\x -> x + 5);
+        modify(fn(x) = x + 5);
         get()
     } with RefState(0);
 

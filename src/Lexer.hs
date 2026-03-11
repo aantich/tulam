@@ -65,13 +65,13 @@ emptyDef    = Tok.LanguageDef
 lexer :: TokenParserIS ParserState
 lexer = Tok.makeTokenParser style
     where
-    ops = [";","=",",",".","..",":", "->", "=>", "|", "?", "<:", "\\", "===", "==>", "<-"]
+    ops = [";","=",",",".","..",":", "->", "=>", "|", "?", "<:", "===", "==>", "<-"]
     names = ["type","function","if","then","else","in","action","structure","instance",
             "let", "where", "∃", "∀", "exists", "forall", "record",
             "algebra", "trait", "morphism", "bridge", "law", "extends", "requires",
             "value", "primitive", "intrinsic",
             "repr", "invariant", "as", "default",
-            "match",
+            "match", "fn",
             "module", "import", "open", "export", "private", "opaque", "hiding",
             "target", "extern",
             "effect", "handler", "handle",

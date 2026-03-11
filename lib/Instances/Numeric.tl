@@ -172,3 +172,30 @@ instance Eq(String) = intrinsic;
 instance Ord(String) = intrinsic;
 instance Show(String) = intrinsic;
 instance Hashable(String) = intrinsic;
+
+/// String forms a semigroup under concatenation.
+instance Semigroup(String) = {
+    function combine(x:String, y:String) : String = concat(x, y)
+};
+
+/// String forms a monoid with empty string as identity.
+instance Monoid(String) = {
+    function combine(x:String, y:String) : String = concat(x, y);
+    value empty : String = ""
+};
+
+/// StringLike instance for the primitive String type.
+/// Treats String as character-indexed (each char = 1 unit).
+instance StringLike(String) = {
+    function byteLength(s:String) : Int = length(s);
+    function strSlice(s:String, start:Int, end:Int) : String = substring(s, start, end);
+    function strDecodeAt(s:String, byteOffset:Int) : Maybe(Pair(Char, Int)) =
+        if byteOffset >= length(s) then Nothing
+        else Just(Pair(charAt(s, byteOffset), byteOffset + 1));
+    function strIndexOf(haystack:String, needle:String) : Int = indexOf(haystack, needle);
+    function strFromChar(c:Char) : String = fromChar(c);
+    /// Override defaults that use strFromChar internally — use StringExt intrinsics directly.
+    function strToUpper(s:String) : String = toUpper(s);
+    function strToLower(s:String) : String = toLower(s);
+    function strReplace(s:String, old:String, new:String) : String = replace(s, old, new)
+};

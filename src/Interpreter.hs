@@ -226,7 +226,7 @@ evalCLM i e@(CLMAPP ex exs) = do
                      else pure $ CLMAPP ex' exs'
 evalCLM i e@(CLMFieldAccess ("", fnum) (CLMCON ct tuple)) = do
     trace $ "[depth=" ++ show i ++ "] CLMFieldAccess ." ++ show fnum
-    if (fnum > Prelude.length tuple) then pure $ CLMERR ("[RT] tried to access field beyond tuple index in " ++ ppr e) SourceInteractive
+    if (fnum >= Prelude.length tuple) then pure $ CLMERR ("[RT] tried to access field beyond tuple index in " ++ ppr e) SourceInteractive
     else pure (tuple Prelude.!! fnum)
 -- named field access with resolved index
 evalCLM i e@(CLMFieldAccess (nm, fnum) (CLMCON ct tuple)) | nm /= "" && fnum >= 0 = do
@@ -484,11 +484,15 @@ evalCLM i e@(CLMIAP (CLMID funcNm) exs) = do
                                             trace $ "  inferred types: " ++ show mTypeNames
                                             case mTypeNames of
                                                 Just typeNames@(firstType:_) -> do
-                                                    -- CHECK INTRINSICS FIRST
-                                                    case lookupIntrinsic funcNm firstType of
-                                                        Just intrinsicFn -> case intrinsicFn exs' of
+                                                    -- CHECK INTRINSICS FIRST (try all arg types, not just first)
+                                                    let tryIntrinsic [] = Nothing
+                                                        tryIntrinsic (t:ts) = case lookupIntrinsic funcNm t of
+                                                            Just fn -> Just (fn, t)
+                                                            Nothing -> tryIntrinsic ts
+                                                    case tryIntrinsic (nub typeNames) of
+                                                        Just (intrinsicFn, matchedType) -> case intrinsicFn exs' of
                                                             Just result -> do
-                                                                trace $ "  intrinsic " ++ funcNm ++ " for " ++ firstType ++ " => " ++ pprSummary 40 result
+                                                                trace $ "  intrinsic " ++ funcNm ++ " for " ++ matchedType ++ " => " ++ pprSummary 40 result
                                                                 pure result
                                                             Nothing ->
                                                                 if Prelude.length typeNames < Prelude.length exs'
@@ -509,12 +513,20 @@ evalCLM i e@(CLMIAP ex exs) = do
     ex' <- evalCLM (i+1) ex
     case ex' of
         CLMERR _ _ -> pure ex'
+        -- If the inner evaluated to a function ID, re-dispatch as proper CLMIAP
+        CLMID nm -> evalCLM i (CLMIAP (CLMID nm) exs)
         _ -> do
             exs' <- imapM (\j e1 -> evalCLM (i+j+2) e1) exs
             case findCLMErr exs' of
                 Just err -> pure err
-                Nothing  -> if ex' == ex && exs' == exs then pure e
-                            else pure $ CLMIAP ex' exs'
+                Nothing
+                  -- Empty args: unwrap CLMIAP, return the value directly
+                  | Prelude.null exs' -> pure ex'
+                  -- Lambda: apply directly
+                  | CLMLAM lam <- ex' -> pure $ applyCLMLam lam exs'
+                  -- No change: return as-is to avoid loops
+                  | ex' == ex && exs' == exs -> pure e
+                  | otherwise -> pure $ CLMIAP ex' exs'
 -- CLMPAP: partial application - evaluate and try to apply
 evalCLM i e@(CLMPAP ex exs) = do
     trace $ "[depth=" ++ show i ++ "] CLMPAP " ++ pprSummary 60 e
@@ -607,20 +619,8 @@ dispatchInstance env funcNm typeNames exs' = do
 -- Infer the type name from a CLM expression by looking at constructor tags
 inferTypeFromExpr :: Environment -> CLMExpr -> Maybe Name
 inferTypeFromExpr env (CLMCON (ConsTag consNm _) _) = lookupTypeOfConstructor consNm env
-inferTypeFromExpr env (CLMLIT (LInt _)) = Just "Int"
-inferTypeFromExpr env (CLMLIT (LFloat _)) = Just "Float64"
-inferTypeFromExpr env (CLMLIT (LString _)) = Just "String"
-inferTypeFromExpr env (CLMLIT (LChar _)) = Just "Char"
-inferTypeFromExpr env (CLMLIT (LInt8 _)) = Just "Int8"
-inferTypeFromExpr env (CLMLIT (LInt16 _)) = Just "Int16"
-inferTypeFromExpr env (CLMLIT (LInt32 _)) = Just "Int32"
-inferTypeFromExpr env (CLMLIT (LInt64 _)) = Just "Int64"
-inferTypeFromExpr env (CLMLIT (LWord8 _)) = Just "UInt8"
-inferTypeFromExpr env (CLMLIT (LWord16 _)) = Just "UInt16"
-inferTypeFromExpr env (CLMLIT (LWord32 _)) = Just "UInt32"
-inferTypeFromExpr env (CLMLIT (LWord64 _)) = Just "UInt64"
-inferTypeFromExpr env (CLMLIT (LFloat32 _)) = Just "Float32"
-inferTypeFromExpr env (CLMARRAY _) = Just "Array"
+inferTypeFromExpr _ (CLMLIT lit) = litTypeName lit
+inferTypeFromExpr _ (CLMARRAY _) = Just "Array"
 inferTypeFromExpr _ _ = Nothing
 
 -- Infer type names from all arguments (for multi-param morphism dispatch)
@@ -656,17 +656,12 @@ isValue _ = False
 -- | Check if a result's type matches the expected hint type name.
 -- Uses the environment to check constructor-to-type mapping.
 resultMatchesHint :: Environment -> CLMExpr -> Name -> Bool
-resultMatchesHint env (CLMCON (ConsTag consName _) _) typeName =
-    case lookupTypeOfConstructor consName env of
+resultMatchesHint env expr typeName =
+    case inferTypeFromExpr env expr of
         Just actualType -> actualType == typeName
-        Nothing -> False  -- can't determine type, don't assume match — trigger re-dispatch
-resultMatchesHint _ (CLMLIT (LInt _)) typeName = typeName == "Int"
-resultMatchesHint _ (CLMLIT (LFloat _)) typeName = typeName == "Float64"
-resultMatchesHint _ (CLMLIT (LString _)) typeName = typeName == "String"
-resultMatchesHint _ (CLMLIT (LChar _)) typeName = typeName == "Char"
-resultMatchesHint _ (CLMLIT _) _ = False
-resultMatchesHint _ (CLMARRAY _) typeName = typeName == "Array"
-resultMatchesHint _ _ _ = True  -- for other expressions, assume match (don't re-dispatch)
+        Nothing -> case expr of
+            CLMLIT _ -> False  -- literal with unknown type, don't assume match
+            _ -> True  -- for other expressions, assume match (don't re-dispatch)
 
 -- | Try hint-type instance dispatch with error recovery
 tryHintInstance :: Environment -> Name -> Name -> [CLMExpr] -> CLMExpr -> IntState CLMExpr
@@ -909,22 +904,7 @@ dispatchReflectionIntrinsic "tag" [CLMLIT _] =
 dispatchReflectionIntrinsic "tagName" [CLMCON (ConsTag nm _) _] =
     pure $ Just $ CLMLIT (LString nm)
 dispatchReflectionIntrinsic "tagName" [CLMLIT lit] =
-    pure $ Just $ CLMLIT (LString (litTypeName lit))
-  where
-    litTypeName (LInt _)     = "Int"
-    litTypeName (LFloat _)   = "Float64"
-    litTypeName (LString _)  = "String"
-    litTypeName (LChar _)    = "Char"
-    litTypeName (LInt8 _)    = "Int8"
-    litTypeName (LInt16 _)   = "Int16"
-    litTypeName (LInt32 _)   = "Int32"
-    litTypeName (LInt64 _)   = "Int64"
-    litTypeName (LWord8 _)   = "UInt8"
-    litTypeName (LWord16 _)  = "UInt16"
-    litTypeName (LWord32 _)  = "UInt32"
-    litTypeName (LWord64 _)  = "UInt64"
-    litTypeName (LFloat32 _) = "Float32"
-    litTypeName _            = "Unknown"
+    pure $ Just $ CLMLIT (LString (maybe "Unknown" id (litTypeName lit)))
 -- arity(x): number of fields in constructor, primitives return 0
 dispatchReflectionIntrinsic "arity" [CLMCON _ fields] =
     pure $ Just $ CLMLIT (LInt (fromIntegral $ Prelude.length fields))

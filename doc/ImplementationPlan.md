@@ -135,9 +135,9 @@ Incremental roadmap from current state to categorical type system. Each step is 
 1. ~~**No State/Exception effect runtime**~~ — **RESOLVED**: Effect handler runtime implemented. `CLMHANDLE` node, handler stack, `dispatchHandlerOp`, `dispatchEffectSequencing`. Standard library handlers: RefState, SilentConsole, DefaultException, StdFileIO.
 2. **Type checker permissive by default**: errors are warnings; `strictTypes` flag makes them fatal
 3. **SIMD Vec operations are stubs** (need native compilation backend)
-4. **No codegen backend**: interpreter only, no JS/.NET/x86 output
-5. **Array HOFs for non-Int types**: foldl/filter type signatures use Int; needs polymorphic dispatch
-6. **Missing string ops**: split, join not yet implemented
+4. **LLVM codegen backend**: Designed (see `doc/backends/LLVMBackendDesign.md`), not yet implemented. 8-phase plan: basic emission → decision trees → monomorphization → unboxing → Perceus RC → defunctionalization → advanced opts → SIMD
+5. ~~**Array HOFs for non-Int types**~~ — **RESOLVED**: ArrayOps/ArrayHOF algebra signatures updated to use polymorphic element types
+6. ~~**Missing string ops**~~ — **RESOLVED**: `split`, `join`, `fromChar` added to `StringExt` algebra with intrinsic implementations. `Semigroup(String)`, `Monoid(String)`, `StringLike(String)` instances added. All string operations now go through algebra dispatch.
 7. **TC pattern variable warnings**: type checker emits spurious "Unbound variable" warnings for pattern match binders in catch-all arms (~95 warnings in stdlib)
 
 ---
@@ -1637,6 +1637,52 @@ Replaced the hard-coded 3-level `buildExpressionParser` with a Pratt parser and 
 | 4 | none | `==`, `!=`, `<`, `>`, `<=`, `>=` |
 | 3 | right | `.&.`, `/\` |
 | 2 | right | `.\|.`, `\/` |
+
+---
+
+## Strict Mode Hardening ✅ COMPLETE
+
+Made the `strictTypes` flag a real, usable feature with REPL toggle, pipeline halt, and comprehensive error reporting.
+
+### What was done:
+- **Phase 0: REPL Toggle + Pipeline Halt**
+  - `State.hs`: Added `tcErrorCount :: !Int` and `tcCollectedErrors :: [String]` to `InterpreterState`
+  - `Main.hs`: Added `:s stricttypes on/off` REPL command + help text
+  - `ModuleSystem.hs`: Pipeline halts after Pass 3 when `strictTypes && tcErrorCount > 0`, skipping CLM/opt passes
+  - `tcErrorCount` resets per module (before each typecheck pass)
+
+- **Phase 1: Mode-Aware Error Reporting**
+  - `TypeCheck.hs`: Converted 4 `tcWarn` call sites to `tcWarnOrFail`: unbound variable, catch-all infer, ERROR node, unsolved constraint
+  - In relaxed mode: behavior identical (warnings). In strict mode: these become fatal errors
+
+- **Phase 2: Fix Silent tcTry Error Swallowing**
+  - `inferLambda`: body-vs-signature mismatch now reports via `tcWarnOrFail` instead of silently discarding
+  - `ConTuple`: constructor argument type mismatches now report via `tcWarnOrFail`
+
+- **Phase 3: Instance Declaration Checking**
+  - Enhanced `checkTopLevel (Instance ...)` to verify method implementations against algebra signatures
+  - Smart type-variable detection: only checks return types when all type params are concrete
+  - Handles Intrinsic/Derive instances gracefully
+
+- **Phase 4: Top-Level Form Validation**
+  - `checkTopLevel (SumType ...)`: validates constructor field types
+  - `checkTopLevel (Structure ...)`: validates method signatures
+  - `checkTopLevel (FixityDecl ...)`: properly handled (no-op, not inferred)
+  - Module system nodes (ModuleDecl, Import, etc.): properly handled
+
+- **Phase 5: CaseOf Pattern Variable Binding**
+  - `infer (CaseOf ...)`: now binds pattern variables from CaseOf patterns before inferring body
+  - Matches the existing `check (CaseOf ...)` behavior
+
+- **Phase 6: Tests (13 new tests)**
+  - Strict mode escalation: unbound var, catch-all, ERROR node, unsolved constraint
+  - tcTry reporting: ConTuple mismatch, inferLambda body-sig mismatch
+  - FixityDecl handling, CaseOf variable binding
+  - Pipeline halt tcErrorCount tracking
+  - Instance checking for Intrinsic instances
+  - P38_StrictTypes.tl integration test
+
+### Test count: 1054 (up from 1041)
 
 ---
 

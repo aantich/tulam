@@ -23,15 +23,15 @@ function swap(p:Pair(a, b)) : Pair(b, a) = match
     | Pair(x, y) -> Pair(y, x);
 
 /// Applies a function to the first component.
-function mapFst(f:a, p:Pair(a, b)) : Pair(c, b) = match
+function mapFst(f:(a -> c), p:Pair(a, b)) : Pair(c, b) = match
     | f, Pair(x, y) -> Pair(f(x), y);
 
 /// Applies a function to the second component.
-function mapSnd(f:b, p:Pair(a, b)) : Pair(a, c) = match
+function mapSnd(f:(b -> c), p:Pair(a, b)) : Pair(a, c) = match
     | f, Pair(x, y) -> Pair(x, f(y));
 
 /// Applies the same function to both components of a homogeneous pair.
-function both(f:a, p:Pair(a, a)) : Pair(b, b) = match
+function both(f:(a -> b), p:Pair(a, a)) : Pair(b, b) = match
     | f, Pair(x, y) -> Pair(f(x), f(y));
 
 // ============================================================================

@@ -16,7 +16,7 @@ repr Array(Int) as PackedInts where {
 // T1: toRepr on Array(Int) produces PackedInts
 function t1() : Int =
     let p = [1, 2, 3] as PackedInts in
-    length(unwrapPacked(p));
+    size(unwrapPacked(p));
 
 // T2: fromRepr on PackedInts produces Array(Int)
 function t2() : Int =

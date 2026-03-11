@@ -94,7 +94,7 @@ sliceEnvironment keepNames env = env
     , effectDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectDecls env)
     , effectHandlers = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectHandlers env)
     , classDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (classDecls env)
-    -- classTagCounter, targetImports, outProgram, raw* kept as-is
+    -- classTagCounter, targetImports, outProgram, raw*, target* kept as-is
     }
 
 -- | Check if an instance key (e.g. "funcName\0TypeName") matches the keep set.
@@ -132,6 +132,9 @@ mergeEnvironment base overlay = Environment
     , rawCLMLambdas = Map.union (rawCLMLambdas overlay) (rawCLMLambdas base)
     , rawCLMInstances = Map.union (rawCLMInstances overlay) (rawCLMInstances base)
     , fixityTable = Map.union (fixityTable overlay) (fixityTable base)
+    , targetInstances = Map.unionWith Map.union (targetInstances overlay) (targetInstances base)
+    , targetHandlers = Map.unionWith Map.union (targetHandlers overlay) (targetHandlers base)
+    , targetExterns = Map.unionWith Map.union (targetExterns overlay) (targetExterns base)
     }
 
 -- Class metadata for OOP class declarations
@@ -182,7 +185,15 @@ data Environment = Environment {
     rawCLMLambdas  :: NameMap CLMLam,
     rawCLMInstances :: NameMap CLMLam,
     -- Operator fixity table: op name -> (assoc, precedence)
-    fixityTable :: NameMap OperatorFixity
+    fixityTable :: NameMap OperatorFixity,
+    -- Target-qualified instance lambdas: target name -> (instance key -> Lambda)
+    -- Instance keys use same "funcName\0typeName" format as instanceLambdas
+    targetInstances :: HashMap Name (NameMap Lambda),
+    -- Target-qualified effect handlers: target name -> (handler name -> (effectName, params, impls))
+    targetHandlers :: HashMap Name (NameMap (Name, [Var], [Expr])),
+    -- Target-qualified extern function declarations: target name -> (func name -> (params, retType, spec))
+    -- spec: Nothing = C runtime call, Just ("inline", "add") = inline instruction, Just ("llvm", "llvm.sqrt.f64") = LLVM intrinsic
+    targetExterns :: HashMap Name (NameMap ([Var], Expr, Maybe (Name, String)))
 } deriving (Show, Generic)
 
 -- Binary helpers for HashMap (not provided by binary package)
@@ -191,6 +202,13 @@ putHashMap m = Bin.put (Map.toList m)
 
 getHashMap :: (Binary k, Binary v, Eq k, Hashable k) => Bin.Get (HashMap k v)
 getHashMap = Map.fromList <$> Bin.get
+
+-- Nested HashMap serialization: HashMap k (HashMap k2 v)
+putNestedHashMap :: (Binary k, Binary k2, Binary v) => HashMap k (HashMap k2 v) -> Bin.Put
+putNestedHashMap m = Bin.put [(k, Map.toList inner) | (k, inner) <- Map.toList m]
+
+getNestedHashMap :: (Binary k, Binary k2, Binary v, Eq k, Hashable k, Eq k2, Hashable k2) => Bin.Get (HashMap k (HashMap k2 v))
+getNestedHashMap = Map.fromList . Prelude.map (\(k, kvs) -> (k, Map.fromList kvs)) <$> Bin.get
 
 -- We need Hashable for HashMap keys (String/Name) — already available via unordered-containers
 
@@ -235,11 +253,15 @@ instance Binary Environment where
         putHashMap (rawCLMLambdas env)
         putHashMap (rawCLMInstances env)
         putHashMap (fixityTable env)
+        putNestedHashMap (targetInstances env)
+        putNestedHashMap (targetHandlers env)
+        putNestedHashMap (targetExterns env)
     get = Environment <$> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> Bin.get <*> Bin.get <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getNestedHashMap <*> getNestedHashMap <*> getNestedHashMap
 
 initialEnvironment = Environment {
     types       = Map.empty,
@@ -260,7 +282,10 @@ initialEnvironment = Environment {
     outProgram   = Map.empty,
     rawCLMLambdas = Map.empty,
     rawCLMInstances = Map.empty,
-    fixityTable = defaultFixities
+    fixityTable = defaultFixities,
+    targetInstances = Map.empty,
+    targetHandlers = Map.empty,
+    targetExterns = Map.empty
 }
 
 
@@ -318,7 +343,11 @@ data InterpreterState = InterpreterState {
     nextMutArrayId :: !Int,
     -- Effect handler stack: [(effectName, opName → implementation)]
     -- Head of list = innermost handler (checked first)
-    handlerStack   :: [(Name, HashMap Name CLMExpr)]
+    handlerStack   :: [(Name, HashMap Name CLMExpr)],
+    -- Type checker error count (per-module, reset before each typecheck pass)
+    tcErrorCount   :: !Int,
+    -- Accumulated TC error messages (across all modules, for diagnostics)
+    tcCollectedErrors :: [String]
 }
 
 instance Show InterpreterState where
@@ -342,7 +371,9 @@ emptyIntState = InterpreterState {
     nextRefId = 0,
     mutArrayTable = Map.empty,
     nextMutArrayId = 0,
-    handlerStack = []
+    handlerStack = [],
+    tcErrorCount = 0,
+    tcCollectedErrors = []
 }
 
 -- | Per-pass optimization flags
@@ -392,7 +423,9 @@ initializeInterpreter = return $ InterpreterState {
     nextRefId = 0,
     mutArrayTable = Map.empty,
     nextMutArrayId = 0,
-    handlerStack = []
+    handlerStack = [],
+    tcErrorCount = 0,
+    tcCollectedErrors = []
 }
 
 -- | Look up a handler op by name in the handler stack (innermost first)
@@ -493,6 +526,10 @@ traverseExprM f (Pi mn e1 e2) = Pi mn <$> f e1 <*> f e2
 traverseExprM f (Implicit e) = Implicit <$> f e
 traverseExprM f (Value v ex) = Value v <$> f ex
 traverseExprM f (Constructors lams) = Constructors <$> mapM (\l -> do { b <- f (body l); pure (l { body = b }) }) lams
+traverseExprM _ e@(Meta _) = pure e
+traverseExprM _ RowEmpty = pure RowEmpty
+traverseExprM f (RowExtend n t r) = RowExtend n <$> f t <*> f r
+traverseExprM f (Sigma mn e1 e2) = Sigma mn <$> f e1 <*> f e2
 traverseExprM f e = f e
 
 traverseActionStmtM :: (Expr -> IntState Expr) -> ActionStmt -> IntState ActionStmt
@@ -603,6 +640,28 @@ mkInstanceKey funcName typeNames = funcName ++ "\0" ++ Data.List.intercalate "\0
 addInstanceLambda :: Name -> [Name] -> Lambda -> Environment -> Environment
 addInstanceLambda funcNm typeNms lam env =
     env { instanceLambdas = Map.insert (mkInstanceKey funcNm typeNms) lam (instanceLambdas env) }
+
+-- | Add a target-qualified instance lambda.
+addTargetInstance :: Name -> Name -> [Name] -> Lambda -> Environment -> Environment
+addTargetInstance target funcNm typeNms lam env =
+    let key = mkInstanceKey funcNm typeNms
+        existing = maybe Map.empty id (Map.lookup target (targetInstances env))
+        updated = Map.insert key lam existing
+    in env { targetInstances = Map.insert target updated (targetInstances env) }
+
+-- | Add a target-qualified effect handler.
+addTargetHandler :: Name -> Name -> (Name, [Var], [Expr]) -> Environment -> Environment
+addTargetHandler target handlerName handler env =
+    let existing = maybe Map.empty id (Map.lookup target (targetHandlers env))
+        updated = Map.insert handlerName handler existing
+    in env { targetHandlers = Map.insert target updated (targetHandlers env) }
+
+-- | Add a target-qualified extern function declaration.
+addTargetExtern :: Name -> Name -> ([Var], Expr, Maybe (Name, String)) -> Environment -> Environment
+addTargetExtern target funcName decl env =
+    let existing = maybe Map.empty id (Map.lookup target (targetExterns env))
+        updated = Map.insert funcName decl existing
+    in env { targetExterns = Map.insert target updated (targetExterns env) }
 
 lookupInstanceLambda :: Name -> [Name] -> Environment -> Maybe Lambda
 lookupInstanceLambda funcNm typeNms env = Map.lookup (mkInstanceKey funcNm typeNms) (instanceLambdas env)

@@ -41,6 +41,27 @@ import qualified Data.Text.Lazy as TL
 
 dbg msg = liftIO $ putStrLn msg
 
+-- | Parse optional type/value parameters in parentheses. Returns [] if none present.
+pOptionalVars :: Parser [Var]
+pOptionalVars = try pVars <|> pure []
+
+-- | Construct a SourceInfo from a Parsec SourcePos.
+mkSrcInfo :: SourcePos -> SourceInfo
+mkSrcInfo pos = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+
+-- | Check if identifier starts with a lowercase letter or underscore.
+isLowerFirst :: String -> Bool
+isLowerFirst (c:_) = (c >= 'a' && c <= 'z') || c == '_'
+isLowerFirst _     = False
+
+-- | Parse a field assignment: name = expr
+pFieldAssignPair :: Parser (Name, Expr)
+pFieldAssignPair = do
+    fnm <- identifier
+    reservedOp "="
+    val <- pExpr
+    return (fnm, val)
+
 -- sum type:
 -- type Bool = True | False;
 -- type Nat = Z | Succ(n:Nat);
@@ -49,7 +70,7 @@ pSumType = do
     pos <- getPosition
     reserved "type"
     name <- uIdentifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     -- Constructors are optional: `type Void;` has zero constructors (uninhabited type)
     (allArgs, ex) <- option (args, []) $ do
         reservedOp "="
@@ -59,7 +80,8 @@ pSumType = do
      , params = allArgs
      , body       = Constructors ex
      , lamType    = Type
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
     return $ SumType lam
 
@@ -69,7 +91,7 @@ pSumTypeWithDeriving = do
     pos <- getPosition
     reserved "type"
     name <- uIdentifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     -- Constructors are optional: `type Void;` has zero constructors (uninhabited type)
     (allArgs, ex) <- option (args, []) $ do
         reservedOp "="
@@ -83,7 +105,8 @@ pSumTypeWithDeriving = do
      , params = allArgs
      , body       = Constructors ex
      , lamType    = Type
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
     let sumType = SumType lam
     -- Generate Instance declarations for each derived algebra
@@ -119,7 +142,8 @@ pExistsOrTypeBody args name pos =
          , params = [Var "_payload" tp UNDEFINED]
          , body = UNDEFINED
          , lamType = defaultTp
-         , lamSrcInfo = SourceInfo (sourceLine p) (sourceColumn p) (sourceName p) ""
+         , lamRequires = []
+         , lamSrcInfo = mkSrcInfo p
         }]
 
     pNormalTypeBody = do
@@ -137,7 +161,7 @@ pExistsBinder =
         return $ Var nm kind UNDEFINED)
     <|> (do
         nm <- identifier
-        return $ Var nm (U 0) UNDEFINED)
+        return $ Var nm (U (LConst 0)) UNDEFINED)
 
 -- To properly parse the type definition we need to properly parse
 -- CONSTRUCTORS inside the sum type
@@ -150,7 +174,7 @@ pConstructor :: Expr -> Parser Lambda
 pConstructor defaultTp = do
     pos <- getPosition
     name <- uIdentifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     -- GADT: optional explicit return type  "Con(args) : ReturnType"
     tp <- try (reservedOp ":" >> concreteType) <|> pure defaultTp
     return Lambda {
@@ -158,7 +182,8 @@ pConstructor defaultTp = do
      , params = args
      , body       = UNDEFINED
      , lamType    = tp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
 
 -- NEW SYNTAX: +/* for type definitions --------------------------------
@@ -197,7 +222,8 @@ pConstructorNew defaultTp = do
      , params = fields
      , body       = UNDEFINED
      , lamType    = tp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
 
 -- Implicit constructor: when type body starts with lowercase field or ..spread,
@@ -214,7 +240,8 @@ pImplicitConstructor defaultTp typeName pos = do
      , params = fields
      , body       = UNDEFINED
      , lamType    = defaultTp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }]
 
 -- Orchestrate type body parsing: detect implicit vs explicit constructors
@@ -228,9 +255,9 @@ pTypeBody defaultTp typeName pos =
   where
     lowerIdentifier = do
         nm <- identifier
-        let c = head nm
-        guard (not (null nm) && (c >= 'a' && c <= 'z' || c == '_'))
-        return nm
+        case nm of
+          (c:_) | (c >= 'a' && c <= 'z') || c == '_' -> return nm
+          _ -> fail "not a lowercase identifier"
 
 -- STRUCTURES ---------------------------------------------------------
 pStructureWith :: String -> StructKind -> Parser Expr
@@ -238,7 +265,7 @@ pStructureWith keyword kind = do
     pos <- getPosition
     reserved keyword
     name <- identifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     tp <- typeSignature
     extends <- parseExtends
     requires <- parseRequires
@@ -250,7 +277,8 @@ pStructureWith keyword kind = do
      , params = args'
      , body       = UNDEFINED
      , lamType    = tp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
     reservedOp "="
     (exs, deriveBlock) <- braces $ do
@@ -350,20 +378,21 @@ pRecord = do
     pos <- getPosition
     reserved "record"
     recName <- uIdentifier
-    tparams <- try pVars <|> pure []
+    tparams <- pOptionalVars
     reservedOp "="
     fields <- braces (sepBy1 pRecordField (reservedOp ","))
     -- Desugar: record Foo = { x:A, y:B }  =>  type Foo = { Foo(x:A, y:B) }
     -- Spread fields (..Name) are stored as Var "..Name" UNDEFINED UNDEFINED
     -- and resolved in Pass 1 when the environment is available
     let vars = map (\(nm, tp) -> Var nm tp UNDEFINED) fields
-    let psi = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
-    let consLam = Lambda recName vars UNDEFINED (Id recName) psi
+    let psi = mkSrcInfo pos
+    let consLam = Lambda recName vars UNDEFINED (Id recName) [] psi
     let lam = Lambda {
        lamName = recName
      , params = tparams
      , body = Constructors [consLam]
      , lamType = Type
+     , lamRequires = []
      , lamSrcInfo = psi
     }
     return $ SumType lam
@@ -391,9 +420,9 @@ pPrimitive = do
     pos <- getPosition
     reserved "primitive"
     name <- uIdentifier
-    args <- try pVars <|> pure []
-    let uLevel = if null args then U 0 else U 1
-    return $ Primitive $ Lambda name args UNDEFINED uLevel (SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) "")
+    args <- pOptionalVars
+    let uLevel = if null args then U (LConst 0) else U (LConst 1)
+    return $ Primitive $ Lambda name args UNDEFINED uLevel [] (mkSrcInfo pos)
 
 -- REPR declarations -------------------------------------------------
 -- repr Nat as Int default where { function toRepr(...) = ..., function fromRepr(...) = ..., invariant(i) = ... };
@@ -438,7 +467,7 @@ pClassDecl = do
         <|> (reserved "sealed" >> return ClassSealed)
     reserved "class"
     name <- uIdentifier
-    fields <- try pVars <|> pure []
+    fields <- pOptionalVars
     -- extends clause: class Dog(breed:String) extends Animal
     -- or with super args: class MyButton(label:String) extends Button(label)
     parentInfo <- optionMaybe $ do
@@ -453,12 +482,13 @@ pClassDecl = do
     -- method body
     reservedOp "="
     (methods, methodMods) <- braces pClassMethodList
-    let si = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+    let si = mkSrcInfo pos
     let lam = Lambda {
            lamName    = name
          , params     = fields
          , body       = DeclBlock methods
          , lamType    = Type
+         , lamRequires = []
          , lamSrcInfo = si
         }
     let ci = ClassInfo {
@@ -509,15 +539,18 @@ pFuncHeader = do
     name <- try identifier <|> (parens operator)
     -- Optional implicit type params in brackets: function foo [s:Type] (x:s) : Int
     implicitArgs <- option [] (try (brackets (sepBy pVar (reservedOp ","))))
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     tp <- typeSignature
+    -- Per-function constraints: function fold(xs:c(a)) : a requires Monoid(a), Ord(b);
+    reqs <- parseRequires
     let implicitArgs' = map (\v -> v { typ = Implicit (typ v) }) implicitArgs
     return Lambda {
        lamName    = name
      , params = implicitArgs' ++ args
      , body       = UNDEFINED
      , lamType    = tp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = reqs
+     , lamSrcInfo = mkSrcInfo pos
     }
 
 pFuncL :: Parser Lambda
@@ -589,14 +622,15 @@ pLaw = do
     pos <- getPosition
     reserved "law"
     name <- identifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     tp <- typeSignature
     let lam = Lambda {
        lamName    = name
      , params = args
      , body       = UNDEFINED
      , lamType    = tp
-     , lamSrcInfo = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+     , lamRequires = []
+     , lamSrcInfo = mkSrcInfo pos
     }
     reservedOp "="
     lawBody <- pLawExpr
@@ -686,7 +720,7 @@ pPatternMatch lam = do
         -- f(x:t1,y:t2) = match | a, b -> expr gets converted into
         -- CaseOf [Var "x" t1 a, Var "y" t2 b] expr
         let bnd = zipWith (\arg pat -> arg {val = pat} ) valueParams ex1
-        return $ CaseOf bnd ex2 (SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) "")
+        return $ CaseOf bnd ex2 (mkSrcInfo pos)
   where
     isImplicitParam (Var _ (Implicit _) _) = True
     isImplicitParam _ = False
@@ -701,7 +735,7 @@ pEffectDecl :: Parser Expr
 pEffectDecl = do
     reserved "effect"
     name <- uIdentifier
-    ps <- try pVars <|> pure []
+    ps <- pOptionalVars
     reservedOp "="
     ops <- braces (sepEndBy pFuncDecl (reservedOp ";"))
     return $ EffectDecl name ps ops
@@ -712,7 +746,7 @@ pHandlerDecl :: Parser Expr
 pHandlerDecl = do
     reserved "handler"
     name <- identifier
-    ps <- try pVars <|> pure []
+    ps <- pOptionalVars
     reservedOp ":"
     effName <- uIdentifier
     reservedOp "="
@@ -755,20 +789,21 @@ pAction = do
     pos <- getPosition
     reserved "action"
     name <- identifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     tp <- typeSignature
     reservedOp "="
     -- Try new-style action block with <- support first, fall back to legacy
     stmts <- braces (sepEndBy1 pActionStmt (reservedOp ";"))
     -- Check if any statement uses <- (new-style) or all are legacy
     let hasBinds = any isActionBind stmts
-    let psi = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+    let psi = mkSrcInfo pos
     if hasBinds
     then return $ Action $ Lambda {
            lamName = name
          , params = args
          , body = ActionBlock stmts
          , lamType = if (tp /= UNDEFINED) then tp else UNDEFINED
+         , lamRequires = []
          , lamSrcInfo = psi
          }
     else do
@@ -779,6 +814,7 @@ pAction = do
          , params = args
          , body       = Statements legacyExprs
          , lamType    = if (tp /= UNDEFINED) then tp else Id "Action"
+         , lamRequires = []
          , lamSrcInfo = psi
         }
 
@@ -855,18 +891,37 @@ concreteType = pTypeArrow
 
 -- Pi types: (x:A) -> B(x) (dependent) or A -> B (non-dependent), right-associative
 -- Also: forall/∀ binders . body (desugars to nested Pi)
-pTypeArrow :: Parser Expr
-pTypeArrow = try pForallType <|> try pDependentPi <|> pSimpleArrow
+-- Parameterized by atom parser: pTypeSumOp for full types, pTypeApp for field types.
+pTypeArrowWith :: Parser Expr -> Parser Expr
+pTypeArrowWith atomParser = try forallP <|> try depPiP <|> simpleP
+  where
+    recurse = pTypeArrowWith atomParser
+    forallP = do
+        try (reserved "forall") <|> reserved "∀"
+        binders <- many1 pForallBinder
+        reservedOp "."
+        bdy <- recurse
+        return $ foldr (\(nm, kind) acc -> Pi (Just nm) kind acc) bdy binders
+    depPiP = do
+        (nm, domTy) <- parens $ do
+            nm <- identifier
+            Control.Monad.guard (not (null nm) && isLowerFirst nm)
+            reservedOp ":"
+            ty <- concreteType  -- inside parens, full type parser is always safe
+            return (nm, ty)
+        reservedOp "->"
+        bdy <- recurse
+        return $ Pi (Just nm) domTy bdy
+    simpleP = do
+        lhs <- atomParser
+        rest <- optionMaybe (reservedOp "->" >> recurse)
+        case rest of
+            Nothing  -> return lhs
+            Just rhs -> return $ Pi Nothing lhs rhs
 
--- forall a b. body  OR  forall (a:Type)(b:Type). body  OR  ∀ a. body
--- Desugars to nested Pi (Just name) kind body
-pForallType :: Parser Expr
-pForallType = do
-    try (reserved "forall") <|> reserved "∀"
-    binders <- many1 pForallBinder
-    reservedOp "."
-    bdy <- pTypeArrow
-    return $ foldr (\(nm, kind) acc -> Pi (Just nm) kind acc) bdy binders
+-- Full type arrow: includes +/* type-level operators
+pTypeArrow :: Parser Expr
+pTypeArrow = pTypeArrowWith pTypeSumOp
 
 -- A forall binder: bare name (kind defaults to Type) or (name:Kind)
 pForallBinder :: Parser (Name, Expr)
@@ -878,35 +933,7 @@ pForallBinder =
         return (nm, kind))
     <|> (do
         nm <- identifier
-        return (nm, U 0))
-
--- Dependent Pi: (x:A) -> B(x)
--- Disambiguated by: lowercase identifier followed by ':' inside parens, then '->'
-pDependentPi :: Parser Expr
-pDependentPi = do
-    (nm, domTy) <- parens $ do
-        nm <- identifier
-        Control.Monad.guard (not (null nm) && isLowerFirst nm)
-        reservedOp ":"
-        ty <- concreteType
-        return (nm, ty)
-    reservedOp "->"
-    body <- pTypeArrow  -- right-associative
-    return $ Pi (Just nm) domTy body
-  where
-    isLowerFirst (c:_) = c >= 'a' && c <= 'z' || c == '_'
-    isLowerFirst _     = False
-
--- Non-dependent arrow: A -> B -> C (right-associative)
--- In full mode: precedence -> < + < * < type application
--- In field mode: no +/* operators (they're separators in type definitions)
-pSimpleArrow :: Parser Expr
-pSimpleArrow = do
-    lhs <- pTypeSumOp
-    rest <- optionMaybe (reservedOp "->" >> pTypeArrow)
-    case rest of
-        Nothing  -> return lhs
-        Just rhs -> return $ Pi Nothing lhs rhs
+        return (nm, U (LConst 0)))
 
 -- Type-level sum: A + B + C (left-associative)
 pTypeSumOp :: Parser Expr
@@ -925,41 +952,7 @@ pTypeProdOp = do
 -- Field type parser: like concreteType but stops at bare * and + (they're separators in type defs)
 -- Used by pFieldDecl for type definition field types
 fieldType :: Parser Expr
-fieldType = pFieldTypeArrow
-
-pFieldTypeArrow :: Parser Expr
-pFieldTypeArrow = try pFieldForallType <|> try pFieldDependentPi <|> pFieldSimpleArrow
-
-pFieldForallType :: Parser Expr
-pFieldForallType = do
-    try (reserved "forall") <|> reserved "∀"
-    binders <- many1 pForallBinder
-    reservedOp "."
-    bdy <- pFieldTypeArrow
-    return $ foldr (\(nm, kind) acc -> Pi (Just nm) kind acc) bdy binders
-
-pFieldDependentPi :: Parser Expr
-pFieldDependentPi = do
-    (nm, domTy) <- parens $ do
-        nm <- identifier
-        Control.Monad.guard (not (null nm) && isLowerFirst nm)
-        reservedOp ":"
-        ty <- concreteType  -- inside parens, full type parser is safe
-        return (nm, ty)
-    reservedOp "->"
-    bdy <- pFieldTypeArrow
-    return $ Pi (Just nm) domTy bdy
-  where
-    isLowerFirst (c:_) = c >= 'a' && c <= 'z' || c == '_'
-    isLowerFirst _     = False
-
-pFieldSimpleArrow :: Parser Expr
-pFieldSimpleArrow = do
-    lhs <- pTypeApp  -- no +/* consumption in field types
-    rest <- optionMaybe (reservedOp "->" >> pFieldTypeArrow)
-    case rest of
-        Nothing  -> return lhs
-        Just rhs -> return $ Pi Nothing lhs rhs
+fieldType = pTypeArrowWith pTypeApp
 
 -- Type application: Vec(a, n), Maybe(a), or bare name/universe
 -- Also: Eff { label: Type, ... | r } ResultType
@@ -968,11 +961,11 @@ pTypeApp = try pEffTypeApp
     <|> try (do
     nm <- identifier
     case nm of
-      "Type"  -> return (U 0)
-      "Type0" -> return (U 0)
-      "Type1" -> return (U 1)
-      "Type2" -> return (U 2)
-      "Type3" -> return (U 3)
+      "Type"  -> return (U (LConst 0))
+      "Type0" -> return (U (LConst 0))
+      "Type1" -> return (U (LConst 1))
+      "Type2" -> return (U (LConst 2))
+      "Type3" -> return (U (LConst 3))
       _ -> do
         margs <- optionMaybe (parens (sepBy1 concreteType (reservedOp ",")))
         case margs of
@@ -1168,17 +1161,23 @@ pLetBinding = do
     val <- pExpr
     return (Var nm tp UNDEFINED, val)
 
--- Anonymous lambda: \x -> expr  or  \x:Type, y -> expr
+-- Anonymous lambda: fn(x) = expr  or  fn(x:Type, y) = expr
+-- Mirrors named function syntax: function name(params) : RetType = body
+-- but without a name. Optional return type annotation with : Type.
+-- Supports fn(x) = match | pat -> body (pattern matching, same as named functions).
 pAnonLambda :: Parser Expr
 pAnonLambda = do
-    reservedOp "\\"
-    args <- sepBy1 pVar (reservedOp ",")
-    reservedOp "->"
-    bdy <- pExpr
-    return $ Function (mkLambda "" args bdy UNDEFINED)
+    reserved "fn"
+    args <- pVars  -- parens with typed/untyped vars, same as function params
+    tp <- typeSignature  -- optional : RetType
+    reservedOp "="
+    let lam = mkLambda "" args UNDEFINED tp
+    bdy <- try (reserved "match" >> PatternMatches <$> many1 (reservedOp "|" >> pPatternMatch lam))
+           <|> pExpr
+    return $ Function (lam { body = bdy })
 
 -- Inline match expression: match expr | pat -> body | pat -> body
--- Desugars to a lambda application: (\__m -> PatternMatches [CaseOf ...]) (scrutinee)
+-- Desugars to a lambda application: (fn(__m) = PatternMatches [CaseOf ...]) (scrutinee)
 pMatchExpr :: Parser Expr
 pMatchExpr = do
     reserved "match"
@@ -1197,19 +1196,19 @@ pMatchCase = do
     pat <- pInsideLeftPattern
     reservedOp "->"
     bdy <- pExpr
-    return (pat, bdy, SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) "")
+    return (pat, bdy, mkSrcInfo pos)
 
 -- Base factor without postfix operators
 pFactorBase :: Parser Expr
-pFactorBase = try pIfThenElse
-    <|> try pLetIn
-    <|> try pUnpackExpr
-    <|> try pAnonLambda
-    <|> try pHandleExpr
-    <|> try pActionBlockExpr
-    <|> try pMatchExpr
-    <|> try pRecordConstruct
-    <|> try pApp
+pFactorBase = pIfThenElse          -- starts with reserved "if"
+    <|> pLetIn                     -- starts with reserved "let"
+    <|> pUnpackExpr                -- starts with reserved "unpack"
+    <|> pAnonLambda                -- starts with reserved "fn"
+    <|> pHandleExpr                -- starts with reserved "handle"
+    <|> pActionBlockExpr           -- starts with reserved "action"
+    <|> pMatchExpr                 -- starts with reserved "match"
+    <|> try pRecordConstruct       -- uppercase identifier + braces
+    <|> try pApp                   -- identifier/parens + parens (args)
     <|> try (parens pExpr)
     <|> try (Id <$> parens operator)   -- (op) as value: (+), (!=), etc.
     <|> try symbolId
@@ -1242,14 +1241,8 @@ pUnpackExpr = do
 pRecordConstruct :: Parser Expr
 pRecordConstruct = do
     nm <- uIdentifier
-    fields <- braces (sepBy1 pFieldAssign (reservedOp ","))
+    fields <- braces (sepBy1 pFieldAssignPair (reservedOp ","))
     return $ RecordConstruct nm fields
-  where
-    pFieldAssign = do
-        fnm <- identifier
-        reservedOp "="
-        val <- pExpr
-        return (fnm, val)
 
 -- Factor with postfix dot-access and record update
 pFactor :: Parser Expr
@@ -1285,13 +1278,7 @@ pDotStep e = optionMaybe $ try $ do
 
 -- Record update fields: { field = expr, ... }
 pUpdateFields :: Parser [(Name, Expr)]
-pUpdateFields = braces (sepBy1 pFieldAssign (reservedOp ","))
-  where
-    pFieldAssign = do
-        fnm <- identifier
-        reservedOp "="
-        val <- pExpr
-        return (fnm, val)
+pUpdateFields = braces (sepBy1 pFieldAssignPair (reservedOp ","))
 
 symbolId :: Parser Expr
 symbolId = do 
@@ -1362,10 +1349,10 @@ pOpaque = do
     reserved "opaque"
     reserved "type"
     name <- uIdentifier
-    args <- try pVars <|> pure []
+    args <- pOptionalVars
     reservedOp "="
     reprType <- concreteType
-    let uLevel = if null args then U 0 else U 1
+    let uLevel = if null args then U (LConst 0) else U (LConst 1)
     return $ OpaqueTy (mkLambda name args UNDEFINED uLevel) reprType
 
 -- Target block: target dotnet { ... };
@@ -1377,8 +1364,35 @@ pTargetBlock = do
 pTargetBlockExpr :: Parser Expr
 pTargetBlockExpr = do
     tgt <- identifier
-    exs <- braces (sepBy pDeclBody (reservedOp ";"))
+    exs <- braces (sepEndBy pTargetDeclBody (reservedOp ";"))
     return $ TargetBlock tgt exs
+
+-- | Declarations valid inside target blocks: everything from pDeclBody plus extern function.
+pTargetDeclBody :: Parser Expr
+pTargetDeclBody = try pExternFunc
+              <|> pDeclBody
+
+-- | extern function name(params) : RetType [= inline "add" | = llvm "llvm.sqrt.f64"];
+pExternFunc :: Parser Expr
+pExternFunc = do
+    reserved "extern"
+    reserved "function"
+    nm <- identifier <|> parens operator
+    ps <- parens (sepBy pParam (reservedOp ","))
+    reservedOp ":"
+    retTy <- concreteType
+    spec <- optionMaybe (try pExternSpec)
+    return $ ExternFunc nm ps retTy spec
+  where
+    pParam = do
+        n <- identifier
+        t <- optionMaybe (reservedOp ":" >> concreteType)
+        return $ Var n (maybe UNDEFINED id t) UNDEFINED
+    pExternSpec = do
+        reservedOp "="
+        kind <- identifier  -- "inline" or "llvm"
+        spec <- stringLit
+        return (kind, spec)
 
 pTargetSwitchExpr :: Parser Expr
 pTargetSwitchExpr = do
@@ -1427,7 +1441,7 @@ pDef =  try pModuleDecl
 pToplevel :: Parser [Expr]
 pToplevel = fmap concat $ many $ do
     pos <- getPosition
-    let si = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
+    let si = mkSrcInfo pos
     -- Try sum type with deriving first (returns multiple exprs), then single-expr pDef
     defs <- try (do { ds <- pSumTypeWithDeriving; reservedOp ";"; return ds })
             <|> (do { d <- pDef; reservedOp ";"; return [d] })

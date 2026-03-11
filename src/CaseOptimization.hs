@@ -43,7 +43,7 @@ caseOptimizationPass = do
     put s{currentEnvironment = env {topLambdas = lambdas', instanceLambdas = instLambdas'} }
     verboseLog $ "  Pass 2: optimized " ++ show (Map.size lambdas') ++ " lambdas, "
         ++ show (Map.size instLambdas') ++ " instances"
-    where f k lam@(Lambda nm args (PatternMatches exs) tp _) = do
+    where f k lam@(Lambda nm args (PatternMatches exs) tp _ _) = do
                 exs' <- mapM (expandCase lam) exs
                 exs'' <- mapM expandNestedPM exs'
                 return lam {body = PatternMatches exs''}
@@ -57,7 +57,7 @@ caseOptimizationPass = do
 -- which desugars to App (Function (Lambda "__m" [] (PatternMatches [CaseOf ...]))) [expr]
 -- The case optimization pass only processes top-level lambda bodies, missing these.
 expandNestedPM :: Expr -> IntState Expr
-expandNestedPM (Function lam@(Lambda _ _ (PatternMatches exs) _ _)) = do
+expandNestedPM (Function lam@(Lambda _ _ (PatternMatches exs) _ _ _)) = do
     exs' <- mapM (expandCase lam) exs
     exs'' <- mapM expandNestedPM exs'
     return $ Function (lam {body = PatternMatches exs''})

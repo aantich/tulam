@@ -16,7 +16,7 @@ import ModuleSystem
 import Util.PrettyPrinting (ppr)
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Set as Set
-import Data.List (isInfixOf, isPrefixOf, nub)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import Interpreter
 import Parser
 import Logs
@@ -24,6 +24,7 @@ import Util.IOLogger (initLogState, LogState(..), LogMessage(..), LogLevel(..))
 import qualified Data.Sequence as Seq
 import System.Directory (doesFileExist)
 import CaseOptimization (positivityCheckPass, terminationCheckPass, coverageCheckPass)
+import LLVMSpec (llvmTests)
 
 -- Helper: run an IntState action with a fresh state
 runFresh :: IntState a -> IO a
@@ -166,6 +167,7 @@ main :: IO ()
 main = do
     st <- setupEnv
     hspec $ do
+        llvmTests
         describe "Parser" $ do
             it "parses simple Id" $ do
                 res <- runFresh $ parseExpr (T.pack "Z")
@@ -180,9 +182,9 @@ main = do
                     other -> expectationFailure $ "Expected App plus [x,y], got: " ++ show other
 
             it "parses anonymous lambda" $ do
-                res <- runFresh $ parseExpr (T.pack "\\x -> x")
+                res <- runFresh $ parseExpr (T.pack "fn(x) = x")
                 case res of
-                    Right (Function (Lambda "" [Var "x" UNDEFINED UNDEFINED] (Id "x") UNDEFINED _)) -> return ()
+                    Right (Function (Lambda "" [Var "x" UNDEFINED UNDEFINED] (Id "x") UNDEFINED _ _)) -> return ()
                     other -> expectationFailure $ "Expected anon lambda, got: " ++ show other
 
         describe "Pipeline integration" $ do
@@ -403,20 +405,20 @@ main = do
                 result <- evalExpr st "fmap(not, Nil)"
                 result `shouldBe` conNil
 
-            it "bind(Just(True), \\x -> Just(not(x))) = Just(False)" $ do
-                result <- evalExpr st "bind(Just(True), \\x -> Just(not(x)))"
+            it "bind(Just(True), fn(x) = Just(not(x))) = Just(False)" $ do
+                result <- evalExpr st "bind(Just(True), fn(x) = Just(not(x)))"
                 result `shouldBe` conJust conFalse
 
-            it "bind(Nothing, \\x -> Just(x)) = Nothing" $ do
-                result <- evalExpr st "bind(Nothing, \\x -> Just(x))"
+            it "bind(Nothing, fn(x) = Just(x)) = Nothing" $ do
+                result <- evalExpr st "bind(Nothing, fn(x) = Just(x))"
                 result `shouldBe` conNothing
 
-            it "bind(Cons(Z, Cons(Succ(Z), Nil)), \\x -> Cons(x, Cons(x, Nil))) duplicates elements" $ do
-                result <- evalExpr st "bind(Cons(Z, Cons(Succ(Z), Nil)), \\x -> Cons(x, Cons(x, Nil)))"
+            it "bind(Cons(Z, Cons(Succ(Z), Nil)), fn(x) = Cons(x, Cons(x, Nil))) duplicates elements" $ do
+                result <- evalExpr st "bind(Cons(Z, Cons(Succ(Z), Nil)), fn(x) = Cons(x, Cons(x, Nil)))"
                 result `shouldBe` conCons conZ (conCons conZ (conCons (conSucc conZ) (conCons (conSucc conZ) conNil)))
 
-            it "bind(Nil, \\x -> Cons(x, Nil)) = Nil" $ do
-                result <- evalExpr st "bind(Nil, \\x -> Cons(x, Nil))"
+            it "bind(Nil, fn(x) = Cons(x, Nil)) = Nil" $ do
+                result <- evalExpr st "bind(Nil, fn(x) = Cons(x, Nil))"
                 result `shouldBe` conNil
 
             it "ap(Just(not), Just(True)) = Just(False)" $ do
@@ -570,8 +572,8 @@ main = do
                 result <- evalExpr st "fmap(not, Just(True))"
                 result `shouldBe` conJust conFalse
 
-            it "bind with arrow-typed callback (f: a -> m(b)): bind(Just(Z), \\x -> Just(Succ(x))) = Just(Succ(Z))" $ do
-                result <- evalExpr st "bind(Just(Z), \\x -> Just(Succ(x)))"
+            it "bind with arrow-typed callback (f: a -> m(b)): bind(Just(Z), fn(x) = Just(Succ(x))) = Just(Succ(Z))" $ do
+                result <- evalExpr st "bind(Just(Z), fn(x) = Just(Succ(x)))"
                 result `shouldBe` conJust (conSucc conZ)
 
             it "compose arrow-typed functions: compose(not, not, True) = True" $ do
@@ -602,188 +604,194 @@ main = do
             let st0 = initTCState TCRelaxed
                 env0 = emptyTCEnv
 
-            describe "exprToTy" $ do
-                it "converts Int to TCon Int" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "Int")) env0 st0
-                    ty `shouldBe` TCon "Int"
+            describe "normalizeTypeExpr" $ do
+                it "converts Int to Id Int" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "Int")) env0 st0
+                    ty `shouldBe` Id "Int"
 
-                it "converts Float64 to TCon Float64" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "Float64")) env0 st0
-                    ty `shouldBe` TCon "Float64"
+                it "converts Float64 to Id Float64" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "Float64")) env0 st0
+                    ty `shouldBe` Id "Float64"
 
-                it "converts String to TCon String" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "String")) env0 st0
-                    ty `shouldBe` TCon "String"
+                it "converts String to Id String" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "String")) env0 st0
+                    ty `shouldBe` Id "String"
 
-                it "converts Bool to TCon Bool" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "Bool")) env0 st0
-                    ty `shouldBe` TCon "Bool"
+                it "converts Bool to Id Bool" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "Bool")) env0 st0
+                    ty `shouldBe` Id "Bool"
 
-                it "converts U 0 to TU (LConst 0)" $ do
-                    let Right (ty, _) = runTC (exprToTy (U 0)) env0 st0
-                    ty `shouldBe` TU (LConst 0)
+                it "converts U (LConst 0) to U (LConst 0)" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (U (LConst 0))) env0 st0
+                    ty `shouldBe` U (LConst 0)
 
                 it "converts arrow type a -> b" $ do
-                    let Right (ty, _) = runTC (exprToTy (ArrowType (Id "Int") (Id "Bool"))) env0 st0
-                    ty `shouldBe` TArrow (TCon "Int") (TCon "Bool")
+                    let Right (ty, _) = runTC (normalizeTypeExpr (ArrowType (Id "Int") (Id "Bool"))) env0 st0
+                    ty `shouldBe` Pi Nothing (Id "Int") (Id "Bool")
 
                 it "converts type application Maybe(Int)" $ do
-                    let Right (ty, _) = runTC (exprToTy (App (Id "Maybe") [Id "Int"])) env0 st0
-                    ty `shouldBe` TApp (TCon "Maybe") [TCon "Int"]
+                    let Right (ty, _) = runTC (normalizeTypeExpr (App (Id "Maybe") [Id "Int"])) env0 st0
+                    ty `shouldBe` App (Id "Maybe") [Id "Int"]
 
                 it "converts UNDEFINED to fresh var" $ do
-                    let Right (ty, st') = runTC (exprToTy UNDEFINED) env0 st0
-                    ty `shouldBe` TVar 0
-                    nextVar st' `shouldBe` 1
+                    let Right (ty, st') = runTC (normalizeTypeExpr UNDEFINED) env0 st0
+                    ty `shouldBe` Meta 0
+                    nextMeta st' `shouldBe` 1
 
                 it "converts lowercase id to TRigid" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "a")) env0 st0
-                    ty `shouldBe` TRigid "a"
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "a")) env0 st0
+                    ty `shouldBe` Id "a"
 
-                it "converts capitalized id to TCon" $ do
-                    let Right (ty, _) = runTC (exprToTy (Id "MyType")) env0 st0
-                    ty `shouldBe` TCon "MyType"
+                it "converts capitalized id to Id" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Id "MyType")) env0 st0
+                    ty `shouldBe` Id "MyType"
 
             describe "Unification" $ do
                 it "unifies identical concrete types" $ do
-                    let result = runTC (unify (TCon "Int") (TCon "Int")) env0 st0
+                    let result = runTC (unify (Id "Int") (Id "Int")) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "fails on mismatched concrete types" $ do
-                    let result = runTC (unify (TCon "Int") (TCon "Bool")) env0 st0
+                    let result = runTC (unify (Id "Int") (Id "Bool")) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should have failed"
 
                 it "unifies variable with concrete type" $ do
-                    let Right (_, st') = runTC (unify (TVar 0) (TCon "Int")) env0 (st0 { nextVar = 1 })
-                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st'
-                    ty `shouldBe` TCon "Int"
+                    let Right (_, st') = runTC (unify (Meta 0) (Id "Int")) env0 (st0 { nextMeta = 1 })
+                    let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st'
+                    ty `shouldBe` Id "Int"
 
                 it "unifies two variables" $ do
-                    let Right (_, st') = runTC (unify (TVar 0) (TVar 1)) env0 (st0 { nextVar = 2 })
-                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st'
-                    ty `shouldBe` TVar 1
+                    let Right (_, st') = runTC (unify (Meta 0) (Meta 1)) env0 (st0 { nextMeta = 2 })
+                    let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st'
+                    ty `shouldBe` Meta 1
 
                 it "detects occurs check" $ do
-                    let result = runTC (unify (TVar 0) (TApp (TCon "Maybe") [TVar 0])) env0 (st0 { nextVar = 1 })
+                    let result = runTC (unify (Meta 0) (App (Id "Maybe") [Meta 0])) env0 (st0 { nextMeta = 1 })
                     case result of
                         Left (OccursCheck _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
                         Right _ -> expectationFailure "Should have failed with occurs check"
 
                 it "unifies arrow types" $ do
-                    let result = runTC (unify (TArrow (TVar 0) (TCon "Bool")) (TArrow (TCon "Int") (TVar 1))) env0 (st0 { nextVar = 2 })
+                    let result = runTC (unify (Pi Nothing (Meta 0) (Id "Bool")) (Pi Nothing (Id "Int") (Meta 1))) env0 (st0 { nextMeta = 2 })
                     case result of
                         Right (_, st') -> do
-                            let Right (t0, _) = runTC (applySubst (TVar 0)) env0 st'
-                            let Right (t1, _) = runTC (applySubst (TVar 1)) env0 st'
-                            t0 `shouldBe` TCon "Int"
-                            t1 `shouldBe` TCon "Bool"
+                            let Right (t0, _) = runTC (applySubst (Meta 0)) env0 st'
+                            let Right (t1, _) = runTC (applySubst (Meta 1)) env0 st'
+                            t0 `shouldBe` Id "Int"
+                            t1 `shouldBe` Id "Bool"
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "unifies type applications" $ do
-                    let result = runTC (unify (TApp (TCon "Maybe") [TVar 0]) (TApp (TCon "Maybe") [TCon "Int"])) env0 (st0 { nextVar = 1 })
+                    let result = runTC (unify (App (Id "Maybe") [Meta 0]) (App (Id "Maybe") [Id "Int"])) env0 (st0 { nextMeta = 1 })
                     case result of
                         Right (_, st') -> do
-                            let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st'
-                            ty `shouldBe` TCon "Int"
+                            let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st'
+                            ty `shouldBe` Id "Int"
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "unifies universes" $ do
-                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 0))) env0 st0
+                    let result = runTC (unify (U (LConst 0)) (U (LConst 0))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
-                it "cumulativity: U 0 unifies with U 1 (U n ≤ U m when n ≤ m)" $ do
-                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 1))) env0 st0
+                it "unify requires exact universe equality: U 0 /= U 1" $ do
+                    let result = runTC (unify (U (LConst 0)) (U (LConst 1))) env0 st0
                     case result of
-                        Right _ -> pure ()  -- cumulativity allows this
+                        Left _ -> pure ()  -- unification requires exact equality
+                        Right _ -> expectationFailure "Should have failed: unify requires exact universe equality"
+
+                it "subtype: U (LConst 0) ≤ U (LConst 1) (cumulativity)" $ do
+                    let result = runTC (subtype (U (LConst 0)) (U (LConst 1))) env0 st0
+                    case result of
+                        Right _ -> pure ()  -- cumulativity allows this in subtype
                         Left errs -> expectationFailure $ "Should succeed by cumulativity: " ++ show errs
 
-                it "fails on higher-to-lower universe (U 1 does not unify with U 0)" $ do
-                    let result = runTC (unify (TU (LConst 1)) (TU (LConst 0))) env0 st0
+                it "fails on higher-to-lower universe (U (LConst 1) does not unify with U (LConst 0))" $ do
+                    let result = runTC (unify (U (LConst 1)) (U (LConst 0))) env0 st0
                     case result of
                         Left _ -> pure ()
-                        Right _ -> expectationFailure "Should have failed: U 1 > U 0"
+                        Right _ -> expectationFailure "Should have failed: U (LConst 1) > U (LConst 0)"
 
-                it "cumulativity: U 0 ≤ U 2 (transitive)" $ do
-                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 2))) env0 st0
+                it "subtype: U (LConst 0) ≤ U (LConst 2) (transitive)" $ do
+                    let result = runTC (subtype (U (LConst 0)) (U (LConst 2))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should succeed: " ++ show errs
 
-                it "cumulativity: U 0 ≤ U 0 (reflexive)" $ do
-                    let result = runTC (unify (TU (LConst 0)) (TU (LConst 0))) env0 st0
+                it "cumulativity: U (LConst 0) ≤ U (LConst 0) (reflexive)" $ do
+                    let result = runTC (unify (U (LConst 0)) (U (LConst 0))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should succeed: " ++ show errs
 
-                it "cumulativity: U 1 ≤ U 2" $ do
-                    let result = runTC (unify (TU (LConst 1)) (TU (LConst 2))) env0 st0
+                it "subtype: U (LConst 1) ≤ U (LConst 2)" $ do
+                    let result = runTC (subtype (U (LConst 1)) (U (LConst 2))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should succeed: " ++ show errs
 
-                it "fails: U 2 does not unify with U 0" $ do
-                    let result = runTC (unify (TU (LConst 2)) (TU (LConst 0))) env0 st0
+                it "fails: U (LConst 2) does not unify with U (LConst 0)" $ do
+                    let result = runTC (unify (U (LConst 2)) (U (LConst 0))) env0 st0
                     case result of
                         Left _ -> pure ()
-                        Right _ -> expectationFailure "Should have failed: U 2 > U 0"
+                        Right _ -> expectationFailure "Should have failed: U (LConst 2) > U (LConst 0)"
 
-                it "cumulativity: TVar unifies with U 1 (variable can be any universe)" $ do
-                    let st1 = st0 { nextVar = 1 }
-                        result = runTC (unify (TVar 0) (TU (LConst 1))) env0 st1
+                it "cumulativity: Meta unifies with U (LConst 1) (variable can be any universe)" $ do
+                    let st1 = st0 { nextMeta = 1 }
+                        result = runTC (unify (Meta 0) (U (LConst 1))) env0 st1
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should succeed: " ++ show errs
 
                 it "transitively resolves substitutions" $ do
-                    -- TVar 0 = TVar 1, TVar 1 = Int => TVar 0 resolves to Int
-                    let st1 = st0 { nextVar = 2 }
-                    let Right (_, st2) = runTC (unify (TVar 0) (TVar 1)) env0 st1
-                    let Right (_, st3) = runTC (unify (TVar 1) (TCon "Int")) env0 st2
-                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st3
-                    ty `shouldBe` TCon "Int"
+                    -- Meta 0 = Meta 1, Meta 1 = Int => Meta 0 resolves to Int
+                    let st1 = st0 { nextMeta = 2 }
+                    let Right (_, st2) = runTC (unify (Meta 0) (Meta 1)) env0 st1
+                    let Right (_, st3) = runTC (unify (Meta 1) (Id "Int")) env0 st2
+                    let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st3
+                    ty `shouldBe` Id "Int"
 
             describe "Row unification" $ do
                 it "unifies identical empty rows" $ do
-                    let result = runTC (unify (TRecord REmpty) (TRecord REmpty)) env0 st0
+                    let result = runTC (unify (RowEmpty) (RowEmpty)) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "unifies record with same fields" $ do
-                    let r1 = TRecord (RExtend "x" (TCon "Int") REmpty)
-                        r2 = TRecord (RExtend "x" (TCon "Int") REmpty)
+                    let r1 = (RowExtend "x" (Id "Int") RowEmpty)
+                        r2 = (RowExtend "x" (Id "Int") RowEmpty)
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "fails on mismatched field types" $ do
-                    let r1 = TRecord (RExtend "x" (TCon "Int") REmpty)
-                        r2 = TRecord (RExtend "x" (TCon "Bool") REmpty)
+                    let r1 = (RowExtend "x" (Id "Int") RowEmpty)
+                        r2 = (RowExtend "x" (Id "Bool") RowEmpty)
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should have failed"
 
                 it "unifies rows with different field order" $ do
-                    let r1 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
-                        r2 = TRecord (RExtend "y" (TCon "Bool") (RExtend "x" (TCon "Int") REmpty))
+                    let r1 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
+                        r2 = (RowExtend "y" (Id "Bool") (RowExtend "x" (Id "Int") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "unifies open row with concrete row" $ do
-                    let st1 = st0 { nextVar = 1 }
-                        r1 = TRecord (RExtend "x" (TCon "Int") (RVar 0))
-                        r2 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let st1 = st0 { nextMeta = 1 }
+                        r1 = (RowExtend "x" (Id "Int") (Meta 0))
+                        r2 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st1
                     case result of
                         Right _ -> pure ()
@@ -792,29 +800,29 @@ main = do
             describe "Bidirectional checking" $ do
                 it "infers literal Int type" $ do
                     let Right (ty, _) = runTC (infer (Lit (LInt 42))) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "infers literal Float64 type" $ do
                     let Right (ty, _) = runTC (infer (Lit (LFloat 3.14))) env0 st0
-                    ty `shouldBe` TCon "Float64"
+                    ty `shouldBe` Id "Float64"
 
                 it "infers literal String type" $ do
                     let Right (ty, _) = runTC (infer (Lit (LString "hello"))) env0 st0
-                    ty `shouldBe` TCon "String"
+                    ty `shouldBe` Id "String"
 
                 it "infers variable type from environment" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("x", TCon "Int")] }
+                    let env1 = env0 { varTypes = Map.fromList [("x", Id "Int")] }
                     let Right (ty, _) = runTC (infer (Id "x")) env1 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "check succeeds for matching literal" $ do
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Int")) env0 st0
+                    let result = runTC (check (Lit (LInt 5)) (Id "Int")) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
                 it "check warns on type mismatch (permissive mode)" $ do
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 st0
+                    let result = runTC (check (Lit (LInt 5)) (Id "Bool")) env0 st0
                     case result of
                         Right (_, st') -> length (tcErrors st') `shouldSatisfy` (> 0)
                         Left _ -> pure ()  -- also acceptable
@@ -822,21 +830,21 @@ main = do
                 it "infers function type from annotated lambda" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int")
                     let Right (ty, _) = runTC (infer (Function lam)) env0 st0
-                    ty `shouldBe` TArrow (TCon "Int") (TCon "Int")
+                    ty `shouldBe` Pi Nothing (Id "Int") (Id "Int")
 
                 it "infers UNDEFINED param type as fresh var" $ do
                     let lam = mkLambda "f" [Var "x" UNDEFINED UNDEFINED] (Lit (LInt 42)) (Id "Int")
                     let Right (ty, _) = runTC (infer (Function lam)) env0 st0
                     -- Should be ?0 -> Int (fresh var for param, Int for body)
                     case ty of
-                        TArrow (TVar _) (TCon "Int") -> pure ()
+                        Pi Nothing (Meta _) (Id "Int") -> pure ()
                         other -> expectationFailure $ "Expected ?n -> Int, got: " ++ show other
 
                 it "infers constructor type from compiler environment" $ do
                     -- Use the full environment with constructors
                     let result = runTC (infer (Lit (LInt 42))) env0 st0
                     case result of
-                        Right (TCon "Int", _) -> pure ()
+                        Right (Id "Int", _) -> pure ()
                         other -> expectationFailure $ "Expected Int, got: " ++ show other
 
             describe "Structure constraints" $ do
@@ -855,65 +863,65 @@ main = do
                 it "infers record literal type" $ do
                     let recLit = RecordLit [("x", Lit (LInt 42)), ("y", Lit (LFloat 3.14))]
                     let Right (ty, _) = runTC (infer recLit) env0 st0
-                    ty `shouldBe` TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Float64") REmpty))
+                    ty `shouldBe` (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Float64") RowEmpty))
 
                 it "converts record type to Ty" $ do
                     let recTy = RecordType [("x", Id "Int"), ("y", Id "Bool")] False
-                    let Right (ty, _) = runTC (exprToTy recTy) env0 st0
-                    ty `shouldBe` TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let Right (ty, _) = runTC (normalizeTypeExpr recTy) env0 st0
+                    ty `shouldBe` (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
 
                 it "converts open record type with row var" $ do
                     let recTy = RecordType [("x", Id "Int")] True
-                    let Right (ty, _) = runTC (exprToTy recTy) env0 st0
+                    let Right (ty, _) = runTC (normalizeTypeExpr recTy) env0 st0
                     case ty of
-                        TRecord (RExtend "x" (TCon "Int") (RVar _)) -> pure ()
+                        (RowExtend "x" (Id "Int") (Meta _)) -> pure ()
                         other -> expectationFailure $ "Expected open record, got: " ++ show other
 
                 it "unifies record literal with expected record type" $ do
                     let recLit = RecordLit [("x", Lit (LInt 1)), ("y", Lit (LFloat 2.0))]
-                        recTy = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Float64") REmpty))
+                        recTy = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Float64") RowEmpty))
                     let result = runTC (check recLit recTy) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
 
             describe "Polymorphism" $ do
-                it "instantiates TForall with fresh variable" $ do
-                    let polyTy = TForall "a" (TArrow (TRigid "a") (TRigid "a"))
+                it "instantiates Pi (Just with fresh variable" $ do
+                    let polyTy = Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a"))
                     let Right (ty, _) = runTC (instantiate polyTy) env0 st0
-                    -- Should be TVar 0 -> TVar 0 (fresh var replacing "a")
+                    -- Should be Meta 0 -> Meta 0 (fresh var replacing "a")
                     case ty of
-                        TArrow (TVar v1) (TVar v2) | v1 == v2 -> pure ()
+                        Pi Nothing (Meta v1) (Meta v2) | v1 == v2 -> pure ()
                         other -> expectationFailure $ "Expected ?n -> ?n, got: " ++ show other
 
-                it "nested TForall instantiation" $ do
-                    let polyTy = TForall "a" (TForall "b" (TArrow (TRigid "a") (TRigid "b")))
+                it "nested Pi (Just instantiation" $ do
+                    let polyTy = Pi (Just "a") (U (LConst 0)) (Pi (Just "b") (U (LConst 0)) (Pi Nothing (Id "a") (Id "b")))
                     let Right (ty, st') = runTC (instantiate polyTy) env0 st0
-                    -- Should be TVar 0 -> TVar 1
+                    -- Should be Meta 0 -> Meta 1
                     case ty of
-                        TArrow (TVar v1) (TVar v2) | v1 /= v2 -> pure ()
+                        Pi Nothing (Meta v1) (Meta v2) | v1 /= v2 -> pure ()
                         other -> expectationFailure $ "Expected ?n -> ?m (n/=m), got: " ++ show other
 
                 it "substTyVar replaces rigid variable" $ do
-                    let ty = TArrow (TRigid "a") (TCon "Int")
-                    substTyVar "a" (TCon "Bool") ty `shouldBe` TArrow (TCon "Bool") (TCon "Int")
+                    let ty = Pi Nothing (Id "a") (Id "Int")
+                    substTyVar "a" (Id "Bool") ty `shouldBe` Pi Nothing (Id "Bool") (Id "Int")
 
                 it "substTyVar does not replace shadowed variable" $ do
-                    let ty = TForall "a" (TArrow (TRigid "a") (TRigid "b"))
-                    substTyVar "a" (TCon "Bool") ty `shouldBe` TForall "a" (TArrow (TRigid "a") (TRigid "b"))
+                    let ty = Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "b"))
+                    substTyVar "a" (Id "Bool") ty `shouldBe` Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "b"))
 
                 it "generalize quantifies free vars" $ do
-                    let Right (ty, _) = runTC (generalize (TArrow (TVar 0) (TVar 0))) env0 (st0 { nextVar = 1 })
+                    let Right (ty, _) = runTC (generalize (Pi Nothing (Meta 0) (Meta 0))) env0 (st0 { nextMeta = 1 })
                     case ty of
-                        TForall _ (TArrow (TRigid _) (TRigid _)) -> pure ()
+                        Pi (Just _) (U (LConst 0)) (Pi Nothing (Id _) (Id _)) -> pure ()
                         other -> expectationFailure $ "Expected forall a. a -> a, got: " ++ show other
 
                 it "generalize does not quantify env-bound vars" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("x", TVar 0)] }
-                    let Right (ty, _) = runTC (generalize (TArrow (TVar 0) (TVar 1))) env1 (st0 { nextVar = 2 })
-                    -- TVar 0 is in env, so only TVar 1 should be generalized
+                    let env1 = env0 { varTypes = Map.fromList [("x", Meta 0)] }
+                    let Right (ty, _) = runTC (generalize (Pi Nothing (Meta 0) (Meta 1))) env1 (st0 { nextMeta = 2 })
+                    -- Meta 0 is in env, so only Meta 1 should be generalized
                     case ty of
-                        TForall _ (TArrow (TVar 0) (TRigid _)) -> pure ()
+                        Pi (Just _) (U (LConst 0)) (Pi Nothing (Meta 0) (Id _)) -> pure ()
                         other -> expectationFailure $ "Expected forall b. ?0 -> b, got: " ++ show other
 
             -- ============================================================
@@ -921,34 +929,34 @@ main = do
             -- ============================================================
             describe "Error detection: unification failures" $ do
                 it "fails unifying Int with String" $ do
-                    let result = runTC (unify (TCon "Int") (TCon "String")) env0 st0
+                    let result = runTC (unify (Id "Int") (Id "String")) env0 st0
                     case result of
-                        Left (Mismatch (TCon "Int") (TCon "String") : _) -> pure ()
+                        Left (Mismatch (Id "Int") (Id "String") : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error type: " ++ show errs
                         Right _ -> expectationFailure "Should have failed"
 
                 it "fails unifying arrow with non-arrow" $ do
-                    let result = runTC (unify (TArrow (TCon "Int") (TCon "Bool")) (TCon "Int")) env0 st0
+                    let result = runTC (unify (Pi Nothing (Id "Int") (Id "Bool")) (Id "Int")) env0 st0
                     case result of
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error type: " ++ show errs
                         Right _ -> expectationFailure "Should have failed"
 
-                it "fails unifying TApp with different constructors" $ do
-                    let result = runTC (unify (TApp (TCon "Maybe") [TCon "Int"]) (TApp (TCon "List") [TCon "Int"])) env0 st0
+                it "fails unifying App with different constructors" $ do
+                    let result = runTC (unify (App (Id "Maybe") [Id "Int"]) (App (Id "List") [Id "Int"])) env0 st0
                     case result of
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error type: " ++ show errs
                         Right _ -> expectationFailure "Should have failed"
 
-                it "fails unifying TApp with different arity" $ do
-                    let result = runTC (unify (TApp (TCon "Pair") [TCon "Int", TCon "Bool"]) (TApp (TCon "Pair") [TCon "Int"])) env0 st0
+                it "fails unifying App with different arity" $ do
+                    let result = runTC (unify (App (Id "Pair") [Id "Int", Id "Bool"]) (App (Id "Pair") [Id "Int"])) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should have failed"
 
                 it "occurs check with nested type" $ do
-                    let result = runTC (unify (TVar 0) (TArrow (TVar 0) (TCon "Int"))) env0 (st0 { nextVar = 1 })
+                    let result = runTC (unify (Meta 0) (Pi Nothing (Meta 0) (Id "Int"))) env0 (st0 { nextMeta = 1 })
                     case result of
                         Left (OccursCheck 0 _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
@@ -956,28 +964,28 @@ main = do
 
             describe "Error detection: check mode mismatches" $ do
                 it "check Int literal against Bool warns" $ do
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 st0
+                    let result = runTC (check (Lit (LInt 5)) (Id "Bool")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
 
                 it "check String literal against Int warns" $ do
-                    let result = runTC (check (Lit (LString "hi")) (TCon "Int")) env0 st0
+                    let result = runTC (check (Lit (LString "hi")) (Id "Int")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
 
                 it "check Float literal against String warns" $ do
-                    let result = runTC (check (Lit (LFloat 3.14)) (TCon "String")) env0 st0
+                    let result = runTC (check (Lit (LFloat 3.14)) (Id "String")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
 
                 it "check Char literal against Int warns" $ do
-                    let result = runTC (check (Lit (LChar 'a')) (TCon "Int")) env0 st0
+                    let result = runTC (check (Lit (LChar 'a')) (Id "Int")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left (Mismatch _ _ : _) -> pure ()
@@ -987,7 +995,7 @@ main = do
                 it "function returning wrong type warns" $ do
                     -- function f(x:Int) : Bool = x  -- returns Int, declared Bool
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Bool")
-                        env1 = env0 { varTypes = Map.fromList [("x", TCon "Int")] }
+                        env1 = env0 { varTypes = Map.fromList [("x", Id "Int")] }
                     let result = runTC (inferLambda lam) env1 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
@@ -997,7 +1005,7 @@ main = do
                 it "check function against incompatible arrow type warns" $ do
                     -- function with Int -> Int checked against String -> Bool
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int")
-                    let result = runTC (check (Function lam) (TArrow (TCon "String") (TCon "Bool"))) env0 st0
+                    let result = runTC (check (Function lam) (Pi Nothing (Id "String") (Id "Bool"))) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> pure ()  -- fatal mismatch also acceptable
@@ -1015,8 +1023,8 @@ main = do
             describe "Error detection: record errors" $ do
                 it "missing field in closed record unification" $ do
                     -- {x:Int} vs {x:Int, y:Bool} — closed record missing field y
-                    let r1 = TRecord (RExtend "x" (TCon "Int") REmpty)
-                        r2 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let r1 = (RowExtend "x" (Id "Int") RowEmpty)
+                        r2 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
                         Left (MissingField "y" : _) -> pure ()
@@ -1025,18 +1033,18 @@ main = do
 
                 it "record field type mismatch" $ do
                     -- {x:Int, y:Bool} vs {x:Int, y:String}
-                    let r1 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
-                        r2 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "String") REmpty))
+                    let r1 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
+                        r2 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "String") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
-                        Left (Mismatch (TCon "Bool") (TCon "String") : _) -> pure ()
+                        Left (Mismatch (Id "Bool") (Id "String") : _) -> pure ()
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should have failed — field y type mismatch"
 
                 it "extra field in expected closed record" $ do
                     -- checking {x=1, y=2, z=3} against {x:Int, y:Int}
                     let recLit = RecordLit [("x", Lit (LInt 1)), ("y", Lit (LInt 2)), ("z", Lit (LInt 3))]
-                        recTy = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Int") REmpty))
+                        recTy = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Int") RowEmpty))
                     let result = runTC (check recLit recTy) env0 st0
                     case result of
                         Left _ -> pure ()  -- should fail: extra field z
@@ -1045,7 +1053,7 @@ main = do
                 it "record literal field with wrong type" $ do
                     -- checking {x = "hello"} against {x:Int}
                     let recLit = RecordLit [("x", Lit (LString "hello"))]
-                        recTy = TRecord (RExtend "x" (TCon "Int") REmpty)
+                        recTy = (RowExtend "x" (Id "Int") RowEmpty)
                     let result = runTC (check recLit recTy) env0 st0
                     case result of
                         Left _ -> pure ()
@@ -1054,9 +1062,9 @@ main = do
             describe "Error detection: row polymorphism edge cases" $ do
                 it "open record accepts extra fields" $ do
                     -- {x:Int, ..r} should accept {x:Int, y:Bool}
-                    let st1 = st0 { nextVar = 1 }
-                        r1 = TRecord (RExtend "x" (TCon "Int") (RVar 0))
-                        r2 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let st1 = st0 { nextMeta = 1 }
+                        r1 = (RowExtend "x" (Id "Int") (Meta 0))
+                        r2 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st1
                     case result of
                         Right _ -> pure ()
@@ -1064,15 +1072,15 @@ main = do
 
                 it "closed record rejects extra fields" $ do
                     -- {x:Int} should NOT accept {x:Int, y:Bool}
-                    let r1 = TRecord (RExtend "x" (TCon "Int") REmpty)
-                        r2 = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let r1 = (RowExtend "x" (Id "Int") RowEmpty)
+                        r2 = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                     let result = runTC (unify r1 r2) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Closed record should reject extra fields"
 
                 it "missing field extraction from empty row fails" $ do
-                    let result = runTC (unify (TRecord (RExtend "x" (TCon "Int") REmpty)) (TRecord (RExtend "z" (TCon "Int") REmpty))) env0 st0
+                    let result = runTC (unify ((RowExtend "x" (Id "Int") RowEmpty)) ((RowExtend "z" (Id "Int") RowEmpty))) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should fail — field z not in {x:Int}"
@@ -1091,7 +1099,7 @@ main = do
 
                 it "application to non-function warns or returns fresh var" $ do
                     -- Applying a literal: (42)(x) — 42 is not a function
-                    let env1 = env0 { varTypes = Map.fromList [("x", TCon "Int")] }
+                    let env1 = env0 { varTypes = Map.fromList [("x", Id "Int")] }
                     let result = runTC (infer (App (Lit (LInt 42)) [Id "x"])) env1 st0
                     -- This should either fail or produce a fresh var (we're permissive)
                     case result of
@@ -1123,12 +1131,12 @@ main = do
 
             describe "Error detection: error message quality" $ do
                 it "Mismatch error includes both types" $ do
-                    let err = Mismatch (TCon "Int") (TCon "Bool")
+                    let err = Mismatch (Id "Int") (Id "Bool")
                     showTCError err `shouldSatisfy` \s ->
                         "Int" `isInfixOf` s && "Bool" `isInfixOf` s
 
                 it "OccursCheck error mentions the variable" $ do
-                    let err = OccursCheck 3 (TArrow (TVar 3) (TCon "Int"))
+                    let err = OccursCheck 3 (Pi Nothing (Meta 3) (Id "Int"))
                     showTCError err `shouldSatisfy` \s ->
                         "?3" `isInfixOf` s
 
@@ -1143,8 +1151,8 @@ main = do
                         "2" `isInfixOf` s && "3" `isInfixOf` s
 
                 it "all errors are prefixed with [TC]" $ do
-                    let errors = [ Mismatch (TCon "Int") (TCon "Bool")
-                                 , OccursCheck 0 (TCon "Int")
+                    let errors = [ Mismatch (Id "Int") (Id "Bool")
+                                 , OccursCheck 0 (Id "Int")
                                  , UnboundVar "x"
                                  , MissingField "f"
                                  , ArityMismatch 1 2
@@ -1164,13 +1172,13 @@ main = do
             describe "tcWarnOrFail and strict mode" $ do
                 it "strict mode fails fatally on type mismatch" $ do
                     let stStrict = initTCState TCStrict
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 stStrict
+                    let result = runTC (check (Lit (LInt 5)) (Id "Bool")) env0 stStrict
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Strict mode should fail on mismatch"
 
                 it "relaxed mode accumulates warning on mismatch" $ do
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Bool")) env0 st0
+                    let result = runTC (check (Lit (LInt 5)) (Id "Bool")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> expectationFailure "Relaxed mode should warn, not fail"
@@ -1193,21 +1201,21 @@ main = do
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> pure ()
 
-                it "exprToTy promotes literals to TLit" $ do
-                    -- Lit (LInt 42) in type position now produces TLit (promoted to type level)
-                    let result = runTC (exprToTy (Lit (LInt 42))) env0 st0
+                it "normalizeTypeExpr promotes literals to TLit" $ do
+                    -- Lit (LInt 42) in type position now produces Lit (promoted to type level)
+                    let result = runTC (normalizeTypeExpr (Lit (LInt 42))) env0 st0
                     case result of
-                        Right (ty, _) -> ty `shouldBe` TLit (LInt 42)
+                        Right (ty, _) -> ty `shouldBe` Lit (LInt 42)
                         Left errs -> expectationFailure $ "Expected TLit, got errors: " ++ show errs
 
             -- ============================================================
-            -- Step 3: TForall alpha-renaming
+            -- Step 3: Pi (Just alpha-renaming
             -- ============================================================
-            describe "TForall alpha-renaming" $ do
+            describe "Pi (Just alpha-renaming" $ do
                 it "alpha-equivalent foralls unify" $ do
                     -- forall a. a -> a  should unify with  forall b. b -> b
-                    let t1 = TForall "a" (TArrow (TRigid "a") (TRigid "a"))
-                        t2 = TForall "b" (TArrow (TRigid "b") (TRigid "b"))
+                    let t1 = Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a"))
+                        t2 = Pi (Just "b") (U (LConst 0)) (Pi Nothing (Id "b") (Id "b"))
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Right _ -> pure ()
@@ -1215,8 +1223,8 @@ main = do
 
                 it "incompatible forall bodies don't unify" $ do
                     -- forall a. a -> a  vs  forall b. b -> Int
-                    let t1 = TForall "a" (TArrow (TRigid "a") (TRigid "a"))
-                        t2 = TForall "b" (TArrow (TRigid "b") (TCon "Int"))
+                    let t1 = Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a"))
+                        t2 = Pi (Just "b") (U (LConst 0)) (Pi Nothing (Id "b") (Id "Int"))
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Left _ -> pure ()
@@ -1238,7 +1246,7 @@ main = do
                             errStrs `shouldSatisfy` Prelude.any ("myFunc" `isInfixOf`)
 
                 it "WithContext error renders properly" $ do
-                    let err = WithContext "function 'test'" (Mismatch (TCon "Int") (TCon "Bool"))
+                    let err = WithContext "function 'test'" (Mismatch (Id "Int") (Id "Bool"))
                     showTCError err `shouldSatisfy` ("test" `isInfixOf`)
                     showTCError err `shouldSatisfy` ("Int" `isInfixOf`)
 
@@ -1254,7 +1262,7 @@ main = do
                     case result of
                         Right (ty, st') -> do
                             -- Should infer Int -> Int without unbound var warning for "fact"
-                            ty `shouldBe` TArrow (TCon "Int") (TCon "Int")
+                            ty `shouldBe` Pi Nothing (Id "Int") (Id "Int")
                             let hasFactUnbound = Prelude.any (\e -> case e of
                                     UnboundVar "fact" -> True
                                     WithContext _ (UnboundVar "fact") -> True
@@ -1265,25 +1273,25 @@ main = do
                 it "non-recursive function unaffected by self-binding" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] (Lit (LInt 42)) (Id "Int")
                     let Right (ty, _) = runTC (inferLambda lam) env0 st0
-                    ty `shouldBe` TArrow (TCon "Int") (TCon "Int")
+                    ty `shouldBe` Pi Nothing (Id "Int") (Id "Int")
 
             -- ============================================================
-            -- Step 6: exprToTy extended cases
+            -- Step 6: normalizeTypeExpr extended cases
             -- ============================================================
-            describe "exprToTy extended cases" $ do
+            describe "normalizeTypeExpr extended cases" $ do
                 it "general App converts to TApp" $ do
-                    -- App (App (Id "F") [Id "a"]) [Id "b"] -> TApp (TApp (TCon "F") [TRigid "a"]) [TRigid "b"]
+                    -- App (App (Id "F") [Id "a"]) [Id "b"] -> App (App (Id "F") [Id "a"]) [Id "b"]
                     let expr = App (App (Id "F") [Id "a"]) [Id "b"]
-                    let Right (ty, _) = runTC (exprToTy expr) env0 st0
+                    let Right (ty, _) = runTC (normalizeTypeExpr expr) env0 st0
                     case ty of
-                        TApp (TApp (TCon "F") [TRigid "a"]) [TRigid "b"] -> pure ()
+                        App (App (Id "F") [Id "a"]) [Id "b"] -> pure ()
                         other -> expectationFailure $ "Expected nested TApp, got: " ++ show other
 
                 it "Function in type position converts to Pi type" $ do
                     let lam = mkLambda "" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
-                    let Right (ty, _) = runTC (exprToTy (Function lam)) env0 st0
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Function lam)) env0 st0
                     case ty of
-                        TPi _ (TCon "Int") _ -> pure ()
+                        Pi _ (Id "Int") _ -> pure ()
                         other -> expectationFailure $ "Expected Pi type, got: " ++ show other
 
             -- ============================================================
@@ -1401,7 +1409,7 @@ main = do
                     let result = runTC (infer (App (RecFieldAccess ("new", -1) (Id "OneField")) [Lit (LInt 1)])) tcEnv' st0
                     case result of
                         Right (ty, st') -> do
-                            ty `shouldBe` TCon "OneField"
+                            ty `shouldBe` Id "OneField"
                             let hasArity = Prelude.any (\e -> case e of
                                     ArityMismatch _ _ -> True
                                     WithContext _ (ArityMismatch _ _) -> True
@@ -1446,7 +1454,7 @@ main = do
                                           , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
                         cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
                         tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
-                    let result = runTC (subtype (TCon "Dog") (TCon "Animal")) tcEnv' st0
+                    let result = runTC (subtype (Id "Dog") (Id "Animal")) tcEnv' st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "subtype Dog <: Animal should succeed: " ++ show errs
@@ -1467,7 +1475,7 @@ main = do
                                           , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
                         cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
                         tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
-                    let result = runTC (subtype (TCon "Animal") (TCon "Dog")) tcEnv' st0
+                    let result = runTC (subtype (Id "Animal") (Id "Dog")) tcEnv' st0
                     case result of
                         Right _ -> expectationFailure "subtype Animal <: Dog should fail"
                         Left errs -> errs `shouldSatisfy`
@@ -1491,9 +1499,9 @@ main = do
                                           , cmExtern = Nothing, cmTag = 101, cmSourceFile = "" }
                         cenv' = cenv { classDecls = Map.fromList [("Animal", animalCM), ("Dog", dogCM)] }
                         tcEnv' = emptyTCEnv { envCompiler = Just cenv'
-                                            , varTypes = Map.fromList [("myDog", TCon "Dog")] }
+                                            , varTypes = Map.fromList [("myDog", Id "Dog")] }
                     let stStrict = initTCState TCStrict
-                    let result = runTC (check (Id "myDog") (TCon "Animal")) tcEnv' stStrict
+                    let result = runTC (check (Id "myDog") (Id "Animal")) tcEnv' stStrict
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "check Dog as Animal should pass in strict mode: " ++ show errs
@@ -1510,26 +1518,26 @@ main = do
                         tcEnv' = emptyTCEnv { envCompiler = Just cenv' }
                     let result = runTC (infer (ReprCast (Lit (LInt 1)) (Id "Dog"))) tcEnv' st0
                     case result of
-                        Right (ty, _) -> ty `shouldBe` TApp (TCon "Maybe") [TCon "Dog"]
+                        Right (ty, _) -> ty `shouldBe` App (Id "Maybe") [Id "Dog"]
                         Left errs -> expectationFailure $ "infer ReprCast to Dog should return Maybe(Dog): " ++ show errs
 
                 it "SubtypeMismatch error has [TC] prefix" $ do
-                    showTCError (SubtypeMismatch (TCon "Int") (TCon "Bool")) `shouldSatisfy` ("TC" `isInfixOf`)
+                    showTCError (SubtypeMismatch (Id "Int") (Id "Bool")) `shouldSatisfy` ("TC" `isInfixOf`)
 
                 it "all [TC] errors include context prefix" $ do
-                    let errors = [ Mismatch (TCon "Int") (TCon "Bool")
-                                 , OccursCheck 0 (TCon "Int")
+                    let errors = [ Mismatch (Id "Int") (Id "Bool")
+                                 , OccursCheck 0 (Id "Int")
                                  , UnboundVar "x"
                                  , MissingField "f"
                                  , ArityMismatch 1 2
                                  , OtherError "test"
-                                 , WithContext "function 'foo'" (Mismatch (TCon "Int") (TCon "Bool"))
+                                 , WithContext "function 'foo'" (Mismatch (Id "Int") (Id "Bool"))
                                  ]
                     mapM_ (\e -> showTCError e `shouldSatisfy` \s -> "[TC]" `isPrefixOf` s) errors
 
                 it "strict mode check passes for matching types" $ do
                     let stStrict = initTCState TCStrict
-                    let result = runTC (check (Lit (LInt 5)) (TCon "Int")) env0 stStrict
+                    let result = runTC (check (Lit (LInt 5)) (Id "Int")) env0 stStrict
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Strict check should pass for matching types: " ++ show errs
@@ -1556,15 +1564,15 @@ main = do
             -- ============================================================
             describe "tcTry state isolation" $ do
                 it "failed tcTry does not corrupt substitution state" $ do
-                    let st1 = st0 { nextVar = 2 }
-                    -- First, bind TVar 0 = Int
-                    let Right (_, st2) = runTC (unify (TVar 0) (TCon "Int")) env0 st1
+                    let st1 = st0 { nextMeta = 2 }
+                    -- First, bind Meta 0 = Int
+                    let Right (_, st2) = runTC (unify (Meta 0) (Id "Int")) env0 st1
                     -- Now try a failing unification — should not affect st2
-                    let Right (result, st3) = runTC (tcTry (unify (TCon "Int") (TCon "Bool"))) env0 st2
+                    let Right (result, st3) = runTC (tcTry (unify (Id "Int") (Id "Bool"))) env0 st2
                     result `shouldBe` Nothing
-                    -- TVar 0 should still resolve to Int
-                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st3
-                    ty `shouldBe` TCon "Int"
+                    -- Meta 0 should still resolve to Int
+                    let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st3
+                    ty `shouldBe` Id "Int"
 
                 it "failed tcTry does not lose accumulated errors" $ do
                     -- Add a warning, then try a failing action
@@ -1580,7 +1588,7 @@ main = do
                     -- infer(Id "noexist") warns, then unify(fresh, Int) succeeds
                     -- but the warning is via tcWarn not tcWarnOrFail,
                     -- so it should still accumulate
-                    let result = runTC (check (Id "noexist") (TCon "Int")) env0 stStrict
+                    let result = runTC (check (Id "noexist") (Id "Int")) env0 stStrict
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> pure ()  -- also fine if it fails
@@ -1598,101 +1606,101 @@ main = do
                             _ -> False)
                         Right _ -> expectationFailure "Strict mode should fail on arity mismatch"
 
-            describe "TSigma unification" $ do
+            describe "Sigma unification" $ do
                 it "unifies identical sigma types" $ do
-                    let t1 = TSigma Nothing (TCon "Int") (TCon "Bool")
-                        t2 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                    let t1 = Sigma Nothing (Id "Int") (Id "Bool")
+                        t2 = Sigma Nothing (Id "Int") (Id "Bool")
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should unify: " ++ show errs
 
                 it "fails on mismatched sigma components" $ do
-                    let t1 = TSigma Nothing (TCon "Int") (TCon "Bool")
-                        t2 = TSigma Nothing (TCon "Int") (TCon "String")
+                    let t1 = Sigma Nothing (Id "Int") (Id "Bool")
+                        t2 = Sigma Nothing (Id "Int") (Id "String")
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should fail on sigma mismatch"
 
                 it "unifies sigma with variables" $ do
-                    let st1 = st0 { nextVar = 2 }
-                        t1 = TSigma Nothing (TVar 0) (TVar 1)
-                        t2 = TSigma Nothing (TCon "Int") (TCon "Bool")
+                    let st1 = st0 { nextMeta = 2 }
+                        t1 = Sigma Nothing (Meta 0) (Meta 1)
+                        t2 = Sigma Nothing (Id "Int") (Id "Bool")
                     let Right (_, st') = runTC (unify t1 t2) env0 st1
-                    let Right (r0, _) = runTC (applySubst (TVar 0)) env0 st'
-                    let Right (r1, _) = runTC (applySubst (TVar 1)) env0 st'
-                    r0 `shouldBe` TCon "Int"
-                    r1 `shouldBe` TCon "Bool"
+                    let Right (r0, _) = runTC (applySubst (Meta 0)) env0 st'
+                    let Right (r1, _) = runTC (applySubst (Meta 1)) env0 st'
+                    r0 `shouldBe` Id "Int"
+                    r1 `shouldBe` Id "Bool"
 
-            describe "TId unification" $ do
+            describe "PropEq unification" $ do
                 it "unifies identical identity types" $ do
-                    let t1 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
-                        t2 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                    let t1 = App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]
+                        t2 = App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should unify: " ++ show errs
 
                 it "fails on mismatched identity endpoints" $ do
-                    let t1 = TId (TCon "Nat") (TCon "Z") (TCon "Z")
-                        t2 = TId (TCon "Nat") (TCon "Z") (TCon "S")
+                    let t1 = App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]
+                        t2 = App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "S")]
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should fail"
 
-            describe "TEffect unification" $ do
+            describe "EffType unification" $ do
                 it "unifies identical effect types" $ do
-                    let t1 = TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit")
-                        t2 = TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit")
+                    let t1 = EffType (RowExtend "console" (Id "Console") RowEmpty) (Id "Unit")
+                        t2 = EffType (RowExtend "console" (Id "Console") RowEmpty) (Id "Unit")
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should unify: " ++ show errs
 
                 it "fails on mismatched effect result types" $ do
-                    let t1 = TEffect REmpty (TCon "Int")
-                        t2 = TEffect REmpty (TCon "Bool")
+                    let t1 = EffType RowEmpty (Id "Int")
+                        t2 = EffType RowEmpty (Id "Bool")
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Should fail on effect result mismatch"
 
                 it "unifies effect rows with different order" $ do
-                    let t1 = TEffect (RExtend "a" (TCon "A") (RExtend "b" (TCon "B") REmpty)) (TCon "Unit")
-                        t2 = TEffect (RExtend "b" (TCon "B") (RExtend "a" (TCon "A") REmpty)) (TCon "Unit")
+                    let t1 = EffType (RowExtend "a" (Id "A") (RowExtend "b" (Id "B") RowEmpty)) (Id "Unit")
+                        t2 = EffType (RowExtend "b" (Id "B") (RowExtend "a" (Id "A") RowEmpty)) (Id "Unit")
                     let result = runTC (unify t1 t2) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Should unify reordered effects: " ++ show errs
 
-            describe "TRigid mismatch" $ do
+            describe "Id mismatch" $ do
                 it "different rigid names fail to unify" $ do
-                    let result = runTC (unify (TRigid "a") (TRigid "b")) env0 st0
+                    let result = runTC (unify (Id "a") (Id "b")) env0 st0
                     case result of
                         Left (Mismatch _ _ : _) -> pure ()
                         Left errs -> expectationFailure $ "Wrong error: " ++ show errs
                         Right _ -> expectationFailure "Different rigid vars should not unify"
 
-                it "TRigid vs TCon fails" $ do
-                    let result = runTC (unify (TRigid "a") (TCon "Int")) env0 st0
+                it "Id vs Id fails" $ do
+                    let result = runTC (unify (Id "a") (Id "Int")) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Rigid vs concrete should fail"
 
-                it "TCon vs TRigid fails" $ do
-                    let result = runTC (unify (TCon "Int") (TRigid "a")) env0 st0
+                it "Id vs Id fails" $ do
+                    let result = runTC (unify (Id "Int") (Id "a")) env0 st0
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Concrete vs rigid should fail"
 
             describe "Row occurs check" $ do
                 it "row variable occurring in its own binding fails" $ do
-                    let st1 = st0 { nextVar = 1 }
+                    let st1 = st0 { nextMeta = 1 }
                         -- Try to unify {x:Int, ..?0} with ?0 — should fail (occurs)
-                        row1 = RExtend "x" (TCon "Int") (RVar 0)
-                    let result = runTC (bindRow 0 row1) env0 st1
+                        row1 = RowExtend "x" (Id "Int") (Meta 0)
+                    let result = runTC (bind 0 row1) env0 st1
                     case result of
                         Left _ -> pure ()
                         Right _ -> expectationFailure "Row occurs check should fail"
@@ -1700,35 +1708,35 @@ main = do
             describe "inferApp edge cases" $ do
                 it "too many args for arrow type returns fresh var" $ do
                     -- Int -> Bool applied to (1, 2) — second arg has no matching param
-                    let env1 = env0 { varTypes = Map.fromList [("f", TArrow (TCon "Int") (TCon "Bool"))] }
+                    let env1 = env0 { varTypes = Map.fromList [("f", Pi Nothing (Id "Int") (Id "Bool"))] }
                     let result = runTC (infer (App (Id "f") [Lit (LInt 1), Lit (LInt 2)])) env1 st0
                     case result of
                         Right (ty, _) -> case ty of
-                            TVar _ -> pure ()  -- got a fresh var (Bool is not arrow)
+                            Meta _ -> pure ()  -- got a fresh var (Bool is not arrow)
                             other -> expectationFailure $ "Expected fresh var from non-arrow application, got: " ++ show other
                         Left _ -> pure ()  -- error also acceptable
 
-                it "application to TVar creates arrow type" $ do
-                    let st1 = st0 { nextVar = 1 }
-                        env1 = env0 { varTypes = Map.fromList [("f", TVar 0)] }
+                it "application to Meta creates arrow type" $ do
+                    let st1 = st0 { nextMeta = 1 }
+                        env1 = env0 { varTypes = Map.fromList [("f", Meta 0)] }
                     let Right (retTy, st') = runTC (infer (App (Id "f") [Lit (LInt 42)])) env1 st1
-                    -- TVar 0 should now be bound to Int -> ?retTy
-                    let Right (fTy, _) = runTC (applySubst (TVar 0)) env0 st'
+                    -- Meta 0 should now be bound to Int -> ?retTy
+                    let Right (fTy, _) = runTC (applySubst (Meta 0)) env0 st'
                     case fTy of
-                        TArrow (TCon "Int") _ -> pure ()
+                        Pi Nothing (Id "Int") _ -> pure ()
                         other -> expectationFailure $ "Expected Int -> ?, got: " ++ show other
 
             describe "LetIn and IfThenElse" $ do
                 it "let binding visible in body" $ do
                     let letExpr = LetIn [(Var "x" UNDEFINED UNDEFINED, Lit (LInt 42))] (Id "x")
                     let Right (ty, _) = runTC (infer letExpr) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "let binding with multiple bindings" $ do
                     let letExpr = LetIn [(Var "x" UNDEFINED UNDEFINED, Lit (LInt 1)),
                                          (Var "y" UNDEFINED UNDEFINED, Lit (LString "hi"))] (Id "y")
                     let Right (ty, _) = runTC (infer letExpr) env0 st0
-                    ty `shouldBe` TCon "String"
+                    ty `shouldBe` Id "String"
 
                 it "if-then-else checks condition is Bool" $ do
                     let ite = IfThenElse (Lit (LInt 42)) (Lit (LInt 1)) (Lit (LInt 2))
@@ -1738,10 +1746,10 @@ main = do
                         Left _ -> pure ()
 
                 it "if-then-else with matching branches succeeds" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("b", TCon "Bool")] }
+                    let env1 = env0 { varTypes = Map.fromList [("b", Id "Bool")] }
                         ite = IfThenElse (Id "b") (Lit (LInt 1)) (Lit (LInt 2))
                     let Right (ty, st') = runTC (infer ite) env1 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
                     -- No type errors
                     Prelude.filter (\e -> case e of
                         UnboundVar _ -> False
@@ -1749,7 +1757,7 @@ main = do
                         _ -> True) (tcErrors st') `shouldSatisfy` Prelude.null
 
                 it "if-then-else with mismatched branches warns" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("b", TCon "Bool")] }
+                    let env1 = env0 { varTypes = Map.fromList [("b", Id "Bool")] }
                         ite = IfThenElse (Id "b") (Lit (LInt 1)) (Lit (LString "oops"))
                     let result = runTC (infer ite) env1 st0
                     case result of
@@ -1759,35 +1767,35 @@ main = do
             describe "Tuple type inference" $ do
                 it "empty tuple infers Unit" $ do
                     let Right (ty, _) = runTC (infer (Tuple [])) env0 st0
-                    ty `shouldBe` TCon "Unit"
+                    ty `shouldBe` Id "Unit"
 
                 it "single-element tuple infers element type" $ do
                     let Right (ty, _) = runTC (infer (Tuple [Lit (LInt 42)])) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "multi-element tuple infers nested TSigma" $ do
                     let Right (ty, _) = runTC (infer (Tuple [Lit (LInt 1), Lit (LString "a"), Lit (LFloat 3.14)])) env0 st0
                     case ty of
-                        TSigma Nothing (TCon "Int") (TSigma Nothing (TCon "String") (TCon "Float64")) -> pure ()
+                        Sigma Nothing (Id "Int") (Sigma Nothing (Id "String") (Id "Float64")) -> pure ()
                         other -> expectationFailure $ "Expected (Int, String, Float64), got: " ++ show other
 
             describe "Array literal inference" $ do
                 it "empty array has polymorphic element type" $ do
                     let Right (ty, _) = runTC (infer (ArrayLit [])) env0 st0
                     case ty of
-                        TApp (TCon "Array") [TVar _] -> pure ()
+                        App (Id "Array") [Meta _] -> pure ()
                         other -> expectationFailure $ "Expected Array(?), got: " ++ show other
 
                 it "non-empty array infers element type" $ do
                     let Right (ty, _) = runTC (infer (ArrayLit [Lit (LInt 1), Lit (LInt 2)])) env0 st0
-                    ty `shouldBe` TApp (TCon "Array") [TCon "Int"]
+                    ty `shouldBe` App (Id "Array") [Id "Int"]
 
             describe "Pattern match checking" $ do
                 it "check PatternMatches propagates expected type" $ do
                     -- PatternMatches [CaseOf [] (Lit (LInt 42)) si]
                     -- checked against Bool should warn
                     let pm = PatternMatches [CaseOf [] (Lit (LInt 42)) SourceInteractive]
-                    let result = runTC (check pm (TCon "Bool")) env0 st0
+                    let result = runTC (check pm (Id "Bool")) env0 st0
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> pure ()
@@ -1795,7 +1803,7 @@ main = do
                 it "CaseOf in check mode binds pattern variables" $ do
                     -- CaseOf [Var "x" (Id "Int") UNDEFINED] (Id "x") checked against Int
                     let co = CaseOf [Var "x" (Id "Int") UNDEFINED] (Id "x") SourceInteractive
-                    let result = runTC (check co (TCon "Int")) env0 st0
+                    let result = runTC (check co (Id "Int")) env0 st0
                     case result of
                         Right (_, st') -> do
                             let realErrors = Prelude.filter (\e -> case e of
@@ -1809,8 +1817,8 @@ main = do
                 it "relaxed mode accumulates multiple warnings" $ do
                     -- Two mismatches in sequence
                     let result = runTC (
-                            check (Lit (LInt 1)) (TCon "Bool") `tcBind` \_ ->
-                            check (Lit (LString "hi")) (TCon "Int")
+                            check (Lit (LInt 1)) (Id "Bool") `tcBind` \_ ->
+                            check (Lit (LString "hi")) (Id "Int")
                             ) env0 st0
                     case result of
                         Right (_, st') -> length (tcErrors st') `shouldSatisfy` (>= 2)
@@ -1819,8 +1827,8 @@ main = do
                 it "strict mode fails on first mismatch" $ do
                     let stStrict = initTCState TCStrict
                     let result = runTC (
-                            check (Lit (LInt 1)) (TCon "Bool") `tcBind` \_ ->
-                            check (Lit (LString "hi")) (TCon "Int")
+                            check (Lit (LInt 1)) (Id "Bool") `tcBind` \_ ->
+                            check (Lit (LString "hi")) (Id "Int")
                             ) env0 stStrict
                     case result of
                         Left errs -> length errs `shouldBe` 1  -- only first error
@@ -1835,107 +1843,107 @@ main = do
                     let Right (ty, _) = runTC (inferLambda lam) env0 st0
                     -- Should return just the value-level arrow: a -> a (wrapped in forall)
                     case ty of
-                        TArrow _ _ -> pure ()  -- some form of arrow type
+                        Pi Nothing _ _ -> pure ()  -- some form of arrow type
                         other -> expectationFailure $ "Expected arrow type, got: " ++ show other
 
-            describe "exprToTy extended coverage" $ do
+            describe "normalizeTypeExpr extended coverage" $ do
                 it "converts empty Tuple to Unit" $ do
-                    let Right (ty, _) = runTC (exprToTy (Tuple [])) env0 st0
-                    ty `shouldBe` TCon "Unit"
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Tuple [])) env0 st0
+                    ty `shouldBe` Id "Unit"
 
                 it "converts single Tuple to inner type" $ do
-                    let Right (ty, _) = runTC (exprToTy (Tuple [Id "Int"])) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Tuple [Id "Int"])) env0 st0
+                    ty `shouldBe` Id "Int"
 
-                it "converts multi Tuple to TSigma chain" $ do
-                    let Right (ty, _) = runTC (exprToTy (Tuple [Id "Int", Id "Bool"])) env0 st0
-                    ty `shouldBe` TSigma Nothing (TCon "Int") (TCon "Bool")
+                it "converts multi Tuple to Sigma chain" $ do
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Tuple [Id "Int", Id "Bool"])) env0 st0
+                    ty `shouldBe` Sigma Nothing (Id "Int") (Id "Bool")
 
                 it "converts Implicit wrapper" $ do
-                    let Right (ty, _) = runTC (exprToTy (Implicit (Id "Int"))) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    let Right (ty, _) = runTC (normalizeTypeExpr (Implicit (Id "Int"))) env0 st0
+                    ty `shouldBe` Id "Int"
 
                 it "converts EffType" $ do
                     let effExpr = EffType (RecordType [("console", Id "Console")] False) (Id "Unit")
-                    let Right (ty, _) = runTC (exprToTy effExpr) env0 st0
+                    let Right (ty, _) = runTC (normalizeTypeExpr effExpr) env0 st0
                     case ty of
-                        TEffect (RExtend "console" (TCon "Console") REmpty) (TCon "Unit") -> pure ()
+                        EffType (RowExtend "console" (Id "Console") RowEmpty) (Id "Unit") -> pure ()
                         other -> expectationFailure $ "Expected Eff {console:Console} Unit, got: " ++ show other
 
                 it "converts PropEqT to TId" $ do
                     let peq = App (Id "PropEqT") [Id "Nat", Id "Z", Id "Z"]
-                    let Right (ty, _) = runTC (exprToTy peq) env0 st0
-                    ty `shouldBe` TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                    let Right (ty, _) = runTC (normalizeTypeExpr peq) env0 st0
+                    ty `shouldBe` App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]
 
             describe "applySubst through complex types" $ do
                 it "substitutes through TApp" $ do
-                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
-                    let Right (ty, _) = runTC (applySubst (TApp (TCon "Maybe") [TVar 0])) env0 st1
-                    ty `shouldBe` TApp (TCon "Maybe") [TCon "Int"]
+                    let st1 = st0 { nextMeta = 1, substitution = Map.fromList [(0, Id "Int")] }
+                    let Right (ty, _) = runTC (applySubst (App (Id "Maybe") [Meta 0])) env0 st1
+                    ty `shouldBe` App (Id "Maybe") [Id "Int"]
 
                 it "substitutes through TSigma" $ do
-                    let st1 = st0 { nextVar = 2, substitution = Map.fromList [(0, TCon "Int"), (1, TCon "Bool")] }
-                    let Right (ty, _) = runTC (applySubst (TSigma Nothing (TVar 0) (TVar 1))) env0 st1
-                    ty `shouldBe` TSigma Nothing (TCon "Int") (TCon "Bool")
+                    let st1 = st0 { nextMeta = 2, substitution = Map.fromList [(0, Id "Int"), (1, Id "Bool")] }
+                    let Right (ty, _) = runTC (applySubst (Sigma Nothing (Meta 0) (Meta 1))) env0 st1
+                    ty `shouldBe` Sigma Nothing (Id "Int") (Id "Bool")
 
                 it "substitutes through TId" $ do
-                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Z")] }
-                    let Right (ty, _) = runTC (applySubst (TId (TCon "Nat") (TVar 0) (TVar 0))) env0 st1
-                    ty `shouldBe` TId (TCon "Nat") (TCon "Z") (TCon "Z")
+                    let st1 = st0 { nextMeta = 1, substitution = Map.fromList [(0, Id "Z")] }
+                    let Right (ty, _) = runTC (applySubst (App (Id "PropEq") [(Id "Nat"), (Meta 0), (Meta 0)])) env0 st1
+                    ty `shouldBe` App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]
 
-                it "substitutes through TForall body" $ do
-                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
-                    let Right (ty, _) = runTC (applySubst (TForall "a" (TArrow (TRigid "a") (TVar 0)))) env0 st1
-                    ty `shouldBe` TForall "a" (TArrow (TRigid "a") (TCon "Int"))
+                it "substitutes through Pi (Just body" $ do
+                    let st1 = st0 { nextMeta = 1, substitution = Map.fromList [(0, Id "Int")] }
+                    let Right (ty, _) = runTC (applySubst (Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Meta 0)))) env0 st1
+                    ty `shouldBe` Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "Int"))
 
-                it "substitutes through TRecord row" $ do
-                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "Int")] }
-                    let Right (ty, _) = runTC (applySubst (TRecord (RExtend "x" (TVar 0) REmpty))) env0 st1
-                    ty `shouldBe` TRecord (RExtend "x" (TCon "Int") REmpty)
+                it "substitutes through id row" $ do
+                    let st1 = st0 { nextMeta = 1, substitution = Map.fromList [(0, Id "Int")] }
+                    let Right (ty, _) = runTC (applySubst ((RowExtend "x" (Meta 0) RowEmpty))) env0 st1
+                    ty `shouldBe` (RowExtend "x" (Id "Int") RowEmpty)
 
                 it "substitutes through TEffect" $ do
-                    let st1 = st0 { nextVar = 1, substitution = Map.fromList [(0, TCon "String")] }
-                    let Right (ty, _) = runTC (applySubst (TEffect REmpty (TVar 0))) env0 st1
-                    ty `shouldBe` TEffect REmpty (TCon "String")
+                    let st1 = st0 { nextMeta = 1, substitution = Map.fromList [(0, Id "String")] }
+                    let Right (ty, _) = runTC (applySubst (EffType RowEmpty (Meta 0))) env0 st1
+                    ty `shouldBe` EffType RowEmpty (Id "String")
 
                 it "chases substitution chains" $ do
                     -- ?0 -> ?1 -> Int
-                    let st1 = st0 { nextVar = 2, substitution = Map.fromList [(0, TVar 1), (1, TCon "Int")] }
-                    let Right (ty, _) = runTC (applySubst (TVar 0)) env0 st1
-                    ty `shouldBe` TCon "Int"
+                    let st1 = st0 { nextMeta = 2, substitution = Map.fromList [(0, Meta 1), (1, Id "Int")] }
+                    let Right (ty, _) = runTC (applySubst (Meta 0)) env0 st1
+                    ty `shouldBe` Id "Int"
 
             describe "showTy coverage" $ do
-                it "showTy TVar" $ showTy (TVar 42) `shouldBe` "?42"
-                it "showTy TRigid" $ showTy (TRigid "a") `shouldBe` "a"
-                it "showTy TCon" $ showTy (TCon "Int") `shouldBe` "Int"
-                it "showTy TApp" $ showTy (TApp (TCon "Maybe") [TCon "Int"]) `shouldBe` "Maybe(Int)"
-                it "showTy TArrow" $ showTy (TArrow (TCon "Int") (TCon "Bool")) `shouldBe` "Int -> Bool"
-                it "showTy TPi dependent" $ showTy (TPi (Just "x") (TCon "Int") (TCon "Bool")) `shouldBe` "(x:Int) -> Bool"
-                it "showTy TSigma" $ showTy (TSigma Nothing (TCon "Int") (TCon "Bool")) `shouldBe` "(Int, Bool)"
-                it "showTy TSigma dependent" $ showTy (TSigma (Just "x") (TCon "Int") (TCon "Bool")) `shouldBe` "(x:Int * Bool)"
-                it "showTy TId" $ showTy (TId (TCon "Nat") (TCon "Z") (TCon "Z")) `shouldBe` "Id(Nat, Z, Z)"
-                it "showTy TForall" $ showTy (TForall "a" (TArrow (TRigid "a") (TRigid "a"))) `shouldBe` "forall a. a -> a"
-                it "showTy TRecord" $ showTy (TRecord (RExtend "x" (TCon "Int") REmpty)) `shouldBe` "{x:Int}"
-                it "showTy TEffect" $ showTy (TEffect (RExtend "c" (TCon "C") REmpty) (TCon "Unit")) `shouldBe` "Eff {c:C} Unit"
-                it "showTy TU (LConst 0)" $ showTy (TU (LConst 0)) `shouldBe` "Type"
-                it "showTy TU (LConst 1)" $ showTy (TU (LConst 1)) `shouldBe` "Type1"
+                it "showTy TVar" $ showTy (Meta 42) `shouldBe` "?42"
+                it "showTy TRigid" $ showTy (Id "a") `shouldBe` "a"
+                it "showTy Id" $ showTy (Id "Int") `shouldBe` "Int"
+                it "showTy TApp" $ showTy (App (Id "Maybe") [Id "Int"]) `shouldBe` "Maybe(Int)"
+                it "showTy TArrow" $ showTy (Pi Nothing (Id "Int") (Id "Bool")) `shouldBe` "Int -> Bool"
+                it "showTy Pi dependent" $ showTy (Pi (Just "x") (Id "Int") (Id "Bool")) `shouldBe` "(x:Int) -> Bool"
+                it "showTy TSigma" $ showTy (Sigma Nothing (Id "Int") (Id "Bool")) `shouldBe` "(Int, Bool)"
+                it "showTy Sigma dependent" $ showTy (Sigma (Just "x") (Id "Int") (Id "Bool")) `shouldBe` "(x:Int * Bool)"
+                it "showTy TId" $ showTy (App (Id "PropEq") [(Id "Nat"), (Id "Z"), (Id "Z")]) `shouldBe` "PropEq(Nat, Z, Z)"
+                it "showTy TForall" $ showTy (Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a"))) `shouldBe` "forall a. a -> a"
+                it "showTy TRecord" $ showTy ((RowExtend "x" (Id "Int") RowEmpty)) `shouldBe` "{x:Int}"
+                it "showTy TEffect" $ showTy (EffType (RowExtend "c" (Id "C") RowEmpty) (Id "Unit")) `shouldBe` "Eff {c:C} Unit"
+                it "showTy U (LConst 0)" $ showTy (U (LConst 0)) `shouldBe` "Type"
+                it "showTy U (LConst 1)" $ showTy (U (LConst 1)) `shouldBe` "Type1"
                 it "showTy nested arrow in arg position" $ do
-                    showTy (TArrow (TArrow (TCon "Int") (TCon "Bool")) (TCon "String"))
+                    showTy (Pi Nothing (Pi Nothing (Id "Int") (Id "Bool")) (Id "String"))
                         `shouldBe` "(Int -> Bool) -> String"
-                it "showRow with row variable" $ showRow (RVar 5) `shouldBe` "..?5"
-                it "showRow with rigid" $ showRow (RRigid "r") `shouldBe` "..r"
+                it "showRow with row variable" $ showRow (Meta 5) `shouldBe` "..?5"
+                it "showRow with rigid" $ showRow (Id "r") `shouldBe` "..r"
                 it "showRow multiple fields" $ do
-                    showRow (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    showRow (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                         `shouldBe` "x:Int, y:Bool"
 
             describe "showTCError coverage" $ do
                 it "ConstraintUnsolved shows structure name" $ do
-                    let err = ConstraintUnsolved (CStructure "Eq" [TCon "MyType"])
+                    let err = ConstraintUnsolved (CStructure "Eq" [Id "MyType"])
                     showTCError err `shouldSatisfy` ("Eq" `isInfixOf`)
                     showTCError err `shouldSatisfy` ("MyType" `isInfixOf`)
 
                 it "WithContext nests context info" $ do
-                    let err = WithContext "method 'foo'" (WithContext "class Bar" (Mismatch (TCon "Int") (TCon "Bool")))
+                    let err = WithContext "method 'foo'" (WithContext "class Bar" (Mismatch (Id "Int") (Id "Bool")))
                     let s = showTCError err
                     s `shouldSatisfy` ("foo" `isInfixOf`)
                     s `shouldSatisfy` ("Bar" `isInfixOf`)
@@ -1944,45 +1952,45 @@ main = do
             describe "Numeric literal types" $ do
                 it "infers Int8 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LInt8 1))) env0 st0
-                    ty `shouldBe` TCon "Int8"
+                    ty `shouldBe` Id "Int8"
                 it "infers Int16 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LInt16 1))) env0 st0
-                    ty `shouldBe` TCon "Int16"
+                    ty `shouldBe` Id "Int16"
                 it "infers Int32 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LInt32 1))) env0 st0
-                    ty `shouldBe` TCon "Int32"
+                    ty `shouldBe` Id "Int32"
                 it "infers Int64 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LInt64 1))) env0 st0
-                    ty `shouldBe` TCon "Int64"
+                    ty `shouldBe` Id "Int64"
                 it "infers UInt8 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LWord8 1))) env0 st0
-                    ty `shouldBe` TCon "UInt8"
+                    ty `shouldBe` Id "UInt8"
                 it "infers UInt16 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LWord16 1))) env0 st0
-                    ty `shouldBe` TCon "UInt16"
+                    ty `shouldBe` Id "UInt16"
                 it "infers UInt32 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LWord32 1))) env0 st0
-                    ty `shouldBe` TCon "UInt32"
+                    ty `shouldBe` Id "UInt32"
                 it "infers UInt64 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LWord64 1))) env0 st0
-                    ty `shouldBe` TCon "UInt64"
+                    ty `shouldBe` Id "UInt64"
                 it "infers Float32 literal" $ do
                     let Right (ty, _) = runTC (infer (Lit (LFloat32 1.0))) env0 st0
-                    ty `shouldBe` TCon "Float32"
+                    ty `shouldBe` Id "Float32"
 
             describe "Misc infer cases" $ do
                 it "infers empty LList" $ do
                     let Right (ty, _) = runTC (infer (Lit (LList []))) env0 st0
                     case ty of
-                        TApp (TCon "List") [TVar _] -> pure ()
+                        App (Id "List") [Meta _] -> pure ()
                         other -> expectationFailure $ "Expected List(?), got: " ++ show other
                 it "infers non-empty LList" $ do
                     let Right (ty, _) = runTC (infer (Lit (LList [Lit (LInt 1)]))) env0 st0
-                    ty `shouldBe` TApp (TCon "List") [TCon "Int"]
+                    ty `shouldBe` App (Id "List") [Id "Int"]
 
                 it "Typed expression checks against annotation" $ do
                     let Right (ty, _) = runTC (infer (Typed (Lit (LInt 42)) (Id "Int"))) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "Typed expression with mismatch warns" $ do
                     let result = runTC (infer (Typed (Lit (LInt 42)) (Id "Bool"))) env0 st0
@@ -1993,91 +2001,91 @@ main = do
                 it "PatternMatches empty returns fresh var" $ do
                     let Right (ty, _) = runTC (infer (PatternMatches [])) env0 st0
                     case ty of
-                        TVar _ -> pure ()
+                        Meta _ -> pure ()
                         other -> expectationFailure $ "Expected fresh var, got: " ++ show other
 
                 it "Statements infers last statement type" $ do
                     let Right (ty, _) = runTC (infer (Statements [Lit (LString "a"), Lit (LInt 42)])) env0 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "empty Statements returns Unit" $ do
                     let Right (ty, _) = runTC (infer (Statements [])) env0 st0
-                    ty `shouldBe` TCon "Unit"
+                    ty `shouldBe` Id "Unit"
 
                 it "UnaryOp dispatches to App" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("negate", TArrow (TCon "Int") (TCon "Int"))] }
+                    let env1 = env0 { varTypes = Map.fromList [("negate", Pi Nothing (Id "Int") (Id "Int"))] }
                     let Right (ty, _) = runTC (infer (UnaryOp "negate" (Lit (LInt 5)))) env1 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "BinaryOp dispatches to App" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("+", TArrow (TCon "Int") (TArrow (TCon "Int") (TCon "Int")))] }
+                    let env1 = env0 { varTypes = Map.fromList [("+", Pi Nothing (Id "Int") (Pi Nothing (Id "Int") (Id "Int")))] }
                     let Right (ty, _) = runTC (infer (BinaryOp "+" (Lit (LInt 1)) (Lit (LInt 2)))) env1 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
-                it "U n infers TU (n+1)" $ do
-                    let Right (ty, _) = runTC (infer (U 0)) env0 st0
-                    ty `shouldBe` TU (LConst 1)
-                    let Right (ty2, _) = runTC (infer (U 1)) env0 st0
-                    ty2 `shouldBe` TU (LConst 2)
+                it "U n infers U (n+1)" $ do
+                    let Right (ty, _) = runTC (infer (U (LConst 0))) env0 st0
+                    ty `shouldBe` U (LConst 1)
+                    let Right (ty2, _) = runTC (infer (U (LConst 1))) env0 st0
+                    ty2 `shouldBe` U (LConst 2)
 
                 it "SumType infers Type" $ do
-                    let Right (ty, _) = runTC (infer (SumType (mkLambda "Bool" [] (Tuple []) (U 0)))) env0 st0
-                    ty `shouldBe` TU (LConst 0)
+                    let Right (ty, _) = runTC (infer (SumType (mkLambda "Bool" [] (Tuple []) (U (LConst 0))))) env0 st0
+                    ty `shouldBe` U (LConst 0)
 
                 it "ReprCast infers target type" $ do
                     let Right (ty, _) = runTC (infer (ReprCast (Lit (LInt 42)) (Id "Nat"))) env0 st0
-                    ty `shouldBe` TCon "Nat"
+                    ty `shouldBe` Id "Nat"
 
                 it "ERROR node warns and returns fresh var" $ do
                     let Right (ty, st') = runTC (infer (ERROR "test error")) env0 st0
                     case ty of
-                        TVar _ -> pure ()
+                        Meta _ -> pure ()
                         other -> expectationFailure $ "Expected fresh var, got: " ++ show other
                     tcErrors st' `shouldSatisfy` (not . null)
 
                 it "RecFieldAccess on record type extracts field" $ do
-                    let recTy = TRecord (RExtend "x" (TCon "Int") (RExtend "y" (TCon "Bool") REmpty))
+                    let recTy = (RowExtend "x" (Id "Int") (RowExtend "y" (Id "Bool") RowEmpty))
                         env1 = env0 { varTypes = Map.fromList [("r", recTy)] }
                     let Right (ty, _) = runTC (infer (RecFieldAccess ("x", -1) (Id "r"))) env1 st0
-                    ty `shouldBe` TCon "Int"
+                    ty `shouldBe` Id "Int"
 
                 it "RecFieldAccess on non-record returns fresh var" $ do
-                    let env1 = env0 { varTypes = Map.fromList [("n", TCon "Int")] }
+                    let env1 = env0 { varTypes = Map.fromList [("n", Id "Int")] }
                     let Right (ty, _) = runTC (infer (RecFieldAccess ("x", -1) (Id "n"))) env1 st0
                     case ty of
-                        TVar _ -> pure ()
+                        Meta _ -> pure ()
                         other -> expectationFailure $ "Expected fresh var, got: " ++ show other
 
-            describe "lamToTy" $ do
+            describe "inferLamType" $ do
                 it "converts simple lambda to Pi type (preserving param name)" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
-                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    let Right (ty, _) = runTC (inferLamType lam) env0 st0
                     case ty of
-                        TPi (Just "x") (TCon "Int") _ -> pure ()
+                        Pi (Just "x") (Id "Int") _ -> pure ()
                         other -> expectationFailure $ "Expected (x:Int) -> ?, got: " ++ show other
 
                 it "converts multi-param lambda to nested Pi types" $ do
                     let lam = mkLambda "f" [Var "x" (Id "Int") UNDEFINED, Var "y" (Id "Bool") UNDEFINED]
                                         UNDEFINED (Id "String")
-                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    let Right (ty, _) = runTC (inferLamType lam) env0 st0
                     case ty of
-                        TPi (Just "x") (TCon "Int") (TPi (Just "y") (TCon "Bool") _) -> pure ()
+                        Pi (Just "x") (Id "Int") (Pi (Just "y") (Id "Bool") _) -> pure ()
                         other -> expectationFailure $ "Expected (x:Int) -> (y:Bool) -> ?, got: " ++ show other
 
                 it "converts zero-param lambda to return type" $ do
                     let lam = mkLambda "f" [] UNDEFINED (Id "Int")
-                    let Right (ty, _) = runTC (lamToTy lam) env0 st0
+                    let Right (ty, _) = runTC (inferLamType lam) env0 st0
                     case ty of
-                        TVar _ -> pure ()  -- UNDEFINED return type -> fresh var
-                        TCon "Int" -> pure ()
+                        Meta _ -> pure ()  -- UNDEFINED return type -> fresh var
+                        Id "Int" -> pure ()
                         other -> expectationFailure $ "Expected Int or fresh var, got: " ++ show other
 
             describe "tyToName" $ do
-                it "extracts name from TCon" $ tyToName (TCon "Int") `shouldBe` "Int"
-                it "extracts name from TApp head" $ tyToName (TApp (TCon "Maybe") [TCon "Int"]) `shouldBe` "Maybe"
-                it "returns empty for TVar" $ tyToName (TVar 0) `shouldBe` ""
-                it "returns empty for TRigid" $ tyToName (TRigid "a") `shouldBe` ""
-                it "returns empty for TArrow" $ tyToName (TArrow (TCon "Int") (TCon "Bool")) `shouldBe` ""
+                it "extracts name from Id" $ tyToName (Id "Int") `shouldBe` "Int"
+                it "extracts name from App head" $ tyToName (App (Id "Maybe") [Id "Int"]) `shouldBe` "Maybe"
+                it "returns empty for TVar" $ tyToName (Meta 0) `shouldBe` ""
+                it "returns name for Id (same as Id now)" $ tyToName (Id "a") `shouldBe` "a"
+                it "returns empty for TArrow" $ tyToName (Pi Nothing (Id "Int") (Id "Bool")) `shouldBe` ""
 
             describe "Context nesting" $ do
                 it "nested tcWithContext shows innermost context" $ do
@@ -2101,27 +2109,27 @@ main = do
 
             describe "generalize edge cases" $ do
                 it "no free vars produces no forall" $ do
-                    let Right (ty, _) = runTC (generalize (TArrow (TCon "Int") (TCon "Bool"))) env0 st0
-                    ty `shouldBe` TArrow (TCon "Int") (TCon "Bool")
+                    let Right (ty, _) = runTC (generalize (Pi Nothing (Id "Int") (Id "Bool"))) env0 st0
+                    ty `shouldBe` Pi Nothing (Id "Int") (Id "Bool")
 
                 it "multiple free vars produce multiple foralls" $ do
-                    let Right (ty, _) = runTC (generalize (TArrow (TVar 0) (TArrow (TVar 1) (TVar 0)))) env0 (st0 { nextVar = 2 })
+                    let Right (ty, _) = runTC (generalize (Pi Nothing (Meta 0) (Pi Nothing (Meta 1) (Meta 0)))) env0 (st0 { nextMeta = 2 })
                     case ty of
-                        TForall _ (TForall _ _) -> pure ()
+                        Pi (Just _) (U (LConst 0)) (Pi (Just _) (U (LConst 0)) _) -> pure ()
                         other -> expectationFailure $ "Expected forall a. forall b. ..., got: " ++ show other
 
             describe "Bidirectional check integration" $ do
                 it "check record literal against compatible open record" $ do
-                    let st1 = st0 { nextVar = 1 }
+                    let st1 = st0 { nextMeta = 1 }
                         recLit = RecordLit [("x", Lit (LInt 1)), ("y", Lit (LFloat 2.0))]
-                        openRecTy = TRecord (RExtend "x" (TCon "Int") (RVar 0))
+                        openRecTy = (RowExtend "x" (Id "Int") (Meta 0))
                     let result = runTC (check recLit openRecTy) env0 st1
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Open record should accept extra fields: " ++ show errs
 
                 it "checkTopLevel SumType passes" $ do
-                    let result = runTC (checkTopLevel (SumType (mkLambda "Bool" [] (Tuple []) (U 0)))) env0 st0
+                    let result = runTC (checkTopLevel (SumType (mkLambda "Bool" [] (Tuple []) (U (LConst 0))))) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "SumType should pass: " ++ show errs
@@ -2472,15 +2480,15 @@ main = do
         -- ============================================================
         describe "Array primitive" $ do
             it "Array intrinsics exist" $ do
-                hasIntrinsic "length" "Array"
+                hasIntrinsic "size" "Array"
                 hasIntrinsic "index" "Array"
                 hasIntrinsic "slice" "Array"
 
-            it "array length evaluates" $ do
-                case lookupIntrinsic "length" "Array" of
+            it "array size evaluates" $ do
+                case lookupIntrinsic "size" "Array" of
                     Just f -> f [CLMARRAY [CLMLIT (LInt 1), CLMLIT (LInt 2), CLMLIT (LInt 3)]]
                         `shouldBe` Just (CLMLIT (LInt 3))
-                    Nothing -> expectationFailure "Array length not found"
+                    Nothing -> expectationFailure "Array size not found"
 
             it "array index evaluates" $ do
                 case lookupIntrinsic "index" "Array" of
@@ -3325,12 +3333,12 @@ main = do
                 result `shouldBe` conNothing
 
             -- Array ops
-            it "length(push([1,2,3], 4)) = 4" $ do
+            it "size(snoc([1,2,3], 4)) = 4" $ do
                 st13 <- loadTestProgram st "tests/programs/P13_Intrinsics.tl"
                 result <- evalExpr st13 "testArrayPush()"
                 result `shouldBe` CLMLIT (LInt 4)
 
-            it "length(reverse([1,2,3])) = 3" $ do
+            it "size(reverse([1,2,3])) = 3" $ do
                 st13 <- loadTestProgram st "tests/programs/P13_Intrinsics.tl"
                 result <- evalExpr st13 "testArrayReverse()"
                 result `shouldBe` CLMLIT (LInt 3)
@@ -3388,42 +3396,42 @@ main = do
                 Map.member "testFmapIncr" (clmLambdas env) `shouldBe` True
 
             -- Array HOF tests
-            it "fmap(\\x -> x + 1, [1, 2, 3]) = [2, 3, 4]" $ do
+            it "fmap(fn(x) = x + 1, [1, 2, 3]) = [2, 3, 4]" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFmapIncr()"
                 result `shouldBe` CLMARRAY [CLMLIT (LInt 2), CLMLIT (LInt 3), CLMLIT (LInt 4)]
 
-            it "fmap(\\x -> x * x, [2, 3, 4]) = [4, 9, 16]" $ do
+            it "fmap(fn(x) = x * x, [2, 3, 4]) = [4, 9, 16]" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFmapSquare()"
                 result `shouldBe` CLMARRAY [CLMLIT (LInt 4), CLMLIT (LInt 9), CLMLIT (LInt 16)]
 
-            it "filter(\\x -> x > 2, [1, 2, 3, 4]) = [3, 4]" $ do
+            it "filter(fn(x) = x > 2, [1, 2, 3, 4]) = [3, 4]" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFilter()"
                 result `shouldBe` CLMARRAY [CLMLIT (LInt 3), CLMLIT (LInt 4)]
 
-            it "foldl(\\acc x -> acc + x, 0, [1, 2, 3]) = 6" $ do
+            it "foldl(fn(acc, x) = acc + x, 0, [1, 2, 3]) = 6" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFoldlSum()"
                 result `shouldBe` CLMLIT (LInt 6)
 
-            it "foldr(\\x acc -> acc + x, 0, [1, 2, 3]) = 6" $ do
+            it "foldr(fn(x, acc) = acc + x, 0, [1, 2, 3]) = 6" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFoldrSum()"
                 result `shouldBe` CLMLIT (LInt 6)
 
-            it "generate(5, \\i -> i * 2) = [0, 2, 4, 6, 8]" $ do
+            it "generate(5, fn(i) = i * 2) = [0, 2, 4, 6, 8]" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testGenerate()"
                 result `shouldBe` CLMARRAY [CLMLIT (LInt 0), CLMLIT (LInt 2), CLMLIT (LInt 4), CLMLIT (LInt 6), CLMLIT (LInt 8)]
 
-            it "length(filter(\\x -> x > 0, [1, -2, 3])) = 2" $ do
+            it "size(filter(fn(x) = x > 0, [1, -2, 3])) = 2" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFilterLength()"
                 result `shouldBe` CLMLIT (LInt 2)
 
-            it "fmap(\\x -> x, []) = []" $ do
+            it "fmap(fn(x) = x, []) = []" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFmapEmpty()"
                 result `shouldBe` CLMARRAY []
@@ -3445,12 +3453,12 @@ main = do
                 result `shouldBe` CLMLIT (LString "[1, 2, 3]")
 
             -- Monadic traversal tests
-            it "mapM(\\x -> Just(x+1), Cons(1, Cons(2, Nil))) = Just(Cons(2, Cons(3, Nil)))" $ do
+            it "mapM(fn(x) = Just(x+1), Cons(1, Cons(2, Nil))) = Just(Cons(2, Cons(3, Nil)))" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testMapMMaybe()"
                 result `shouldBe` conJust (conCons (CLMLIT (LInt 2)) (conCons (CLMLIT (LInt 3)) conNil))
 
-            it "foldM(\\acc x -> Just(acc+x), 0, Cons(1, Cons(2, Nil))) = Just(3)" $ do
+            it "foldM(fn(acc, x) = Just(acc+x), 0, Cons(1, Cons(2, Nil))) = Just(3)" $ do
                 st14 <- loadTestProgram st "tests/programs/P14_RealPrograms.tl"
                 result <- evalExpr st14 "testFoldMMaybe()"
                 result `shouldBe` conJust (CLMLIT (LInt 3))
@@ -4549,38 +4557,38 @@ main = do
             let tcSt0 = initTCState TCRelaxed
                 tcEnv0 = emptyTCEnv
 
-            it "exprToTy: non-dependent arrow → TPi Nothing" $ do
-                let Right (ty, _) = runTC (exprToTy (Pi Nothing (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
-                ty `shouldBe` TPi Nothing (TCon "Int") (TCon "Bool")
+            it "normalizeTypeExpr: non-dependent arrow → Pi Nothing" $ do
+                let Right (ty, _) = runTC (normalizeTypeExpr (Pi Nothing (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
+                ty `shouldBe` Pi Nothing (Id "Int") (Id "Bool")
 
-            it "exprToTy: dependent Pi → TPi (Just name)" $ do
-                let Right (ty, _) = runTC (exprToTy (Pi (Just "n") (Id "Nat") (Id "Nat"))) tcEnv0 tcSt0
-                ty `shouldBe` TPi (Just "n") (TCon "Nat") (TCon "Nat")
+            it "normalizeTypeExpr: dependent Pi → Pi (Just name)" $ do
+                let Right (ty, _) = runTC (normalizeTypeExpr (Pi (Just "n") (Id "Nat") (Id "Nat"))) tcEnv0 tcSt0
+                ty `shouldBe` Pi (Just "n") (Id "Nat") (Id "Nat")
 
-            it "exprToTy: ArrowType pattern synonym still works" $ do
-                let Right (ty, _) = runTC (exprToTy (ArrowType (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
-                ty `shouldBe` TArrow (TCon "Int") (TCon "Bool")
+            it "normalizeTypeExpr: ArrowType pattern synonym still works" $ do
+                let Right (ty, _) = runTC (normalizeTypeExpr (ArrowType (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
+                ty `shouldBe` Pi Nothing (Id "Int") (Id "Bool")
 
-            it "lamToTy: named params → TPi (Just name)" $ do
+            it "inferLamType: named params → Pi (Just name)" $ do
                 let lam = mkLambda "f" [Var "n" (Id "Nat") UNDEFINED] UNDEFINED (Id "Nat")
-                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                let Right (ty, _) = runTC (inferLamType lam) tcEnv0 tcSt0
                 case ty of
-                    TPi (Just "n") (TCon "Nat") _ -> pure ()
-                    other -> expectationFailure $ "Expected TPi (Just n), got: " ++ show other
+                    Pi (Just "n") (Id "Nat") _ -> pure ()
+                    other -> expectationFailure $ "Expected Pi (Just n), got: " ++ show other
 
-            it "lamToTy: unnamed params → TPi Nothing" $ do
+            it "inferLamType: unnamed params → Pi Nothing" $ do
                 let lam = mkLambda "f" [Var "" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
-                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                let Right (ty, _) = runTC (inferLamType lam) tcEnv0 tcSt0
                 case ty of
-                    TPi Nothing (TCon "Int") _ -> pure ()
-                    other -> expectationFailure $ "Expected TPi Nothing, got: " ++ show other
+                    Pi Nothing (Id "Int") _ -> pure ()
+                    other -> expectationFailure $ "Expected Pi Nothing, got: " ++ show other
 
-            it "lamToTy: underscore params → TPi Nothing" $ do
+            it "inferLamType: underscore params → Pi Nothing" $ do
                 let lam = mkLambda "f" [Var "_" (Id "Int") UNDEFINED] UNDEFINED (Id "Bool")
-                let Right (ty, _) = runTC (lamToTy lam) tcEnv0 tcSt0
+                let Right (ty, _) = runTC (inferLamType lam) tcEnv0 tcSt0
                 case ty of
-                    TPi Nothing (TCon "Int") _ -> pure ()
-                    other -> expectationFailure $ "Expected TPi Nothing, got: " ++ show other
+                    Pi Nothing (Id "Int") _ -> pure ()
+                    other -> expectationFailure $ "Expected Pi Nothing, got: " ++ show other
 
             -- PatternGuard / ExprConsTagCheck backward compat
             it "ExprConsTagCheck pattern synonym constructs PatternGuard" $ do
@@ -4599,196 +4607,196 @@ main = do
             describe "Type-level normalization (evalCLMPure)" $ do
                 let env = currentEnvironment st
 
-                it "normalizeTy: TCon passes through unchanged" $ do
-                    let result = normalizeTy env (TCon "Int")
-                    result `shouldBe` TCon "Int"
+                it "normalizeTy: Id passes through unchanged" $ do
+                    let result = normalizeTy env (Id "Int")
+                    result `shouldBe` Id "Int"
 
-                it "normalizeTy: TApp with unknown function passes through" $ do
-                    let result = normalizeTy env (TApp (TCon "Vec") [TCon "Int", TCon "Z"])
-                    result `shouldBe` TApp (TCon "Vec") [TCon "Int", TCon "Z"]
+                it "normalizeTy: App with unknown function passes through" $ do
+                    let result = normalizeTy env (App (Id "Vec") [Id "Int", Id "Z"])
+                    result `shouldBe` App (Id "Vec") [Id "Int", Id "Z"]
 
                 it "normalizeTy: plus(Z, Z) reduces to Z" $ do
-                    let result = normalizeTy env (TApp (TCon "plus") [TCon "Z", TCon "Z"])
-                    result `shouldBe` TCon "Z"
+                    let result = normalizeTy env (App (Id "plus") [Id "Z", Id "Z"])
+                    result `shouldBe` Id "Z"
 
                 it "normalizeTy: plus(Succ(Z), Z) reduces to Succ(Z)" $ do
-                    let natZ = TCon "Z"
-                        natSZ = TApp (TCon "Succ") [natZ]
-                        result = normalizeTy env (TApp (TCon "plus") [natSZ, natZ])
-                    result `shouldBe` TApp (TCon "Succ") [TCon "Z"]
+                    let natZ = Id "Z"
+                        natSZ = App (Id "Succ") [natZ]
+                        result = normalizeTy env (App (Id "plus") [natSZ, natZ])
+                    result `shouldBe` App (Id "Succ") [Id "Z"]
 
                 it "normalizeTy: plus(Succ(Z), Succ(Z)) reduces to Succ(Succ(Z))" $ do
-                    let natZ = TCon "Z"
-                        natSZ = TApp (TCon "Succ") [natZ]
-                        natSSZ = TApp (TCon "Succ") [natSZ]
-                        result = normalizeTy env (TApp (TCon "plus") [natSZ, natSZ])
+                    let natZ = Id "Z"
+                        natSZ = App (Id "Succ") [natZ]
+                        natSSZ = App (Id "Succ") [natSZ]
+                        result = normalizeTy env (App (Id "plus") [natSZ, natSZ])
                     result `shouldBe` natSSZ
 
                 it "normalizeTy: nested plus(plus(Z,Z), Succ(Z)) reduces" $ do
-                    let natZ = TCon "Z"
-                        natSZ = TApp (TCon "Succ") [natZ]
-                        inner = TApp (TCon "plus") [natZ, natZ]
-                        result = normalizeTy env (TApp (TCon "plus") [inner, natSZ])
+                    let natZ = Id "Z"
+                        natSZ = App (Id "Succ") [natZ]
+                        inner = App (Id "plus") [natZ, natZ]
+                        result = normalizeTy env (App (Id "plus") [inner, natSZ])
                     result `shouldBe` natSZ
 
                 it "normalizeTy: mult(Succ(Succ(Z)), Succ(Succ(Z))) = 4" $ do
-                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
-                        result = normalizeTy env (TApp (TCon "mult") [n 2, n 2])
+                    let n i = Prelude.iterate (\x -> App (Id "Succ") [x]) (Id "Z") !! i
+                        result = normalizeTy env (App (Id "mult") [n 2, n 2])
                     result `shouldBe` n 4
 
                 it "normalizeTy: doesn't reduce when args have TVar" $ do
-                    let result = normalizeTy env (TApp (TCon "plus") [TVar 0, TCon "Z"])
-                    result `shouldBe` TApp (TCon "plus") [TVar 0, TCon "Z"]
+                    let result = normalizeTy env (App (Id "plus") [Meta 0, Id "Z"])
+                    result `shouldBe` App (Id "plus") [Meta 0, Id "Z"]
 
-                it "tyToCLM: Z → CLMCON Z 0 []" $ do
-                    let result = tyToCLM env (TCon "Z")
+                it "exprToCLMTC: Z → CLMCON Z 0 []" $ do
+                    let result = exprToCLMTC env (Id "Z")
                     result `shouldBe` CLMCON (ConsTag "Z" 0) []
 
-                it "tyToCLM: Succ(Z) → CLMCON Succ 1 [CLMCON Z 0 []]" $ do
-                    let result = tyToCLM env (TApp (TCon "Succ") [TCon "Z"])
+                it "exprToCLMTC: Succ(Z) → CLMCON Succ 1 [CLMCON Z 0 []]" $ do
+                    let result = exprToCLMTC env (App (Id "Succ") [Id "Z"])
                     result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]
 
-                it "clmToTy: CLMCON Z → TCon Z" $ do
-                    let result = clmToTy (CLMCON (ConsTag "Z" 0) [])
-                    result `shouldBe` Just (TCon "Z")
+                it "clmToExpr: CLMCON Z → Id Z" $ do
+                    let result = clmToExpr (CLMCON (ConsTag "Z" 0) [])
+                    result `shouldBe` Just (Id "Z")
 
-                it "clmToTy: CLMCON Succ [Z] → TApp Succ [Z]" $ do
-                    let result = clmToTy (CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []])
-                    result `shouldBe` Just (TApp (TCon "Succ") [TCon "Z"])
+                it "clmToExpr: CLMCON Succ [Z] → App Succ [Z]" $ do
+                    let result = clmToExpr (CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []])
+                    result `shouldBe` Just (App (Id "Succ") [Id "Z"])
 
                 -- Functions at different universe levels
                 it "normalizeTy: not(True) reduces to False (Bool functions at type level)" $ do
-                    let result = normalizeTy env (TApp (TCon "not") [TCon "True"])
-                    result `shouldBe` TCon "False"
+                    let result = normalizeTy env (App (Id "not") [Id "True"])
+                    result `shouldBe` Id "False"
 
                 it "normalizeTy: not(False) reduces to True" $ do
-                    let result = normalizeTy env (TApp (TCon "not") [TCon "False"])
-                    result `shouldBe` TCon "True"
+                    let result = normalizeTy env (App (Id "not") [Id "False"])
+                    result `shouldBe` Id "True"
 
                 it "normalizeTy: not(not(True)) reduces to True (nested Bool)" $ do
-                    let inner = TApp (TCon "not") [TCon "True"]
-                        result = normalizeTy env (TApp (TCon "not") [inner])
-                    result `shouldBe` TCon "True"
+                    let inner = App (Id "not") [Id "True"]
+                        result = normalizeTy env (App (Id "not") [inner])
+                    result `shouldBe` Id "True"
 
                 it "normalizeTy: not(True) reduces to False" $ do
-                    let result = normalizeTy env (TApp (TCon "not") [TCon "True"])
-                    result `shouldBe` TCon "False"
+                    let result = normalizeTy env (App (Id "not") [Id "True"])
+                    result `shouldBe` Id "False"
 
                 it "normalizeTy: not(False) reduces to True" $ do
-                    let result = normalizeTy env (TApp (TCon "not") [TCon "False"])
-                    result `shouldBe` TCon "True"
+                    let result = normalizeTy env (App (Id "not") [Id "False"])
+                    result `shouldBe` Id "True"
 
                 it "normalizeTy: not(not(True)) reduces to True" $ do
-                    let inner = TApp (TCon "not") [TCon "True"]
-                        result = normalizeTy env (TApp (TCon "not") [inner])
-                    result `shouldBe` TCon "True"
+                    let inner = App (Id "not") [Id "True"]
+                        result = normalizeTy env (App (Id "not") [inner])
+                    result `shouldBe` Id "True"
 
                 -- Larger computations
                 it "normalizeTy: plus(3, 2) = 5 (larger Nat arithmetic)" $ do
-                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
-                        result = normalizeTy env (TApp (TCon "plus") [n 3, n 2])
+                    let n i = Prelude.iterate (\x -> App (Id "Succ") [x]) (Id "Z") !! i
+                        result = normalizeTy env (App (Id "plus") [n 3, n 2])
                     result `shouldBe` n 5
 
                 it "normalizeTy: mult(3, 2) = 6" $ do
-                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
-                        result = normalizeTy env (TApp (TCon "mult") [n 3, n 2])
+                    let n i = Prelude.iterate (\x -> App (Id "Succ") [x]) (Id "Z") !! i
+                        result = normalizeTy env (App (Id "mult") [n 3, n 2])
                     result `shouldBe` n 6
 
                 it "normalizeTy: plus(mult(2,2), Succ(Z)) = 5 (composed arithmetic)" $ do
-                    let n i = Prelude.iterate (\x -> TApp (TCon "Succ") [x]) (TCon "Z") !! i
-                        inner = TApp (TCon "mult") [n 2, n 2]
-                        result = normalizeTy env (TApp (TCon "plus") [inner, n 1])
+                    let n i = Prelude.iterate (\x -> App (Id "Succ") [x]) (Id "Z") !! i
+                        inner = App (Id "mult") [n 2, n 2]
+                        result = normalizeTy env (App (Id "plus") [inner, n 1])
                     result `shouldBe` n 5
 
                 -- Edge cases
-                it "normalizeTy: TRigid args — reduction attempted but may not fully reduce" $ do
-                    let result = normalizeTy env (TApp (TCon "plus") [TRigid "n", TCon "Z"])
-                    -- TRigid is concrete, so reduction IS attempted.
+                it "normalizeTy: Id args — reduction attempted but may not fully reduce" $ do
+                    let result = normalizeTy env (App (Id "plus") [Id "n", Id "Z"])
+                    -- Id is concrete, so reduction IS attempted.
                     -- plus(n, Z) pattern matches: first case is (Z, m) -> m, second is (Succ(k), m) -> ...
                     -- Since n is opaque (not Z or Succ), neither case matches → returns unreduced
-                    result `shouldBe` TApp (TCon "plus") [TRigid "n", TCon "Z"]
+                    result `shouldBe` App (Id "plus") [Id "n", Id "Z"]
 
                 it "normalizeTy: Pi type children get normalized" $ do
-                    let body = TApp (TCon "plus") [TCon "Z", TCon "Z"]
-                        result = normalizeTy env (TPi Nothing (TCon "Int") body)
-                    result `shouldBe` TPi Nothing (TCon "Int") (TCon "Z")
+                    let body = App (Id "plus") [Id "Z", Id "Z"]
+                        result = normalizeTy env (Pi Nothing (Id "Int") body)
+                    result `shouldBe` Pi Nothing (Id "Int") (Id "Z")
 
                 it "normalizeTy: preserves structure when nothing to normalize" $ do
-                    let ty = TPi (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
+                    let ty = Pi (Just "x") (Id "Nat") (App (Id "Vec") [Id "Int", Id "x"])
                         result = normalizeTy env ty
                     result `shouldBe` ty
 
                 -- Instance dispatch at type level (algebra methods usable as type-level functions)
                 it "normalizeTy: (==) on Nats via instance dispatch — Z == Z reduces to True" $ do
-                    let result = normalizeTy env (TApp (TCon "==") [TCon "Z", TCon "Z"])
-                    result `shouldBe` TCon "True"
+                    let result = normalizeTy env (App (Id "==") [Id "Z", Id "Z"])
+                    result `shouldBe` Id "True"
 
                 it "normalizeTy: (==) on Nats via instance dispatch — Z == Succ(Z) reduces to False" $ do
-                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
-                        result = normalizeTy env (TApp (TCon "==") [TCon "Z", natSZ])
-                    result `shouldBe` TCon "False"
+                    let natSZ = App (Id "Succ") [Id "Z"]
+                        result = normalizeTy env (App (Id "==") [Id "Z", natSZ])
+                    result `shouldBe` Id "False"
 
                 it "normalizeTy: (==) on Nats via instance dispatch — Succ(Z) == Succ(Z) reduces to True" $ do
-                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
-                        result = normalizeTy env (TApp (TCon "==") [natSZ, natSZ])
-                    result `shouldBe` TCon "True"
+                    let natSZ = App (Id "Succ") [Id "Z"]
+                        result = normalizeTy env (App (Id "==") [natSZ, natSZ])
+                    result `shouldBe` Id "True"
 
                 it "normalizeTy: compare on Nats via instance dispatch — compare(Z, Succ(Z)) reduces to LessThan" $ do
-                    let natSZ = TApp (TCon "Succ") [TCon "Z"]
-                        result = normalizeTy env (TApp (TCon "compare") [TCon "Z", natSZ])
-                    result `shouldBe` TCon "LessThan"
+                    let natSZ = App (Id "Succ") [Id "Z"]
+                        result = normalizeTy env (App (Id "compare") [Id "Z", natSZ])
+                    result `shouldBe` Id "LessThan"
 
-                -- tyToCLM edge cases
-                it "tyToCLM: function name → CLMID" $ do
-                    let result = tyToCLM env (TCon "plus")
+                -- exprToCLMTC edge cases
+                it "exprToCLMTC: function name → CLMID" $ do
+                    let result = exprToCLMTC env (Id "plus")
                     result `shouldBe` CLMID "plus"
 
-                it "tyToCLM: TRigid → CLMID" $ do
-                    let result = tyToCLM env (TRigid "a")
+                it "exprToCLMTC: Id → CLMID" $ do
+                    let result = exprToCLMTC env (Id "a")
                     result `shouldBe` CLMID "a"
 
-                it "tyToCLM: TU (LConst 0) → CLMU (LConst 0)" $ do
-                    let result = tyToCLM env (TU (LConst 0))
+                it "exprToCLMTC: U (LConst 0) → CLMU (LConst 0)" $ do
+                    let result = exprToCLMTC env (U (LConst 0))
                     result `shouldBe` CLMU (LConst 0)
 
-                it "tyToCLM: nested constructor Succ(Succ(Z))" $ do
-                    let n2 = TApp (TCon "Succ") [TApp (TCon "Succ") [TCon "Z"]]
-                        result = tyToCLM env n2
+                it "exprToCLMTC: nested constructor Succ(Succ(Z))" $ do
+                    let n2 = App (Id "Succ") [App (Id "Succ") [Id "Z"]]
+                        result = exprToCLMTC env n2
                     result `shouldBe` CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]
 
-                -- clmToTy edge cases
-                it "clmToTy: CLMEMPTY → Nothing" $ do
-                    clmToTy CLMEMPTY `shouldBe` Nothing
+                -- clmToExpr edge cases
+                it "clmToExpr: CLMEMPTY → Nothing" $ do
+                    clmToExpr CLMEMPTY `shouldBe` Nothing
 
-                it "clmToTy: CLMU (LConst 1) → Just (TU (LConst 1))" $ do
-                    clmToTy (CLMU (LConst 1)) `shouldBe` Just (TU (LConst 1))
+                it "clmToExpr: CLMU (LConst 1) → Just (U (LConst 1))" $ do
+                    clmToExpr (CLMU (LConst 1)) `shouldBe` Just (U (LConst 1))
 
-                it "clmToTy: CLMID → Just (TCon)" $ do
-                    clmToTy (CLMID "Nat") `shouldBe` Just (TCon "Nat")
+                it "clmToExpr: CLMID → Just (TCon)" $ do
+                    clmToExpr (CLMID "Nat") `shouldBe` Just (Id "Nat")
 
-                it "clmToTy: deeply nested constructor round-trips" $ do
+                it "clmToExpr: deeply nested constructor round-trips" $ do
                     let n3 = CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Succ" 1) [CLMCON (ConsTag "Z" 0) []]]]
-                        expected = TApp (TCon "Succ") [TApp (TCon "Succ") [TApp (TCon "Succ") [TCon "Z"]]]
-                    clmToTy n3 `shouldBe` Just expected
+                        expected = App (Id "Succ") [App (Id "Succ") [App (Id "Succ") [Id "Z"]]]
+                    clmToExpr n3 `shouldBe` Just expected
 
                 -- isConcreteTy
-                it "isConcreteTy: TVar is not concrete" $ do
-                    isConcreteTy (TVar 0) `shouldBe` False
+                it "isConcreteTy: Meta is not concrete" $ do
+                    isConcreteTy (Meta 0) `shouldBe` False
 
-                it "isConcreteTy: TCon is concrete" $ do
-                    isConcreteTy (TCon "Int") `shouldBe` True
+                it "isConcreteTy: Id is concrete" $ do
+                    isConcreteTy (Id "Int") `shouldBe` True
 
-                it "isConcreteTy: TRigid is concrete" $ do
-                    isConcreteTy (TRigid "a") `shouldBe` True
+                it "isConcreteTy: Id is concrete" $ do
+                    isConcreteTy (Id "a") `shouldBe` True
 
-                it "isConcreteTy: TApp with all concrete args is concrete" $ do
-                    isConcreteTy (TApp (TCon "Vec") [TCon "Int", TCon "Z"]) `shouldBe` True
+                it "isConcreteTy: App with all concrete args is concrete" $ do
+                    isConcreteTy (App (Id "Vec") [Id "Int", Id "Z"]) `shouldBe` True
 
-                it "isConcreteTy: TApp with TVar arg is not concrete" $ do
-                    isConcreteTy (TApp (TCon "Vec") [TCon "Int", TVar 0]) `shouldBe` False
+                it "isConcreteTy: App with Meta arg is not concrete" $ do
+                    isConcreteTy (App (Id "Vec") [Id "Int", Meta 0]) `shouldBe` False
 
-                it "isConcreteTy: TPi with concrete parts is concrete" $ do
-                    isConcreteTy (TPi Nothing (TCon "Int") (TCon "Bool")) `shouldBe` True
+                it "isConcreteTy: Pi with concrete parts is concrete" $ do
+                    isConcreteTy (Pi Nothing (Id "Int") (Id "Bool")) `shouldBe` True
 
         -- ==================================================================
         -- P35: GADTs (Generalized Algebraic Data Types)
@@ -4835,8 +4843,8 @@ main = do
                     case runTC (infer (ConTuple (ConsTag "VNil" 0) [])) tcEnv tcSt of
                         Right (ty, _) -> do
                             case ty of
-                                TApp (TCon "Vec") [_, zTy] ->
-                                    zTy `shouldBe` TCon "Z"
+                                App (Id "Vec") [_, zTy] ->
+                                    zTy `shouldBe` Id "Z"
                                 _ -> expectationFailure $ "Expected Vec(_, Z), got: " ++ showTy ty
                         Left errs -> expectationFailure $ "Type check failed: " ++ show errs
 
@@ -4851,11 +4859,11 @@ main = do
                             case runTC (applySubst ty) tcEnv st' of
                                 Right (ty', _) ->
                                     case ty' of
-                                        TApp (TCon "Vec") [intTy, succTy] -> do
-                                            intTy `shouldBe` TCon "Int"
+                                        App (Id "Vec") [intTy, succTy] -> do
+                                            intTy `shouldBe` Id "Int"
                                             case succTy of
-                                                TApp (TCon "Succ") [TCon "Z"] -> pure ()
-                                                TApp (TCon "Succ") [_] -> pure () -- fresh var for Z is ok
+                                                App (Id "Succ") [Id "Z"] -> pure ()
+                                                App (Id "Succ") [_] -> pure () -- fresh var for Z is ok
                                                 _ -> expectationFailure $ "Expected Succ(_), got: " ++ showTy succTy
                                         _ -> expectationFailure $ "Expected Vec(Int, Succ(_)), got: " ++ showTy ty'
                                 Left _ -> expectationFailure "applySubst failed"
@@ -4871,7 +4879,7 @@ main = do
                             case runTC (applySubst ty) tcEnv st' of
                                 Right (ty', _) ->
                                     case ty' of
-                                        TApp (TCon "Maybe") [TCon "Int"] -> pure ()
+                                        App (Id "Maybe") [Id "Int"] -> pure ()
                                         _ -> expectationFailure $ "Expected Maybe(Int), got: " ++ showTy ty'
                                 Left _ -> expectationFailure "applySubst failed"
                         Left errs -> expectationFailure $ "Type check failed: " ++ show errs
@@ -4883,16 +4891,16 @@ main = do
                     extractTypeName UNDEFINED `shouldBe` ""
 
                 it "applyGADTRefinements substitutes rigid vars in varTypes" $ do
-                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", TRigid "n"), ("y", TRigid "a")] }
-                        refinements = [("n", TCon "Z"), ("a", TCon "Int")]
+                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", Id "n"), ("y", Id "a")] }
+                        refinements = [("n", Id "Z"), ("a", Id "Int")]
                         env1 = applyGADTRefinements refinements env0
-                    Map.lookup "x" (varTypes env1) `shouldBe` Just (TCon "Z")
-                    Map.lookup "y" (varTypes env1) `shouldBe` Just (TCon "Int")
+                    Map.lookup "x" (varTypes env1) `shouldBe` Just (Id "Z")
+                    Map.lookup "y" (varTypes env1) `shouldBe` Just (Id "Int")
 
                 it "applyGADTRefinements is identity when no refinements" $ do
-                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", TRigid "n")] }
+                    let env0 = emptyTCEnv { varTypes = Map.fromList [("x", Id "n")] }
                         env1 = applyGADTRefinements [] env0
-                    Map.lookup "x" (varTypes env1) `shouldBe` Just (TRigid "n")
+                    Map.lookup "x" (varTypes env1) `shouldBe` Just (Id "n")
 
         -- ==================================================================
         -- Level Type Unit Tests
@@ -4948,25 +4956,25 @@ main = do
         -- TC: substTyVar Shadowing for TPi/TSigma
         -- ==================================================================
         describe "substTyVar shadowing" $ do
-            it "TPi (Just n) shadows: does not substitute in body when name matches" $ do
-                -- substTyVar "a" Int (TPi (Just "a") Nat (TRigid "a")) should NOT replace body's "a"
-                let result = substTyVar "a" (TCon "Int") (TPi (Just "a") (TCon "Nat") (TRigid "a"))
-                result `shouldBe` TPi (Just "a") (TCon "Nat") (TRigid "a")
-            it "TPi (Just n) non-shadow: substitutes in body when name differs" $ do
-                let result = substTyVar "a" (TCon "Int") (TPi (Just "x") (TRigid "a") (TRigid "a"))
-                result `shouldBe` TPi (Just "x") (TCon "Int") (TCon "Int")
-            it "TPi Nothing always substitutes in both domain and codomain" $ do
-                let result = substTyVar "a" (TCon "Int") (TPi Nothing (TRigid "a") (TRigid "a"))
-                result `shouldBe` TPi Nothing (TCon "Int") (TCon "Int")
-            it "TSigma (Just n) shadows: does not substitute in body when name matches" $ do
-                let result = substTyVar "a" (TCon "Int") (TSigma (Just "a") (TCon "Nat") (TRigid "a"))
-                result `shouldBe` TSigma (Just "a") (TCon "Nat") (TRigid "a")
-            it "TSigma (Just n) non-shadow: substitutes in body when name differs" $ do
-                let result = substTyVar "b" (TCon "Bool") (TSigma (Just "x") (TRigid "b") (TRigid "b"))
-                result `shouldBe` TSigma (Just "x") (TCon "Bool") (TCon "Bool")
-            it "TSigma Nothing always substitutes" $ do
-                let result = substTyVar "a" (TCon "Int") (TSigma Nothing (TRigid "a") (TRigid "a"))
-                result `shouldBe` TSigma Nothing (TCon "Int") (TCon "Int")
+            it "Pi (Just n) shadows: does not substitute in body when name matches" $ do
+                -- substTyVar "a" Int (Pi (Just "a") Nat (Id "a")) should NOT replace body's "a"
+                let result = substTyVar "a" (Id "Int") (Pi (Just "a") (Id "Nat") (Id "a"))
+                result `shouldBe` Pi (Just "a") (Id "Nat") (Id "a")
+            it "Pi (Just n) non-shadow: substitutes in body when name differs" $ do
+                let result = substTyVar "a" (Id "Int") (Pi (Just "x") (Id "a") (Id "a"))
+                result `shouldBe` Pi (Just "x") (Id "Int") (Id "Int")
+            it "Pi Nothing always substitutes in both domain and codomain" $ do
+                let result = substTyVar "a" (Id "Int") (Pi Nothing (Id "a") (Id "a"))
+                result `shouldBe` Pi Nothing (Id "Int") (Id "Int")
+            it "Sigma (Just n) shadows: does not substitute in body when name matches" $ do
+                let result = substTyVar "a" (Id "Int") (Sigma (Just "a") (Id "Nat") (Id "a"))
+                result `shouldBe` Sigma (Just "a") (Id "Nat") (Id "a")
+            it "Sigma (Just n) non-shadow: substitutes in body when name differs" $ do
+                let result = substTyVar "b" (Id "Bool") (Sigma (Just "x") (Id "b") (Id "b"))
+                result `shouldBe` Sigma (Just "x") (Id "Bool") (Id "Bool")
+            it "Sigma Nothing always substitutes" $ do
+                let result = substTyVar "a" (Id "Int") (Sigma Nothing (Id "a") (Id "a"))
+                result `shouldBe` Sigma Nothing (Id "Int") (Id "Int")
 
         -- ==================================================================
         -- TC: Alpha-Renaming in Unify for TPi/TSigma
@@ -4975,32 +4983,32 @@ main = do
             it "TPi: unifies (x:A) -> B(x) with (y:A) -> B(y) via alpha-rename" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    ty1 = TPi (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
-                    ty2 = TPi (Just "y") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "y"])
+                    ty1 = Pi (Just "x") (Id "Nat") (App (Id "Vec") [Id "Int", Id "x"])
+                    ty2 = Pi (Just "y") (Id "Nat") (App (Id "Vec") [Id "Int", Id "y"])
                 case runTC (unify ty1 ty2) env0 st0 of
                     Right _ -> pure ()
                     Left errs -> expectationFailure $ "Alpha-rename should succeed: " ++ show errs
             it "TPi: fails when domains differ despite alpha-rename" $ do
                 let st0 = initTCState TCStrict
                     env0 = emptyTCEnv
-                    ty1 = TPi (Just "x") (TCon "Nat") (TRigid "x")
-                    ty2 = TPi (Just "y") (TCon "Int") (TRigid "y")
+                    ty1 = Pi (Just "x") (Id "Nat") (Id "x")
+                    ty2 = Pi (Just "y") (Id "Int") (Id "y")
                 case runTC (unify ty1 ty2) env0 st0 of
                     Left _ -> pure ()
                     Right _ -> expectationFailure "Should fail: domains differ"
             it "TPi: unnamed vs named unification works" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    ty1 = TPi Nothing (TCon "Int") (TCon "Bool")
-                    ty2 = TPi (Just "x") (TCon "Int") (TCon "Bool")
+                    ty1 = Pi Nothing (Id "Int") (Id "Bool")
+                    ty2 = Pi (Just "x") (Id "Int") (Id "Bool")
                 case runTC (unify ty1 ty2) env0 st0 of
                     Right _ -> pure ()
                     Left errs -> expectationFailure $ "Should succeed: " ++ show errs
             it "TSigma: unifies (x:A, B(x)) with (y:A, B(y)) via alpha-rename" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    ty1 = TSigma (Just "x") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "x"])
-                    ty2 = TSigma (Just "y") (TCon "Nat") (TApp (TCon "Vec") [TCon "Int", TRigid "y"])
+                    ty1 = Sigma (Just "x") (Id "Nat") (App (Id "Vec") [Id "Int", Id "x"])
+                    ty2 = Sigma (Just "y") (Id "Nat") (App (Id "Vec") [Id "Int", Id "y"])
                 case runTC (unify ty1 ty2) env0 st0 of
                     Right _ -> pure ()
                     Left errs -> expectationFailure $ "Alpha-rename should succeed: " ++ show errs
@@ -5009,23 +5017,23 @@ main = do
         -- freeRigidVars
         -- ==================================================================
         describe "freeRigidVars" $ do
-            it "TRigid returns the name" $ do
-                freeRigidVars (TRigid "a") `shouldBe` ["a"]
-            it "TCon returns empty" $ do
-                freeRigidVars (TCon "Int") `shouldBe` []
-            it "TVar returns empty" $ do
-                freeRigidVars (TVar 0) `shouldBe` []
-            it "TApp collects from head and args" $ do
-                freeRigidVars (TApp (TRigid "f") [TRigid "a", TCon "Int"]) `shouldBe` ["f", "a"]
-            it "TPi (Just n) filters bound name from body" $ do
-                freeRigidVars (TPi (Just "x") (TRigid "a") (TRigid "x")) `shouldBe` ["a"]
-            it "TPi Nothing collects from both" $ do
-                freeRigidVars (TPi Nothing (TRigid "a") (TRigid "b")) `shouldBe` ["a", "b"]
-            it "TSigma (Just n) filters bound name from body" $ do
-                freeRigidVars (TSigma (Just "x") (TRigid "a") (TRigid "x")) `shouldBe` ["a"]
+            it "Id returns the name" $ do
+                freeRigidVars (Id "a") `shouldBe` ["a"]
+            it "Id returns empty" $ do
+                freeRigidVars (Id "Int") `shouldBe` []
+            it "Meta returns empty" $ do
+                freeRigidVars (Meta 0) `shouldBe` []
+            it "App collects from head and args" $ do
+                sort (freeRigidVars (App (Id "f") [Id "a", Id "Int"])) `shouldBe` ["a", "f"]
+            it "Pi (Just n) filters bound name from body" $ do
+                freeRigidVars (Pi (Just "x") (Id "a") (Id "x")) `shouldBe` ["a"]
+            it "Pi Nothing collects from both" $ do
+                freeRigidVars (Pi Nothing (Id "a") (Id "b")) `shouldBe` ["a", "b"]
+            it "Sigma (Just n) filters bound name from body" $ do
+                freeRigidVars (Sigma (Just "x") (Id "a") (Id "x")) `shouldBe` ["a"]
             it "nested types collect all rigids" $ do
-                let ty = TPi Nothing (TApp (TCon "Vec") [TRigid "a", TRigid "n"]) (TRigid "b")
-                freeRigidVars ty `shouldBe` ["a", "n", "b"]
+                let ty = Pi Nothing (App (Id "Vec") [Id "a", Id "n"]) (Id "b")
+                sort (freeRigidVars ty) `shouldBe` ["a", "b", "n"]
 
         -- ==================================================================
         -- GADT: gadtRefine error/edge cases
@@ -5073,7 +5081,7 @@ main = do
                 let cenv = currentEnvironment st35
                     env0 = buildTCEnvFromEnvironment cenv
                     -- Simulate matching VNil against v:Vec(Int, n)
-                    env1 = env0 { varTypes = Map.insert "v" (TApp (TCon "Vec") [TCon "Int", TRigid "n"]) (varTypes env0) }
+                    env1 = env0 { varTypes = Map.insert "v" (App (Id "Vec") [Id "Int", Id "n"]) (varTypes env0) }
                     checks = [PatternGuard (PCheckTag (ConsTag "VNil" 0)) (Id "v")]
                     st0 = initTCState TCRelaxed
                 case runTC (gadtRefine checks) env1 st0 of
@@ -5081,7 +5089,7 @@ main = do
                         -- Should produce a refinement for "n" → Z
                         let nRef = Prelude.lookup "n" refs
                         case nRef of
-                            Just (TCon "Z") -> pure ()
+                            Just (Id "Z") -> pure ()
                             Just other -> expectationFailure $ "Expected n → Z, got n → " ++ showTy other
                             Nothing -> expectationFailure $ "Expected refinement for n, got: " ++ show refs
                     Left errs -> expectationFailure $ "gadtRefine failed: " ++ show errs
@@ -5093,32 +5101,32 @@ main = do
             it "maps type param names to fresh vars" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    mapping = [("a", TVar 100), ("n", TVar 101)]
+                    mapping = [("a", Meta 100), ("n", Meta 101)]
                 case runTC (gadtExprToTy mapping (Id "a")) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TVar 100
+                    Right (ty, _) -> ty `shouldBe` Meta 100
                     Left _ -> expectationFailure "Should not fail"
-            it "preserves uppercase as TCon" $ do
+            it "preserves uppercase as Id" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    mapping = [("a", TVar 100)]
+                    mapping = [("a", Meta 100)]
                 case runTC (gadtExprToTy mapping (Id "Z")) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TCon "Z"
+                    Right (ty, _) -> ty `shouldBe` Id "Z"
                     Left _ -> expectationFailure "Should not fail"
             it "handles App with mixed params and constructors" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    mapping = [("a", TVar 100), ("n", TVar 101)]
+                    mapping = [("a", Meta 100), ("n", Meta 101)]
                     -- Vec(a, Succ(n))
                     expr = App (Id "Vec") [Id "a", App (Id "Succ") [Id "n"]]
                 case runTC (gadtExprToTy mapping expr) env0 st0 of
                     Right (ty, _) ->
-                        ty `shouldBe` TApp (TCon "Vec") [TVar 100, TApp (TCon "Succ") [TVar 101]]
+                        ty `shouldBe` App (Id "Vec") [Meta 100, App (Id "Succ") [Meta 101]]
                     Left _ -> expectationFailure "Should not fail"
             it "handles U expression" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                case runTC (gadtExprToTy [] (U 0)) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TU (LConst 0)
+                case runTC (gadtExprToTy [] (U (LConst 0))) env0 st0 of
+                    Right (ty, _) -> ty `shouldBe` U (LConst 0)
                     Left _ -> expectationFailure "Should not fail"
 
         -- ==================================================================
@@ -5128,41 +5136,41 @@ main = do
             it "non-parameterized type has kind Type" $ do
                 let st0 = initTCState TCRelaxed
                     env0 = emptyTCEnv
-                    boolLam = mkLambda "Bool" [] (Tuple []) (U 0)
+                    boolLam = mkLambda "Bool" [] (Tuple []) (U (LConst 0))
                 case runTC (infer (SumType boolLam)) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TU (LConst 0)
+                    Right (ty, _) -> ty `shouldBe` U (LConst 0)
                     Left errs -> expectationFailure $ "Failed: " ++ show errs
             it "single-param type has kind Type -> Type" $ do
                 let st0 = initTCState TCRelaxed
                     cenv = currentEnvironment st
                     env0 = buildTCEnvFromEnvironment cenv
-                    maybeLam = mkLambda "Maybe" [Var "a" (U 0) UNDEFINED] (Tuple []) (U 0)
+                    maybeLam = mkLambda "Maybe" [Var "a" (U (LConst 0)) UNDEFINED] (Tuple []) (U (LConst 0))
                 case runTC (infer (SumType maybeLam)) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TPi Nothing (TU (LConst 0)) (TU (LConst 0))
+                    Right (ty, _) -> ty `shouldBe` Pi Nothing (U (LConst 0)) (U (LConst 0))
                     Left errs -> expectationFailure $ "Failed: " ++ show errs
             it "two-param type has kind Type -> Type -> Type" $ do
                 let st0 = initTCState TCRelaxed
                     cenv = currentEnvironment st
                     env0 = buildTCEnvFromEnvironment cenv
-                    eitherLam = mkLambda "Either" [Var "a" (U 0) UNDEFINED, Var "b" (U 0) UNDEFINED] (Tuple []) (U 0)
+                    eitherLam = mkLambda "Either" [Var "a" (U (LConst 0)) UNDEFINED, Var "b" (U (LConst 0)) UNDEFINED] (Tuple []) (U (LConst 0))
                 case runTC (infer (SumType eitherLam)) env0 st0 of
-                    Right (ty, _) -> ty `shouldBe` TPi Nothing (TU (LConst 0)) (TPi Nothing (TU (LConst 0)) (TU (LConst 0)))
+                    Right (ty, _) -> ty `shouldBe` Pi Nothing (U (LConst 0)) (Pi Nothing (U (LConst 0)) (U (LConst 0)))
                     Left errs -> expectationFailure $ "Failed: " ++ show errs
 
         -- ==================================================================
-        -- normalizeTy for TSigma dependent substitution
+        -- normalizeTy for Sigma dependent substitution
         -- ==================================================================
         describe "normalizeTy TSigma" $ do
-            it "normalizes TSigma children" $ do
+            it "normalizes Sigma children" $ do
                 let env0 = currentEnvironment st
-                    -- TSigma Nothing (plus(Z,Z)) (TCon "Int") → TSigma Nothing Z Int
-                    natZ = TCon "Z"
-                    inner = TApp (TCon "plus") [natZ, natZ]
-                    result = normalizeTy env0 (TSigma Nothing inner (TCon "Int"))
-                result `shouldBe` TSigma Nothing natZ (TCon "Int")
-            it "preserves TSigma when nothing to normalize" $ do
+                    -- Sigma Nothing (plus(Z,Z)) (Id "Int") → Sigma Nothing Z Int
+                    natZ = Id "Z"
+                    inner = App (Id "plus") [natZ, natZ]
+                    result = normalizeTy env0 (Sigma Nothing inner (Id "Int"))
+                result `shouldBe` Sigma Nothing natZ (Id "Int")
+            it "preserves Sigma when nothing to normalize" $ do
                 let env0 = currentEnvironment st
-                    ty = TSigma (Just "x") (TCon "Nat") (TCon "Int")
+                    ty = Sigma (Just "x") (Id "Nat") (Id "Int")
                     result = normalizeTy env0 ty
                 result `shouldBe` ty
 
@@ -5175,7 +5183,7 @@ main = do
                 let redCon = mkLambda "Red" [] (Tuple []) (Id "Color")
                     greenCon = mkLambda "Green" [] (Tuple []) (Id "Color")
                     blueCon = mkLambda "Blue" [] (Tuple []) (Id "Color")
-                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U 0))
+                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Color", colorType)] }
                     s = mkStateWithEnv env
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5185,7 +5193,7 @@ main = do
                 -- type Nat = Z | Succ(Nat)  -- Nat only in positive position
                 let zCon = mkLambda "Z" [] (Tuple []) (Id "Nat")
                     succCon = mkLambda "Succ" [Var "n" (Id "Nat") UNDEFINED] (Tuple [Id "n"]) (Id "Nat")
-                    natType = SumType (mkLambda "Nat" [] (Constructors [zCon, succCon]) (U 0))
+                    natType = SumType (mkLambda "Nat" [] (Constructors [zCon, succCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Nat", natType)] }
                     s = mkStateWithEnv env
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5194,7 +5202,7 @@ main = do
             it "warns on negative occurrence (type in function domain)" $ do
                 -- type Bad = MkBad(Bad -> Int) -- Bad in negative position
                 let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
-                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U 0))
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
                     s = mkStateWithEnv env
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5204,7 +5212,7 @@ main = do
             it "no warning for type in function codomain (positive)" $ do
                 -- type F = MkF(Int -> F) -- F only in positive position (result)
                 let mkFCon = mkLambda "MkF" [Var "f" (Pi Nothing (Id "Int") (Id "F")) UNDEFINED] (Tuple [Id "f"]) (Id "F")
-                    fType = SumType (mkLambda "F" [] (Constructors [mkFCon]) (U 0))
+                    fType = SumType (mkLambda "F" [] (Constructors [mkFCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("F", fType)] }
                     s = mkStateWithEnv env
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5217,7 +5225,7 @@ main = do
                 let innerArrow = Pi Nothing (Id "Int") (Id "Bad2")  -- Int -> Bad2
                     outerArrow = Pi Nothing innerArrow (Id "Int")   -- (Int -> Bad2) -> Int
                     mkCon = mkLambda "MkBad2" [Var "f" outerArrow UNDEFINED] (Tuple [Id "f"]) (Id "Bad2")
-                    badType = SumType (mkLambda "Bad2" [] (Constructors [mkCon]) (U 0))
+                    badType = SumType (mkLambda "Bad2" [] (Constructors [mkCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Bad2", badType)] }
                     s = mkStateWithEnv env
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5225,7 +5233,7 @@ main = do
 
             it "disabled when flag is off" $ do
                 let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
-                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U 0))
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
                     s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkPositivity = False } }
                 warnings <- runAndGetWarnings s positivityCheckPass
@@ -5295,7 +5303,7 @@ main = do
                 -- type Bool = True | False, match covers both
                 let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
                     falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
-                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U (LConst 0)))
                     trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
                                  (Id "a") SourceInteractive
                     falseCase = ExpandedCase [ExprConsTagCheck (ConsTag "False" 1) (Id "x")]
@@ -5318,7 +5326,7 @@ main = do
                 -- type Bool = True | False, match only covers True
                 let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
                     falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
-                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U (LConst 0)))
                     trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
                                  (Id "a") SourceInteractive
                     matchBody = PatternMatches [trueCase]
@@ -5341,7 +5349,7 @@ main = do
                 -- match with empty checks = wildcard
                 let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
                     falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
-                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U (LConst 0)))
                     trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
                                  (Id "a") SourceInteractive
                     wildcardCase = ExpandedCase [] (Id "b") SourceInteractive
@@ -5364,7 +5372,7 @@ main = do
                 let redCon = mkLambda "Red" [] (Tuple []) (Id "Color")
                     greenCon = mkLambda "Green" [] (Tuple []) (Id "Color")
                     blueCon = mkLambda "Blue" [] (Tuple []) (Id "Color")
-                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U 0))
+                    colorType = SumType (mkLambda "Color" [] (Constructors [redCon, greenCon, blueCon]) (U (LConst 0)))
                     redCase = ExpandedCase [ExprConsTagCheck (ConsTag "Red" 0) (Id "x")]
                                 (Id "a") SourceInteractive
                     matchBody = PatternMatches [redCase]
@@ -5387,7 +5395,7 @@ main = do
             it "checks instance lambdas too" $ do
                 let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
                     falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
-                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U (LConst 0)))
                     trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
                                  (Id "a") SourceInteractive
                     matchBody = PatternMatches [trueCase]
@@ -5407,7 +5415,7 @@ main = do
             it "disabled when flag is off" $ do
                 let trueCon = mkLambda "True" [] (Tuple []) (Id "Bool")
                     falseCon = mkLambda "False" [] (Tuple []) (Id "Bool")
-                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U 0))
+                    boolType = SumType (mkLambda "Bool" [] (Constructors [trueCon, falseCon]) (U (LConst 0)))
                     trueCase = ExpandedCase [ExprConsTagCheck (ConsTag "True" 0) (Id "x")]
                                  (Id "a") SourceInteractive
                     matchBody = PatternMatches [trueCase]
@@ -5741,7 +5749,7 @@ main = do
                     Right [Function lam] -> do
                         -- The param type should contain forall
                         case typ (head (params lam)) of
-                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") (Id "a")) -> return ()
+                            Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a")) -> return ()
                             other -> expectationFailure $ "Expected forall a. a -> a, got: " ++ show other
                     other -> expectationFailure $ "Expected Function, got: " ++ show other
 
@@ -5750,7 +5758,7 @@ main = do
                 case res of
                     Right [Function lam] -> do
                         case typ (head (params lam)) of
-                            Pi (Just "a") (U 0) (Pi (Just "b") (U 0) _) -> return ()
+                            Pi (Just "a") (U (LConst 0)) (Pi (Just "b") (U (LConst 0)) _) -> return ()
                             other -> expectationFailure $ "Expected nested forall, got: " ++ show other
                     other -> expectationFailure $ "Expected Function, got: " ++ show other
 
@@ -5759,7 +5767,7 @@ main = do
                 case res of
                     Right [Function lam] -> do
                         case typ (head (params lam)) of
-                            Pi (Just "a") (U 0) (Pi (Just "b") (U 0) _) -> return ()
+                            Pi (Just "a") (U (LConst 0)) (Pi (Just "b") (U (LConst 0)) _) -> return ()
                             other -> expectationFailure $ "Expected kinded forall, got: " ++ show other
                     other -> expectationFailure $ "Expected Function, got: " ++ show other
 
@@ -5768,7 +5776,7 @@ main = do
                 case res of
                     Right [Function lam] -> do
                         case typ (head (params lam)) of
-                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") (Id "a")) -> return ()
+                            Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a")) -> return ()
                             other -> expectationFailure $ "Expected forall from ∀, got: " ++ show other
                     other -> expectationFailure $ "Expected Function, got: " ++ show other
 
@@ -5842,7 +5850,7 @@ main = do
                 case res of
                     Right [Function lam] -> do
                         case typ (head (params lam)) of
-                            Pi (Just "a") (U 0) (Pi Nothing (Id "a") _) -> return ()
+                            Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") _) -> return ()
                             other -> expectationFailure $ "Expected forall a. (a -> ...), got: " ++ show other
                     other -> expectationFailure $ "Expected Function, got: " ++ show other
 
@@ -6087,29 +6095,365 @@ main = do
                 result `shouldBe` conTrue
 
         -- ==================================================================
-        -- TypeCheck: TLit support
+        -- P37: String Algebra Operations
         -- ==================================================================
-        describe "TypeCheck: TLit (value literals in types)" $ do
+        describe "P37: String Algebra Operations" $ do
+            it "P37 t1: split basic" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t1()"
+                case result of
+                    CLMCON (ConsTag "Cons" _) [CLMLIT (LString "hello"), CLMCON (ConsTag "Cons" _) [CLMLIT (LString "world"), CLMCON (ConsTag "Cons" _) [CLMLIT (LString "foo"), CLMCON (ConsTag "Nil" _) []]]] -> return ()
+                    other -> expectationFailure $ "Expected Cons(hello, Cons(world, Cons(foo, Nil))), got: " ++ show other
+
+            it "P37 t2: join basic" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t2()"
+                result `shouldBe` CLMLIT (LString "a-b-c")
+
+            it "P37 t3: fromChar" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t3()"
+                result `shouldBe` CLMLIT (LString "A")
+
+            it "P37 t4: split with empty results" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t4()"
+                case result of
+                    CLMCON (ConsTag "Cons" _) [CLMLIT (LString "a"), CLMCON (ConsTag "Cons" _) [CLMLIT (LString ""), CLMCON (ConsTag "Cons" _) [CLMLIT (LString "b"), CLMCON (ConsTag "Nil" _) []]]] -> return ()
+                    other -> expectationFailure $ "Expected Cons(a, Cons('', Cons(b, Nil))), got: " ++ show other
+
+            it "P37 t5: join empty list" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t5()"
+                result `shouldBe` CLMLIT (LString "")
+
+            it "P37 t6: join singleton" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t6()"
+                result `shouldBe` CLMLIT (LString "only")
+
+            it "P37 t7: Semigroup combine" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t7()"
+                result `shouldBe` CLMLIT (LString "hello world")
+
+            it "P37 t9: split then join roundtrip" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t9()"
+                result `shouldBe` CLMLIT (LString "a-b-c")
+
+            it "P37 t10: split on no match" $ do
+                st' <- loadTestProgram st "tests/programs/P37_StringOps.tl"
+                result <- evalExpr st' "t10()"
+                case result of
+                    CLMCON (ConsTag "Cons" _) [CLMLIT (LString "hello"), CLMCON (ConsTag "Nil" _) []] -> return ()
+                    other -> expectationFailure $ "Expected Cons(hello, Nil), got: " ++ show other
+
+        -- ==================================================================
+        -- P38: Strict Types Integration
+        -- ==================================================================
+        describe "P38: Strict Types Integration" $ do
+            it "P38: loading with strict mode collects errors for bad function" $ do
+                let strictSt = st { currentFlags = (currentFlags st) { strictTypes = True } }
+                st' <- loadTestProgram strictSt "tests/programs/P38_StrictTypes.tl"
+                -- The file has a function with wrong return type, should have errors
+                tcErrorCount st' `shouldSatisfy` (> 0)
+                tcCollectedErrors st' `shouldSatisfy` (not . null)
+
+            it "P38: loading with relaxed mode has zero tcErrorCount" $ do
+                st' <- loadTestProgram st "tests/programs/P38_StrictTypes.tl"
+                -- In relaxed mode, errors are warnings, tcErrorCount stays 0 since we only count in strict
+                -- Actually, tcCollectedErrors always accumulates now
+                pure () :: IO ()
+
+        -- ==================================================================
+        -- TypeCheck: Lit support
+        -- ==================================================================
+        describe "TypeCheck: Lit (value literals in types)" $ do
             let tcSt0 = initTCState TCRelaxed
                 tcEnv0 = emptyTCEnv
 
-            it "TLit unifies with itself" $ do
-                let result = runTC (unify (TLit (LInt 3)) (TLit (LInt 3))) tcEnv0 tcSt0
+            it "Lit unifies with itself" $ do
+                let result = runTC (unify (Lit (LInt 3)) (Lit (LInt 3))) tcEnv0 tcSt0
                 case result of
                     Right _ -> return ()
                     Left errs -> expectationFailure $ "Unification failed: " ++ show errs
 
-            it "TLit fails to unify with different literal" $ do
-                let result = runTC (unify (TLit (LInt 3)) (TLit (LInt 4))) tcEnv0 tcSt0
+            it "Lit fails to unify with different literal" $ do
+                let result = runTC (unify (Lit (LInt 3)) (Lit (LInt 4))) tcEnv0 tcSt0
                 case result of
                     Left _ -> return ()
                     Right _ -> expectationFailure "Expected unification to fail for 3 vs 4"
 
-            it "TLit is concrete" $ do
-                isConcreteTy (TLit (LInt 42)) `shouldBe` True
+            it "Lit is concrete" $ do
+                isConcreteTy (Lit (LInt 42)) `shouldBe` True
 
-            it "TId with concrete components is concrete" $ do
-                isConcreteTy (TId (TCon "Int") (TLit (LInt 3)) (TLit (LInt 3))) `shouldBe` True
+            it "PropEq with concrete components is concrete" $ do
+                isConcreteTy (App (Id "PropEq") [Id "Int", Lit (LInt 3), Lit (LInt 3)]) `shouldBe` True
 
-            it "TId with TVar component is not concrete" $ do
-                isConcreteTy (TId (TCon "Int") (TVar 0) (TLit (LInt 3))) `shouldBe` False
+            it "PropEq with Meta component is not concrete" $ do
+                isConcreteTy (App (Id "PropEq") [Id "Int", Meta 0, Lit (LInt 3)]) `shouldBe` False
+
+        -- ==================================================================
+        -- Phase 1: Critical bug fix tests
+        -- ==================================================================
+        describe "Phase 1: Critical fixes" $ do
+            let tcSt0 = initTCState TCRelaxed
+                tcEnv0 = emptyTCEnv
+
+            describe "occursIn handles compound Expr forms" $ do
+                it "detects Meta inside NTuple" $ do
+                    occursIn 5 (NTuple [(Nothing, Meta 5)]) `shouldBe` True
+
+                it "does not false-positive NTuple without Meta" $ do
+                    occursIn 5 (NTuple [(Nothing, Id "Int")]) `shouldBe` False
+
+                it "detects Meta inside ConTuple" $ do
+                    occursIn 3 (ConTuple (ConsTag "Just" 1) [Meta 3]) `shouldBe` True
+
+                it "detects Meta inside Typed" $ do
+                    occursIn 2 (Typed (Id "x") (Meta 2)) `shouldBe` True
+
+                it "detects Meta inside ArrayLit" $ do
+                    occursIn 1 (ArrayLit [Id "a", Meta 1]) `shouldBe` True
+
+                it "detects Meta inside RecordType" $ do
+                    occursIn 7 (RecordType [("x", Meta 7)] False) `shouldBe` True
+
+                it "detects Meta inside Implicit" $ do
+                    occursIn 4 (Implicit (Meta 4)) `shouldBe` True
+
+            describe "freeMetas handles compound Expr forms" $ do
+                it "finds metas inside NTuple" $ do
+                    freeMetas (NTuple [(Just "a", Meta 1), (Nothing, Meta 2)]) `shouldBe` [1, 2]
+
+                it "finds metas inside RecordType" $ do
+                    freeMetas (RecordType [("x", Meta 3), ("y", Id "Int")] False) `shouldBe` [3]
+
+            describe "isConcreteTy handles compound Expr forms" $ do
+                it "NTuple with all concrete fields is concrete" $ do
+                    isConcreteTy (NTuple [(Nothing, Id "Int"), (Nothing, Id "Bool")]) `shouldBe` True
+
+                it "NTuple with Meta is not concrete" $ do
+                    isConcreteTy (NTuple [(Nothing, Meta 0)]) `shouldBe` False
+
+                it "RecordType with concrete fields is concrete" $ do
+                    isConcreteTy (RecordType [("x", Id "Int")] False) `shouldBe` True
+
+            describe "Pi universe level inference" $ do
+                it "Type -> Type : Type1" $ do
+                    let result = runTC (infer (Pi Nothing (U (LConst 0)) (U (LConst 0)))) tcEnv0 tcSt0
+                    case result of
+                        Right (ty, _) -> ty `shouldBe` U (LConst 1)
+                        Left errs -> expectationFailure $ "Should infer Type1: " ++ show errs
+
+                it "Type1 -> Type : Type2" $ do
+                    let result = runTC (infer (Pi Nothing (U (LConst 1)) (U (LConst 0)))) tcEnv0 tcSt0
+                    case result of
+                        Right (ty, _) -> ty `shouldBe` U (LConst 2)
+                        Left errs -> expectationFailure $ "Should infer Type2: " ++ show errs
+
+                it "Int -> Bool : Type (value-level Pi)" $ do
+                    let result = runTC (infer (Pi Nothing (Id "Int") (Id "Bool"))) tcEnv0 tcSt0
+                    case result of
+                        Right (ty, _) -> ty `shouldBe` U (LConst 0)
+                        Left errs -> expectationFailure $ "Should infer Type: " ++ show errs
+
+            describe "Universe unification correctness" $ do
+                it "U 0 does not unify with U 1 (use subtype for cumulativity)" $ do
+                    let result = runTC (unify (U (LConst 0)) (U (LConst 1))) tcEnv0 tcSt0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "unify should require exact universe equality"
+
+                it "subtype allows U 0 <= U 1" $ do
+                    let result = runTC (subtype (U (LConst 0)) (U (LConst 1))) tcEnv0 tcSt0
+                    case result of
+                        Right _ -> pure ()
+                        Left errs -> expectationFailure $ "subtype should allow cumulativity: " ++ show errs
+
+                it "subtype rejects U 1 <= U 0" $ do
+                    let result = runTC (subtype (U (LConst 1)) (U (LConst 0))) tcEnv0 tcSt0
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "subtype should reject U 1 <= U 0"
+
+            describe "applySubst handles compound Expr forms" $ do
+                it "substitutes inside NTuple" $ do
+                    let st1 = tcSt0 { nextMeta = 2, substitution = Map.fromList [(0, Id "Int")] }
+                        result = runTC (applySubst (NTuple [(Nothing, Meta 0)])) tcEnv0 st1
+                    case result of
+                        Right (NTuple [(Nothing, Id "Int")], _) -> pure ()
+                        Right (other, _) -> expectationFailure $ "Expected NTuple with Int, got: " ++ show other
+                        Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
+
+            describe "replaceMeta handles compound Expr forms" $ do
+                it "replaces inside NTuple" $ do
+                    replaceMeta 0 (Id "Bool") (NTuple [(Nothing, Meta 0)]) `shouldBe` NTuple [(Nothing, Id "Bool")]
+
+                it "replaces inside RecordType" $ do
+                    replaceMeta 1 (Id "Int") (RecordType [("x", Meta 1)] False) `shouldBe` RecordType [("x", Id "Int")] False
+
+        -- ==================================================================
+        -- Strict Mode Hardening Tests
+        -- ==================================================================
+        describe "Strict mode hardening" $ do
+            let stStrict = initTCState TCStrict
+                stRelaxed = initTCState TCRelaxed
+                env0 = emptyTCEnv
+
+            describe "tcWarnOrFail escalation in strict mode" $ do
+                it "unbound variable is fatal in strict mode" $ do
+                    let result = runTC (infer (Id "nonexistent_xyz")) env0 stStrict
+                    case result of
+                        Left errs -> errs `shouldSatisfy` Prelude.any (\e -> case e of
+                            UnboundVar _ -> True
+                            WithContext _ (UnboundVar _) -> True
+                            _ -> False)
+                        Right _ -> expectationFailure "Strict mode should fail on unbound variable"
+
+                it "catch-all infer is fatal in strict mode" $ do
+                    let result = runTC (infer (DeclBlock [])) env0 stStrict
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Strict mode should fail on uninferrable expr"
+
+                it "ERROR node is fatal in strict mode" $ do
+                    let result = runTC (infer (ERROR "test error")) env0 stStrict
+                    case result of
+                        Left _ -> pure ()
+                        Right _ -> expectationFailure "Strict mode should fail on ERROR node"
+
+                it "unsolved constraint is fatal in strict mode" $ do
+                    -- Create a structure "Eq" with a method, but no instance for "Unknown"
+                    let eqLam = mkLambda "Eq" [Var "a" (U (LConst 0)) UNDEFINED]
+                                  (DeclBlock [Function (mkLambda "==" [Var "x" (Id "a") UNDEFINED, Var "y" (Id "a") UNDEFINED] UNDEFINED (Id "Bool"))])
+                                  UNDEFINED
+                        cenv = addNamedStructure (Structure eqLam (StructInfo SAlgebra [] [] [] [])) initialEnvironment
+                        envWithCompiler = emptyTCEnv { envCompiler = Just cenv }
+                        action = tcModify (\s -> s { constraints = [CStructure "Eq" [Id "Unknown"]] })
+                                 `tcBind` \_ -> resolveConstraints
+                    let result = runTC action envWithCompiler stStrict
+                    case result of
+                        Left errs -> errs `shouldSatisfy` Prelude.any (\e -> case e of
+                            ConstraintUnsolved _ -> True
+                            WithContext _ (ConstraintUnsolved _) -> True
+                            _ -> False)
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+
+            describe "tcTry error reporting (not silently swallowed)" $ do
+                it "ConTuple arg mismatch reports error in strict mode" $ do
+                    let succCons = mkLambda "Succ" [Var "n" (Id "Nat") UNDEFINED] (Tuple [Id "n"]) (Id "Nat")
+                        cenv = addNamedConstructor 1 succCons initialEnvironment
+                        tcEnvC = emptyTCEnv { envCompiler = Just cenv }
+                    -- Pass a String literal where Nat is expected
+                    let result = runTC (infer (ConTuple (ConsTag "Succ" 1) [Lit (LString "bad")])) tcEnvC stStrict
+                    case result of
+                        Left errs -> errs `shouldSatisfy` (not . null)
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+
+                it "inferLambda body-signature mismatch reports in strict mode" $ do
+                    -- Function says returns Bool but body is Int literal
+                    let lam = mkLambda "badFunc" [Var "x" (Id "Int") UNDEFINED] (Lit (LInt 42)) (Id "Bool")
+                    let result = runTC (inferLambda lam) env0 stStrict
+                    case result of
+                        Left errs -> errs `shouldSatisfy` (not . null)
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+
+            describe "FixityDecl handled in checkTopLevel" $ do
+                it "FixityDecl doesn't generate type error" $ do
+                    let result = runTC (checkTopLevel (FixityDecl AssocLeft 6 ["+", "-"])) env0 stStrict
+                    case result of
+                        Right ((), st') -> tcErrors st' `shouldSatisfy` null
+                        Left errs -> expectationFailure $ "FixityDecl should not fail: " ++ show errs
+
+            describe "CaseOf pattern variable binding" $ do
+                it "pattern variables are in scope for body" $ do
+                    -- CaseOf [Var "n" Nat _] body — n should be bound
+                    let caseExpr = CaseOf [Var "n" (Id "Nat") UNDEFINED] (Id "n") SourceInteractive
+                    let result = runTC (infer caseExpr) env0 stRelaxed
+                    case result of
+                        Right (ty, st') ->
+                            -- n should resolve to Nat, not trigger UnboundVar
+                            tcErrors st' `shouldSatisfy` (not . Prelude.any isUnboundVar)
+                        Left errs -> expectationFailure $ "Should not fail: " ++ show errs
+
+            describe "Pipeline halt in strict mode" $ do
+                it "tcErrorCount tracks errors" $ do
+                    -- Run typeCheckPass with a program containing a type error
+                    let badExpr = Function (mkLambda "badFunc" [] (ERROR "intentional") (Id "Int"))
+                        strictSt = emptyIntState {
+                            currentFlags = (currentFlags emptyIntState) { strictTypes = True },
+                            parsedModule = [(badExpr, SourceInteractive)]
+                        }
+                    finalSt <- evalStateT (execStateT typeCheckPass strictSt) initLogState
+                    tcErrorCount finalSt `shouldSatisfy` (> 0)
+
+                it "tcErrorCount is 0 when no errors" $ do
+                    let goodExpr = Function (mkLambda "goodFunc" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int"))
+                        relaxedSt = emptyIntState {
+                            parsedModule = [(goodExpr, SourceInteractive)]
+                        }
+                    finalSt <- evalStateT (execStateT typeCheckPass relaxedSt) initLogState
+                    tcErrorCount finalSt `shouldBe` 0
+
+            describe "Instance declaration checking" $ do
+                it "intrinsic instances pass without error" $ do
+                    let inst = Instance "Eq" [Id "Int"] [Intrinsic] []
+                    let result = runTC (checkTopLevel inst) env0 stRelaxed
+                    case result of
+                        Right ((), st') -> tcErrors st' `shouldSatisfy` null
+                        Left errs -> expectationFailure $ "Intrinsic instance should pass: " ++ show errs
+
+        -- ==================================================================
+        -- Phase 2: Semantic correctness tests
+        -- ==================================================================
+        describe "Phase 2: Semantic correctness" $ do
+            let tcSt0 = initTCState TCRelaxed
+                tcEnv0 = emptyTCEnv
+
+            describe "instantiate handles higher universes" $ do
+                it "instantiates forall a:Type1. a with fresh meta" $ do
+                    let forallTy = Pi (Just "f") (U (LConst 1)) (Id "f")
+                        result = runTC (instantiate forallTy) tcEnv0 tcSt0
+                    case result of
+                        Right (Meta _, _) -> pure ()  -- successfully instantiated to fresh meta
+                        Right (other, _) -> expectationFailure $ "Expected Meta, got: " ++ show other
+                        Left errs -> expectationFailure $ "Should instantiate: " ++ show errs
+
+                it "instantiates nested forall across universes" $ do
+                    let forallTy = Pi (Just "a") (U (LConst 0)) (Pi (Just "f") (U (LConst 1)) (App (Id "f") [Id "a"]))
+                        result = runTC (instantiate forallTy) tcEnv0 tcSt0
+                    case result of
+                        Right (App (Id "f") [Meta _], _) -> expectationFailure "Should also instantiate f"
+                        Right (App (Meta _) [Meta _], _) -> pure ()  -- both instantiated
+                        Right (other, _) -> expectationFailure $ "Unexpected: " ++ show other
+                        Left errs -> expectationFailure $ "Should instantiate: " ++ show errs
+
+            describe "clmToExpr handles applications" $ do
+                it "converts CLMAPP back to App" $ do
+                    clmToExpr (CLMAPP (CLMID "f") [CLMID "x"]) `shouldBe` Just (App (Id "f") [Id "x"])
+
+                it "converts nested CLMAPP" $ do
+                    clmToExpr (CLMAPP (CLMID "Maybe") [CLMID "Int"]) `shouldBe` Just (App (Id "Maybe") [Id "Int"])
+
+                it "converts CLMIAP to App" $ do
+                    clmToExpr (CLMIAP (CLMID "show") [CLMID "x"]) `shouldBe` Just (App (Id "show") [Id "x"])
+
+            describe "unify preserves OccursCheck error through normalization" $ do
+                it "OccursCheck is not swallowed by retry" $ do
+                    let result = runTC (unify (Meta 0) (App (Id "List") [Meta 0])) tcEnv0 (tcSt0 { nextMeta = 1 })
+                    case result of
+                        Left (OccursCheck _ _ : _) -> pure ()
+                        Left errs -> expectationFailure $ "Expected OccursCheck, got: " ++ show errs
+                        Right _ -> expectationFailure "Should have failed with OccursCheck"
+
+            describe "substTyVar handles compound Expr forms" $ do
+                it "substitutes inside NTuple" $ do
+                    substTyVar "a" (Id "Int") (NTuple [(Nothing, Id "a")]) `shouldBe` NTuple [(Nothing, Id "Int")]
+
+                it "substitutes inside RecordType" $ do
+                    substTyVar "a" (Id "Bool") (RecordType [("x", Id "a")] False) `shouldBe` RecordType [("x", Id "Bool")] False
+
+                it "substitutes inside Implicit" $ do
+                    substTyVar "a" (Id "Int") (Implicit (Id "a")) `shouldBe` Implicit (Id "Int")

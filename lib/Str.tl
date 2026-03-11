@@ -7,6 +7,7 @@ module Str;
 import Core;
 import Algebra;
 import Morphism;
+import Collection;
 
 // ============================================================================
 // Str type
@@ -65,13 +66,13 @@ function isContinuation(b:Byte) : Bool =
 
 /// Decode one code point starting at byte offset i.
 function decodeAt(bytes:Array(Byte), i:Int) : Maybe(Pair(Int, Int)) =
-    if i >= length(bytes) then Nothing
+    if i >= size(bytes) then Nothing
     else
         let b0 = byteToInt(index(bytes, i)) in
         let seqLen = utf8SeqLen(intToByte(b0)) in
         if seqLen == 0 then Nothing
         else if seqLen == 1 then Just(Pair(b0, i + 1))
-        else if i + seqLen > length(bytes) then Nothing
+        else if i + seqLen > size(bytes) then Nothing
         else if seqLen == 2 then
             let b1 = byteToInt(index(bytes, i + 1)) in
             if (b1 .&. 0xC0) != 0x80 then Nothing
@@ -102,7 +103,7 @@ function countCodePoints(bytes:Array(Byte)) : Int =
     countCodePointsFrom(bytes, 0, 0);
 
 function countCodePointsFrom(bytes:Array(Byte), i:Int, count:Int) : Int =
-    if i >= length(bytes) then count
+    if i >= size(bytes) then count
     else
         let seqLen = utf8SeqLen(index(bytes, i)) in
         if seqLen == 0 then count
@@ -114,8 +115,8 @@ function nthByteOffset(bytes:Array(Byte), n:Int) : Maybe(Int) =
 
 function nthByteOffsetFrom(bytes:Array(Byte), i:Int, n:Int) : Maybe(Int) =
     if n == 0 then
-        if i <= length(bytes) then Just(i) else Nothing
-    else if i >= length(bytes) then Nothing
+        if i <= size(bytes) then Just(i) else Nothing
+    else if i >= size(bytes) then Nothing
     else
         let seqLen = utf8SeqLen(index(bytes, i)) in
         if seqLen == 0 then Nothing
@@ -126,7 +127,7 @@ function isValidUtf8(bytes:Array(Byte)) : Bool =
     isValidUtf8From(bytes, 0);
 
 function isValidUtf8From(bytes:Array(Byte), i:Int) : Bool =
-    if i >= length(bytes) then True
+    if i >= size(bytes) then True
     else isValidUtf8Check(decodeAt(bytes, i), bytes);
 
 function isValidUtf8Check(result:Maybe(Pair(Int, Int)), bytes:Array(Byte)) : Bool = match
@@ -145,7 +146,7 @@ function eqBytes(a:Array(Byte), b:Array(Byte), i:Int, len:Int) : Bool =
 
 /// Helper: lexicographic byte array comparison.
 function compareBytes(a:Array(Byte), b:Array(Byte), i:Int, minLen:Int) : Ordering =
-    if i >= minLen then compare(length(a), length(b))
+    if i >= minLen then compare(size(a), size(b))
     else
         let ba = byteToInt(index(a, i)) in
         let bb = byteToInt(index(b, i)) in
@@ -185,18 +186,18 @@ instance Ord(Str) = {
 
 instance Semigroup(Str) = {
     function combine(a:Str, b:Str) : Str =
-        Str(arrayConcat(a.bytes, b.bytes), a.byteLen + b.byteLen)
+        Str(combine(a.bytes, b.bytes), a.byteLen + b.byteLen)
 };
 
 instance Monoid(Str) = {
     function combine(a:Str, b:Str) : Str =
-        Str(arrayConcat(a.bytes, b.bytes), a.byteLen + b.byteLen);
+        Str(combine(a.bytes, b.bytes), a.byteLen + b.byteLen);
     value empty : Str = Str([], 0)
 };
 
 /// Helper: decode all bytes to build a display string.
 function strToDisplayString(bytes:Array(Byte), i:Int, acc:String) : String =
-    if i >= length(bytes) then acc
+    if i >= size(bytes) then acc
     else strToDisplayStep(decodeAt(bytes, i), bytes, i, acc);
 
 function strToDisplayStep(result:Maybe(Pair(Int, Int)), bytes:Array(Byte), i:Int, acc:String) : String = match
@@ -246,7 +247,7 @@ instance StringLike(Str) = {
 
     function strFromChar(c:Char) : Str =
         let bs = encodeCodePoint(fromEnum(c)) in
-        Str(bs, length(bs))
+        Str(bs, size(bs))
 };
 
 // ============================================================================
@@ -261,5 +262,5 @@ algebra FromString(a:Type) = {
 /// Str can be constructed directly from byte arrays.
 instance FromString(Str) = {
     function fromStringLiteral(bytes:Array(Byte)) : Str =
-        Str(bytes, length(bytes))
+        Str(bytes, size(bytes))
 };

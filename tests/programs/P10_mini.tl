@@ -43,14 +43,14 @@ function getTaskPriScore(t:TaskItem) : Int = match
     | Task(p, s, e) -> score(p);
 
 function filterDone(tasks:List(TaskItem)) : List(TaskItem) =
-    bind(tasks, \t -> if isDone(t) then Cons(t, Nil) else Nil);
+    bind(tasks, fn(t) = if isDone(t) then Cons(t, Nil) else Nil);
 
 function totalEffort(tasks:List(TaskItem)) : Nat = match
     | Nil -> Z
     | Cons(Task(p, s, e), rest) -> plus(e, totalEffort(rest));
 
 function priorities(tasks:List(TaskItem)) : List(Int) =
-    fmap(\t -> match t | Task(p, s, e) -> score(p), tasks);
+    fmap(fn(t) = match t | Task(p, s, e) -> score(p), tasks);
 
 function maxScore(tasks:List(TaskItem)) : Int = match
     | Nil -> 0

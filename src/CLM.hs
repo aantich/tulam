@@ -377,21 +377,9 @@ evalCLMPure lookupFn lookupInstanceFn = go
 -- For constructors, requires a lookup function to map constructor name → type name.
 inferTypePure :: (Name -> Maybe Name) -> CLMExpr -> Maybe Name
 inferTypePure consLookup (CLMCON (ConsTag consNm _) _) = consLookup consNm
-inferTypePure _ (CLMLIT (LInt _))     = Just "Int"
-inferTypePure _ (CLMLIT (LFloat _))   = Just "Float64"
-inferTypePure _ (CLMLIT (LString _))  = Just "String"
-inferTypePure _ (CLMLIT (LChar _))    = Just "Char"
-inferTypePure _ (CLMLIT (LInt8 _))    = Just "Int8"
-inferTypePure _ (CLMLIT (LInt16 _))   = Just "Int16"
-inferTypePure _ (CLMLIT (LInt32 _))   = Just "Int32"
-inferTypePure _ (CLMLIT (LInt64 _))   = Just "Int64"
-inferTypePure _ (CLMLIT (LWord8 _))   = Just "UInt8"
-inferTypePure _ (CLMLIT (LWord16 _))  = Just "UInt16"
-inferTypePure _ (CLMLIT (LWord32 _))  = Just "UInt32"
-inferTypePure _ (CLMLIT (LWord64 _))  = Just "UInt64"
-inferTypePure _ (CLMLIT (LFloat32 _)) = Just "Float32"
-inferTypePure _ (CLMARRAY _)          = Just "Array"
-inferTypePure _ _                     = Nothing
+inferTypePure _ (CLMLIT lit) = litTypeName lit
+inferTypePure _ (CLMARRAY _) = Just "Array"
+inferTypePure _ _             = Nothing
 
 -- | Normalize a level by evaluating concrete arithmetic
 normalizeLevel :: Level -> Level

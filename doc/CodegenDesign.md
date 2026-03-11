@@ -257,7 +257,7 @@ This is the core insight that drives everything. Rather than hardcoding type map
 ### 5.1 How It Works
 
 ```tulam
--- In lib/Target/JS.tl (or similar target-specific stdlib module):
+-- In lib/Backend/JS/Native.tl (or similar target-specific stdlib module):
 repr Int as number target js;
 repr Float64 as number target js;
 repr String as string target js;
@@ -271,7 +271,7 @@ instance StringOps(String) target js = intrinsic; -- compiles concat to JS +
 ```
 
 ```tulam
--- In lib/Target/DotNet.tl:
+-- In lib/Backend/DotNet/Native.tl:
 repr Int as System.Int64 target dotnet;
 repr Float64 as System.Double target dotnet;
 repr String as System.String target dotnet;
@@ -279,7 +279,7 @@ repr Bool as System.Boolean target dotnet;
 ```
 
 ```tulam
--- In lib/Target/Native.tl:
+-- In lib/Backend/LLVM/Native.tl:
 repr Int as int64_t target native;
 repr Float64 as double target native;
 repr String as std::string target native;

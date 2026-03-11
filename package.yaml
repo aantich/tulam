@@ -39,6 +39,7 @@ dependencies:
 - binary
 - bytestring
 - hashable
+- process
 
 ghc-options:
 # - -Wall
@@ -95,3 +96,5 @@ tests:
     dependencies:
     - tulam
     - hspec
+    - process
+    - directory

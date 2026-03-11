@@ -34,9 +34,13 @@ function neTail(xs:NonEmpty(a)) : List(a) = match
 
 instance Semigroup(NonEmpty(a)) = {
     function combine(xs:NonEmpty(a), ys:NonEmpty(a)) : NonEmpty(a) = match
-        | NonEmpty(h, Nil), ys -> NonEmpty(h, toList(ys))
-        | NonEmpty(h, Cons(t, rest)), ys -> NonEmpty(h, Cons(t, combine(rest, toList(ys))))
+        | NonEmpty(h, t), ys -> NonEmpty(h, listCombine(t, toList(ys)));
 };
+
+/// Helper: concatenate two lists.
+function listCombine(xs:List(a), ys:List(a)) : List(a) = match
+    | Nil, ys -> ys
+    | Cons(h, t), ys -> Cons(h, listCombine(t, ys));
 
 instance Show(NonEmpty(a)) = {
     function show(x:NonEmpty(a)) : String = match

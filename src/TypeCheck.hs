@@ -1,17 +1,19 @@
-{-# LANGUAGE OverloadedStrings, PatternSynonyms #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | Type checker for tulam: bidirectional type checking with row polymorphism.
 -- Inserted as Pass 3 in the compilation pipeline (between case optimization and CLM conversion).
+--
+-- Uses Expr from Surface.hs directly as the type representation.
+-- No separate Ty/Row types — types ARE expressions (unified architecture).
 module TypeCheck
-  ( -- * Internal type representation
-    Ty(..), Row(..), TyVar
-  , pattern TArrow, pattern TProd
-    -- * Type checker state and monad
-  , TCState(..), TCEnv(..), TCMode(..), TCError(..), Constraint(..)
+  ( -- * Type checker state and monad
+    TCState(..), TCEnv(..), TCMode(..), TCError(..), Constraint(..)
   , initTCState, emptyTCEnv
     -- * Core operations
-  , runTC, freshTyVar, freshRowVar
-  , exprToTy
+  , runTC, freshMeta
+  , normalizeTypeExpr
+    -- * Generic type-expr traversal (Phase 1)
+  , mapTypeChildren, foldMapTypeChildren
     -- * Unification & Subtyping
   , unify, applySubst, subtype
     -- * Bidirectional checking
@@ -19,12 +21,15 @@ module TypeCheck
     -- * Polymorphism
   , instantiate, generalize, substTyVar
     -- * Internal helpers (for testing)
-  , tcBind, tcPure, tcWarn, tcWarnOrFail, tcTry, tcLocal, tcWithContext, tcFail
-  , checkTopLevel, buildTCEnvFromEnvironment, inferLambda, lamToTy
+  , tcBind, tcPure, tcWarn, tcWarnOrFail, tcTry, tcLocal, tcWithContext, tcFail, tcModify, withCompilerEnv
+  , checkTopLevel, buildTCEnvFromEnvironment, inferLambda, inferLamType
   , resolveConstraints, showTCError, showExprBrief, showTy, showRow
-  , tyToName, bindRow
+  , tyToName, freeMetas, replaceMeta, occursIn
     -- * Type-level normalization
-  , normalizeTy, tyToCLM, clmToTy, isConcreteTy, lambdaToCLMLam
+  , normalizeTy, clmToExpr, isConcreteTy, lambdaToCLMLam, exprToCLMTC
+  , bind
+    -- * Zonking (Phase 4)
+  , zonk
     -- * Rigid variable analysis (for existential escape checking)
   , freeRigidVars
     -- * GADT support
@@ -42,52 +47,9 @@ import Control.Monad (when, unless, zipWithM_, forM_, forM, foldM)
 import Control.Monad.Trans.State.Strict (get, put, modify)
 import Control.Monad.IO.Class (liftIO)
 import Data.HashMap.Strict as Map
+import qualified Data.IntSet as IntSet
+import qualified Data.Set as Set
 import Data.List (intercalate, nub)
-
--- ============================================================================
--- Internal Type Representation
--- ============================================================================
-
--- | Type variables are unique integers
-type TyVar = Int
-
--- | Internal type representation, separate from Surface.Expr.
--- Designed to support theorem proving (Curry-Howard) via dependent types.
-data Ty
-  = TVar TyVar              -- ^ Unification variable (mutable during inference)
-  | TRigid Name             -- ^ Rigid/skolem variable (from forall, not unifiable)
-  | TCon Name               -- ^ Type constructor: Int, Bool, Maybe, etc.
-  | TApp Ty [Ty]            -- ^ Type application: Maybe Int = TApp (TCon "Maybe") [TCon "Int"]
-  | TPi (Maybe Name) Ty Ty  -- ^ Dependent function type: (x:A) -> B(x)
-                             --   TPi Nothing a b = simple arrow (a -> b)
-                             --   TPi (Just "x") a b = dependent pi
-  | TSigma (Maybe Name) Ty Ty -- ^ Dependent pair type: (x:A) * B(x)
-                               --   TSigma Nothing a b = simple product
-                               --   TSigma (Just "x") a b = dependent sigma
-  | TId Ty Ty Ty            -- ^ Identity/propositional equality: Id(A, x, y)
-  | TForall Name Ty         -- ^ Polymorphic type: forall a. Ty
-  | TRecord Row             -- ^ Record type: {x:Int, y:Bool, ..r}
-  | TEffect Row Ty          -- ^ Effect type: Eff {console:Console, ..r} a
-  | TU Level                -- ^ Universe: TU (LConst 0) = Type, TU (LConst 1) = Type1, etc.
-  | TLevel                  -- ^ The type of universe levels themselves
-  | TLit Literal            -- ^ Value-level literal promoted to type level: TLit (LInt 3)
-  deriving (Show, Eq)
-
--- | Row types for structural records
-data Row
-  = REmpty                   -- ^ Closed row (no more fields)
-  | RExtend Name Ty Row      -- ^ Field extension: {name:Ty | rest}
-  | RVar TyVar               -- ^ Row variable (for open records)
-  | RRigid Name              -- ^ Rigid row variable
-  deriving (Show, Eq)
-
--- | Convenience: non-dependent arrow type
-pattern TArrow :: Ty -> Ty -> Ty
-pattern TArrow a b = TPi Nothing a b
-
--- | Convenience: non-dependent product type
-pattern TProd :: Ty -> Ty -> Ty
-pattern TProd a b = TSigma Nothing a b
 
 -- ============================================================================
 -- Type Checker State & Monad
@@ -96,46 +58,46 @@ pattern TProd a b = TSigma Nothing a b
 data TCMode = TCStrict | TCRelaxed deriving (Show, Eq)
 
 data TCError
-  = Mismatch Ty Ty             -- ^ Expected vs actual type mismatch
-  | OccursCheck TyVar Ty       -- ^ Infinite type detected
-  | UnboundVar Name            -- ^ Variable not in scope
-  | MissingField Name          -- ^ Record field not found
-  | ArityMismatch Int Int      -- ^ Expected vs actual argument count
-  | ConstraintUnsolved Constraint -- ^ Unresolved structure constraint
-  | OtherError String          -- ^ Generic error
-  | WithContext String TCError  -- ^ Error with location context
-  | SubtypeMismatch Ty Ty      -- ^ Subtype relationship doesn't hold
+  = Mismatch Expr Expr             -- ^ Expected vs actual type mismatch
+  | OccursCheck Int Expr           -- ^ Infinite type detected
+  | UnboundVar Name                -- ^ Variable not in scope
+  | MissingField Name              -- ^ Record field not found
+  | ArityMismatch Int Int          -- ^ Expected vs actual argument count
+  | ConstraintUnsolved Constraint  -- ^ Unresolved structure constraint
+  | OtherError String              -- ^ Generic error
+  | WithContext String TCError     -- ^ Error with location context
+  | WithSource SourceInfo TCError  -- ^ Error with source location (Phase 5)
+  | SubtypeMismatch Expr Expr      -- ^ Subtype relationship doesn't hold
   deriving (Show)
 
 data Constraint
-  = CStructure Name [Ty]       -- ^ e.g. CStructure "Eq" [TVar 3]
-  | CRowLack Name Row          -- ^ Field absence constraint for row unification
+  = CStructure Name [Expr]         -- ^ e.g. CStructure "Eq" [Meta 3]
+  | CRowLack Name Expr             -- ^ Field absence constraint for row unification
   deriving (Show)
 
 data TCState = TCState
-  { nextVar      :: !Int                      -- ^ Fresh variable counter
-  , substitution :: HashMap TyVar Ty          -- ^ Current substitution (unification results)
-  , rowSubst     :: HashMap TyVar Row         -- ^ Row variable substitution
-  , constraints  :: [Constraint]              -- ^ Deferred constraints
-  , tcErrors     :: [TCError]                 -- ^ Accumulated errors
-  , tcMode       :: TCMode                    -- ^ Strict or relaxed
+  { nextMeta      :: !Int                       -- ^ Fresh metavariable counter
+  , substitution  :: HashMap Int Expr           -- ^ Unified substitution (type vars AND row vars)
+  , constraints   :: [Constraint]               -- ^ Deferred constraints
+  , tcErrors      :: [TCError]                  -- ^ Accumulated errors
+  , tcMode        :: TCMode                     -- ^ Strict or relaxed
   } deriving (Show)
 
 data TCEnv = TCEnv
-  { varTypes    :: HashMap Name Ty            -- ^ Local variable types (gamma context)
-  , tyVarScope  :: [Name]                     -- ^ In-scope type variables
-  , envCompiler :: Maybe Environment          -- ^ Compiler environment for lookups
-  , tcContext   :: [String]                   -- ^ Error context stack (e.g., "function 'foo'")
+  { varTypes    :: HashMap Name Expr            -- ^ Local variable types (gamma context)
+  , tyVarScope  :: [Name]                       -- ^ In-scope type variables
+  , envCompiler :: Maybe Environment            -- ^ Compiler environment for lookups
+  , tcContext   :: [String]                      -- ^ Error context stack
+  , tcSourceInfo :: Maybe SourceInfo            -- ^ Current source location for error messages (Phase 5)
   }
 
 initTCState :: TCMode -> TCState
 initTCState mode = TCState
-  { nextVar      = 0
-  , substitution = Map.empty
-  , rowSubst     = Map.empty
-  , constraints  = []
-  , tcErrors     = []
-  , tcMode       = mode
+  { nextMeta      = 0
+  , substitution  = Map.empty
+  , constraints   = []
+  , tcErrors      = []
+  , tcMode        = mode
   }
 
 emptyTCEnv :: TCEnv
@@ -144,11 +106,10 @@ emptyTCEnv = TCEnv
   , tyVarScope  = []
   , envCompiler = Nothing
   , tcContext   = []
+  , tcSourceInfo = Nothing
   }
 
 -- | The TC monad: state over TCState, with environment passed explicitly.
--- We use Either for error short-circuiting during unification,
--- but accumulate non-fatal errors in tcErrors.
 type TC a = TCEnv -> TCState -> Either [TCError] (a, TCState)
 
 runTC :: TC a -> TCEnv -> TCState -> Either [TCError] (a, TCState)
@@ -185,16 +146,23 @@ tcWithContext ctx = tcLocal (\env -> env { tcContext = ctx : tcContext env })
 tcFail :: TCError -> TC a
 tcFail err _env _st = Left [err]
 
+-- | Fail with multiple errors (re-raise preserved errors)
+tcFails :: [TCError] -> TC a
+tcFails errs _env _st = Left errs
+
 -- | Record a non-fatal error and continue
 tcWarn :: TCError -> TC ()
 tcWarn err _env st = Right ((), st { tcErrors = err : tcErrors st })
 
--- | Warn in relaxed mode, fail in strict mode. Attaches context if available.
+-- | Warn in relaxed mode, fail in strict mode. Attaches context and source info if available.
 tcWarnOrFail :: TCError -> TC ()
 tcWarnOrFail err env st =
-  let wrapped = case tcContext env of
+  let withCtx = case tcContext env of
         []      -> err
         (ctx:_) -> WithContext ctx err
+      wrapped = case tcSourceInfo env of
+        Just si -> WithSource si withCtx
+        Nothing -> withCtx
   in case tcMode st of
     TCStrict  -> Left [wrapped]
     TCRelaxed -> Right ((), st { tcErrors = wrapped : tcErrors st })
@@ -207,405 +175,404 @@ tcMapM_ :: (a -> TC ()) -> [a] -> TC ()
 tcMapM_ _ [] = tcPure ()
 tcMapM_ f (x:xs) = f x `tcBind` \_ -> tcMapM_ f xs
 
+-- | Access the compiler environment, applying a function if available.
+-- Returns the default action when no compiler environment is set (e.g., in unit tests).
+withCompilerEnv :: TC a -> (Environment -> TC a) -> TC a
+withCompilerEnv def f =
+  tcAsk `tcBind` \tenv ->
+    case envCompiler tenv of
+      Just cenv -> f cenv
+      Nothing   -> def
+
 -- ============================================================================
 -- Fresh Variables
 -- ============================================================================
 
--- | Generate a fresh unification type variable
-freshTyVar :: TC Ty
-freshTyVar _env st =
-  let v = nextVar st
-  in Right (TVar v, st { nextVar = v + 1 })
-
--- | Generate a fresh row variable
-freshRowVar :: TC Row
-freshRowVar _env st =
-  let v = nextVar st
-  in Right (RVar v, st { nextVar = v + 1 })
+-- | Generate a fresh unification metavariable
+freshMeta :: TC Expr
+freshMeta _env st =
+  let v = nextMeta st
+  in Right (Meta v, st { nextMeta = v + 1 })
 
 -- ============================================================================
--- Expr → Ty Conversion
+-- Expr → Type Normalization
 -- ============================================================================
 
--- | Convert a Surface AST type expression to the internal Ty representation.
-exprToTy :: Expr -> TC Ty
-exprToTy UNDEFINED = freshTyVar  -- unknown type → fresh var
-exprToTy (U n) = tcPure (TU (LConst n))
--- Literal promotion: value-level literals → type-level literals (for dependent types)
-exprToTy (Lit l) = tcPure (TLit l)
-exprToTy (Id "Int") = tcPure (TCon "Int")
-exprToTy (Id "Float64") = tcPure (TCon "Float64")
-exprToTy (Id "String") = tcPure (TCon "String")
-exprToTy (Id "Char") = tcPure (TCon "Char")
-exprToTy (Id "Bool") = tcPure (TCon "Bool")
-exprToTy (Id "Nat") = tcPure (TCon "Nat")
-exprToTy (Id "Int8") = tcPure (TCon "Int8")
-exprToTy (Id "Int16") = tcPure (TCon "Int16")
-exprToTy (Id "Int32") = tcPure (TCon "Int32")
-exprToTy (Id "Int64") = tcPure (TCon "Int64")
-exprToTy (Id "UInt") = tcPure (TCon "UInt")
-exprToTy (Id "UInt8") = tcPure (TCon "UInt8")
-exprToTy (Id "UInt16") = tcPure (TCon "UInt16")
-exprToTy (Id "UInt32") = tcPure (TCon "UInt32")
-exprToTy (Id "UInt64") = tcPure (TCon "UInt64")
-exprToTy (Id "Float32") = tcPure (TCon "Float32")
-exprToTy (Id "Byte") = tcPure (TCon "Byte")
-exprToTy (Id "Array") = tcPure (TCon "Array")
-exprToTy (Id name) = do
-  -- Check if it's a known type constructor or a type variable
-  -- Capital-letter names are type constructors, lowercase are type variables
-  tcAsk `tcBind` \env ->
-    if not (Prelude.null name) && isUpper (Prelude.head name)
-    then tcPure (TCon name)
-    else if name `Prelude.elem` tyVarScope env
-         then tcPure (TRigid name)
-         else tcPure (TRigid name)  -- assume type variable even if not in scope
-  where
-    isUpper c = c >= 'A' && c <= 'Z'
--- PropEq(A, x, y) → TId (canonical name; PropEqT kept as legacy alias)
-exprToTy (App (Id "PropEqT") [tyExpr, lhs, rhs]) =
-  exprToTy tyExpr `tcBind` \t ->
-    exprToTy lhs `tcBind` \l ->
-      exprToTy rhs `tcBind` \r ->
-        tcPure (TId t l r)
-exprToTy (App (Id "PropEq") [tyExpr, lhs, rhs]) =
-  exprToTy tyExpr `tcBind` \t ->
-    exprToTy lhs `tcBind` \l ->
-      exprToTy rhs `tcBind` \r ->
-        tcPure (TId t l r)
-exprToTy (App (Id name) args) =
-  tcMapM exprToTy args `tcBind` \tyArgs ->
-    tcPure (TApp (TCon name) tyArgs)
-exprToTy (Pi Nothing a b) =
-  exprToTy a `tcBind` \ta ->
-    exprToTy b `tcBind` \tb ->
-      tcPure (TPi Nothing ta tb)
-exprToTy (Pi (Just n) a b) =
-  exprToTy a `tcBind` \ta ->
-    exprToTy b `tcBind` \tb ->
-      tcPure (TPi (Just n) ta tb)
-exprToTy (Implicit inner) =
-  exprToTy inner  -- for now, just look through Implicit wrappers
-exprToTy (NTuple fields) =
-  -- Unified tuple/record type: positional → TSigma, named → TSigma with names
-  tcMapM (\(mn, e) -> exprToTy e `tcBind` \ty -> tcPure (mn, ty)) fields `tcBind` \typedFields ->
+-- | Normalize a Surface AST expression into a form suitable for type checking.
+-- Replaces exprToTy: most Expr forms are already valid types (Id, App, Pi, etc.).
+-- Only a few forms need conversion (UNDEFINED → fresh meta, RecordType → RowExtend chain, etc.).
+normalizeTypeExpr :: Expr -> TC Expr
+normalizeTypeExpr UNDEFINED = freshMeta
+normalizeTypeExpr (U l) = tcPure (U l)
+normalizeTypeExpr (Lit l) = tcPure (Lit l)
+normalizeTypeExpr (Id name) = tcPure (Id name)
+normalizeTypeExpr (Meta n) = tcPure (Meta n)
+normalizeTypeExpr RowEmpty = tcPure RowEmpty
+normalizeTypeExpr (RowExtend n t r) =
+  normalizeTypeExpr t `tcBind` \t' ->
+    normalizeTypeExpr r `tcBind` \r' ->
+      tcPure (RowExtend n t' r')
+-- PropEq / PropEqT → App (Id "PropEq") [t, l, r]
+normalizeTypeExpr (App (Id "PropEqT") [tyExpr, lhs, rhs]) =
+  tcMapM normalizeTypeExpr [tyExpr, lhs, rhs] `tcBind` \args' ->
+    tcPure (App (Id "PropEq") args')
+normalizeTypeExpr (App (Id "PropEq") args@[_, _, _]) =
+  tcMapM normalizeTypeExpr args `tcBind` \args' ->
+    tcPure (App (Id "PropEq") args')
+normalizeTypeExpr (App f args) =
+  normalizeTypeExpr f `tcBind` \f' ->
+    tcMapM normalizeTypeExpr args `tcBind` \args' ->
+      tcPure (App f' args')
+normalizeTypeExpr (Pi mn a b) =
+  normalizeTypeExpr a `tcBind` \a' ->
+    normalizeTypeExpr b `tcBind` \b' ->
+      tcPure (Pi mn a' b')
+normalizeTypeExpr (Sigma mn a b) =
+  normalizeTypeExpr a `tcBind` \a' ->
+    normalizeTypeExpr b `tcBind` \b' ->
+      tcPure (Sigma mn a' b')
+normalizeTypeExpr (Implicit inner) = normalizeTypeExpr inner
+normalizeTypeExpr (NTuple fields) =
+  tcMapM (\(mn, e) -> normalizeTypeExpr e `tcBind` \ty -> tcPure (mn, ty)) fields `tcBind` \typedFields ->
     case typedFields of
-      []        -> tcPure (TCon "Unit")
+      []        -> tcPure (Id "Unit")
       [(_, t)]  -> tcPure t
-      _         -> tcPure (Prelude.foldr (\(mn, t) acc -> TSigma mn t acc) (snd (Prelude.last typedFields)) (Prelude.init typedFields))
--- Record type: {x:Int, y:Bool, ..}
-exprToTy (RecordType fields isOpen) =
-  tcMapM (\(n, tpExpr) -> exprToTy tpExpr `tcBind` \ty -> tcPure (n, ty)) fields `tcBind` \typedFields ->
+      _         -> tcPure (Prelude.foldr (\(mn, t) acc -> Sigma mn t acc) (snd (Prelude.last typedFields)) (Prelude.init typedFields))
+normalizeTypeExpr (RecordType fields isOpen) =
+  tcMapM (\(n, tpExpr) -> normalizeTypeExpr tpExpr `tcBind` \ty -> tcPure (n, ty)) fields `tcBind` \typedFields ->
     if isOpen
-    then freshRowVar `tcBind` \rv ->
-           tcPure (TRecord (Prelude.foldr (\(n,t) r -> RExtend n t r) rv typedFields))
-    else tcPure (TRecord (Prelude.foldr (\(n,t) r -> RExtend n t r) REmpty typedFields))
--- Effect type: Eff { row } resultType
-exprToTy (EffType rowExpr resultExpr) =
-  exprToEffRow rowExpr `tcBind` \row ->
-    exprToTy resultExpr `tcBind` \resTy ->
-      tcPure (TEffect row resTy)
--- General App (non-Id head)
-exprToTy (App e args) =
-  exprToTy e `tcBind` \headTy ->
-    tcMapM exprToTy args `tcBind` \tyArgs ->
-      tcPure (TApp headTy tyArgs)
--- Function in type position → arrow type
-exprToTy (Function lam) = lamToTy lam
--- ConTuple in type position
-exprToTy (ConTuple (ConsTag cname _) args) =
-  tcMapM exprToTy args `tcBind` \tyArgs ->
-    tcPure (TApp (TCon cname) tyArgs)
--- Known declaration forms — not types, skip silently
-exprToTy (ModuleDecl _) = freshTyVar
-exprToTy (Import _ _ _) = freshTyVar
-exprToTy (Export _ _) = freshTyVar
-exprToTy (PrivateDecl _) = freshTyVar
-exprToTy (SumType _) = freshTyVar
-exprToTy (Structure _ _) = freshTyVar
-exprToTy (Instance _ _ _ _) = freshTyVar
-exprToTy (ClassDecl _ _) = freshTyVar
-exprToTy Intrinsic = freshTyVar
-exprToTy Derive = freshTyVar
--- Fallback: if we can't convert, use a fresh variable with warning
-exprToTy e =
-  tcWarn (OtherError $ "Cannot convert to type: " ++ showExprBrief e)
-    `tcBind` \_ -> freshTyVar
+    then freshMeta `tcBind` \rv ->
+           tcPure (Prelude.foldr (\(n,t) r -> RowExtend n t r) rv typedFields)
+    else tcPure (Prelude.foldr (\(n,t) r -> RowExtend n t r) RowEmpty typedFields)
+normalizeTypeExpr (EffType rowExpr resExpr) =
+  normalizeEffRow rowExpr `tcBind` \row ->
+    normalizeTypeExpr resExpr `tcBind` \resTy ->
+      tcPure (EffType row resTy)
+normalizeTypeExpr (Function lam) = inferLamType lam
+normalizeTypeExpr (ConTuple (ConsTag cname _) args) =
+  tcMapM normalizeTypeExpr args `tcBind` \tyArgs ->
+    tcPure (App (Id cname) tyArgs)
+-- Known declaration/statement forms — not types, map to fresh meta silently (Phase 7A: exhaustive)
+normalizeTypeExpr (ModuleDecl _) = freshMeta
+normalizeTypeExpr (Import _ _ _) = freshMeta
+normalizeTypeExpr (Export _ _) = freshMeta
+normalizeTypeExpr (PrivateDecl _) = freshMeta
+normalizeTypeExpr (SumType _) = freshMeta
+normalizeTypeExpr (Structure _ _) = freshMeta
+normalizeTypeExpr (Instance _ _ _ _) = freshMeta
+normalizeTypeExpr (ClassDecl _ _) = freshMeta
+normalizeTypeExpr Intrinsic = freshMeta
+normalizeTypeExpr Derive = freshMeta
+-- Value-level forms that are not types (Phase 7A: explicit cases, no catch-all)
+normalizeTypeExpr (BinaryOp _ _ _) = freshMeta
+normalizeTypeExpr (UnaryOp _ _) = freshMeta
+normalizeTypeExpr (Statements _) = freshMeta
+normalizeTypeExpr (ActionBlock _) = freshMeta
+normalizeTypeExpr (PatternMatches _) = freshMeta
+normalizeTypeExpr (CaseOf _ _ _) = freshMeta
+normalizeTypeExpr (ExpandedCase _ _ _) = freshMeta
+normalizeTypeExpr (IfThenElse _ _ _) = freshMeta
+normalizeTypeExpr (LetIn _ _) = freshMeta
+normalizeTypeExpr (Binding _) = freshMeta
+normalizeTypeExpr (Value _ _) = freshMeta
+normalizeTypeExpr (Primitive _) = freshMeta
+normalizeTypeExpr (Action _) = freshMeta
+normalizeTypeExpr (Constructors _) = freshMeta
+normalizeTypeExpr (DeclBlock _) = freshMeta
+normalizeTypeExpr (PatternGuard _ _) = freshMeta
+normalizeTypeExpr (RecFieldAccess _ _) = freshMeta
+normalizeTypeExpr (Repr _ _ _ _ _) = freshMeta
+normalizeTypeExpr (ReprCast _ _) = freshMeta
+normalizeTypeExpr (Law _ _) = freshMeta
+normalizeTypeExpr (PropEq _ _) = freshMeta
+normalizeTypeExpr (Implies _ _) = freshMeta
+normalizeTypeExpr (Open _) = freshMeta
+normalizeTypeExpr (OpaqueTy _ _) = freshMeta
+normalizeTypeExpr (TargetBlock _ _) = freshMeta
+normalizeTypeExpr (TargetSwitch _) = freshMeta
+normalizeTypeExpr (RecordConstruct _ _) = freshMeta
+normalizeTypeExpr (RecordUpdate _ _) = freshMeta
+normalizeTypeExpr (RecordPattern _ _) = freshMeta
+normalizeTypeExpr (EffectDecl _ _ _) = freshMeta
+normalizeTypeExpr (HandlerDecl _ _ _ _) = freshMeta
+normalizeTypeExpr (HandleWith _ _) = freshMeta
+normalizeTypeExpr (FixityDecl _ _ _) = freshMeta
+normalizeTypeExpr (ERROR msg) =
+  tcWarn (OtherError $ "Error node in type position: " ++ msg) `tcBind` \_ -> freshMeta
 
--- | Convert an effect row expression to a Row
-exprToEffRow :: Expr -> TC Row
-exprToEffRow (RecordType fields isOpen) =
-  tcMapM (\(n, tpExpr) -> exprToTy tpExpr `tcBind` \ty -> tcPure (n, ty)) fields `tcBind` \typedFields ->
-    if isOpen
-    then freshRowVar `tcBind` \rv ->
-           tcPure (Prelude.foldr (\(n,t) r -> RExtend n t r) rv typedFields)
-    else tcPure (Prelude.foldr (\(n,t) r -> RExtend n t r) REmpty typedFields)
-exprToEffRow _ = freshRowVar  -- unknown row → fresh row var
+-- | Convert an effect row expression to an Expr row.
+-- Reuses normalizeTypeExpr for RecordType; defaults to fresh meta for unknowns.
+normalizeEffRow :: Expr -> TC Expr
+normalizeEffRow e@(RecordType _ _) = normalizeTypeExpr e
+normalizeEffRow _ = freshMeta
+
+-- ============================================================================
+-- Generic Type-Expr Traversal Infrastructure (Phase 1)
+-- ============================================================================
+
+-- | Apply a function to all immediate type-relevant children of an Expr node,
+-- reconstructing the node. Atoms (Meta, Id, U, Lit, RowEmpty) return self.
+-- This is the single point of truth for "what children does a type-Expr have?"
+mapTypeChildren :: (Expr -> Expr) -> Expr -> Expr
+mapTypeChildren _ e@(Meta _)     = e
+mapTypeChildren _ e@(Id _)       = e
+mapTypeChildren _ e@(U _)        = e
+mapTypeChildren _ e@(Lit _)      = e
+mapTypeChildren _ e@RowEmpty     = e
+mapTypeChildren _ e@UNDEFINED    = e
+mapTypeChildren f (App c args)        = App (f c) (Prelude.map f args)
+mapTypeChildren f (Pi mn a b)         = Pi mn (f a) (f b)
+mapTypeChildren f (Sigma mn a b)      = Sigma mn (f a) (f b)
+mapTypeChildren f (RowExtend l t r)   = RowExtend l (f t) (f r)
+mapTypeChildren f (EffType r t)       = EffType (f r) (f t)
+mapTypeChildren f (NTuple fields)     = NTuple (Prelude.map (\(mn, e) -> (mn, f e)) fields)
+mapTypeChildren f (ConTuple ct exprs) = ConTuple ct (Prelude.map f exprs)
+mapTypeChildren f (Typed e t)         = Typed (f e) (f t)
+mapTypeChildren f (ArrayLit exprs)    = ArrayLit (Prelude.map f exprs)
+mapTypeChildren f (Implicit e)        = Implicit (f e)
+mapTypeChildren f (RecordType fs o)   = RecordType (Prelude.map (\(n, e) -> (n, f e)) fs) o
+mapTypeChildren _ e                   = e  -- all other Expr forms are non-type atoms for our purposes
+
+-- | Accumulation variant: fold a monoid over all immediate type-relevant children.
+foldMapTypeChildren :: Monoid m => (Expr -> m) -> Expr -> m
+foldMapTypeChildren _ (Meta _)     = mempty
+foldMapTypeChildren _ (Id _)       = mempty
+foldMapTypeChildren _ (U _)        = mempty
+foldMapTypeChildren _ (Lit _)      = mempty
+foldMapTypeChildren _ RowEmpty     = mempty
+foldMapTypeChildren _ UNDEFINED    = mempty
+foldMapTypeChildren f (App c args)        = f c <> mconcat (Prelude.map f args)
+foldMapTypeChildren f (Pi _ a b)          = f a <> f b
+foldMapTypeChildren f (Sigma _ a b)       = f a <> f b
+foldMapTypeChildren f (RowExtend _ t r)   = f t <> f r
+foldMapTypeChildren f (EffType r t)       = f r <> f t
+foldMapTypeChildren f (NTuple fields)     = mconcat (Prelude.map (f . snd) fields)
+foldMapTypeChildren f (ConTuple _ exprs)  = mconcat (Prelude.map f exprs)
+foldMapTypeChildren f (Typed e t)         = f e <> f t
+foldMapTypeChildren f (ArrayLit exprs)    = mconcat (Prelude.map f exprs)
+foldMapTypeChildren f (Implicit e)        = f e
+foldMapTypeChildren f (RecordType fs _)   = mconcat (Prelude.map (f . snd) fs)
+foldMapTypeChildren _ _                   = mempty
 
 -- ============================================================================
 -- Substitution Application
 -- ============================================================================
 
--- | Apply the current substitution to a type, fully resolving all known variables.
-applySubst :: Ty -> TC Ty
-applySubst (TVar v) =
+-- | Apply the current substitution to a type expression, fully resolving all known metavariables.
+-- Uses mapTypeChildren for structural recursion; Meta gets special path-compression treatment (Phase 6B).
+applySubst :: Expr -> TC Expr
+applySubst (Meta v) =
   tcGet `tcBind` \st ->
     case Map.lookup v (substitution st) of
-      Just ty -> applySubst ty  -- chase the chain
-      Nothing -> tcPure (TVar v)
-applySubst (TRigid n) = tcPure (TRigid n)
-applySubst (TCon n) = tcPure (TCon n)
-applySubst (TApp c args) =
-  applySubst c `tcBind` \c' ->
-    tcMapM applySubst args `tcBind` \args' ->
-      tcPure (TApp c' args')
-applySubst (TPi mn a b) =
-  applySubst a `tcBind` \a' ->
-    applySubst b `tcBind` \b' ->
-      tcPure (TPi mn a' b')
-applySubst (TSigma mn a b) =
-  applySubst a `tcBind` \a' ->
-    applySubst b `tcBind` \b' ->
-      tcPure (TSigma mn a' b')
-applySubst (TId t a b) =
-  applySubst t `tcBind` \t' ->
-    applySubst a `tcBind` \a' ->
-      applySubst b `tcBind` \b' ->
-        tcPure (TId t' a' b')
-applySubst (TForall n t) =
-  applySubst t `tcBind` \t' ->
-    tcPure (TForall n t')
-applySubst (TRecord row) =
-  applySubstRow row `tcBind` \row' ->
-    tcPure (TRecord row')
-applySubst (TEffect row ty) =
-  applySubstRow row `tcBind` \row' ->
-    applySubst ty `tcBind` \ty' ->
-      tcPure (TEffect row' ty')
-applySubst (TU l) = tcPure (TU l)
-applySubst TLevel = tcPure TLevel
-applySubst (TLit l) = tcPure (TLit l)
-
-applySubstRow :: Row -> TC Row
-applySubstRow REmpty = tcPure REmpty
-applySubstRow (RExtend l t r) =
-  applySubst t `tcBind` \t' ->
-    applySubstRow r `tcBind` \r' ->
-      tcPure (RExtend l t' r')
-applySubstRow (RVar v) =
-  tcGet `tcBind` \st ->
-    case Map.lookup v (rowSubst st) of
-      Just row -> applySubstRow row
-      Nothing  -> tcPure (RVar v)
-applySubstRow (RRigid n) = tcPure (RRigid n)
+      Just ty -> applySubst ty `tcBind` \resolved ->
+        -- Path compression (Phase 6B): point v directly to the final resolved type
+        case resolved of
+          Meta v' | v' == v -> tcPure resolved  -- avoid self-loop
+          _ -> tcModify (\s -> s { substitution = Map.insert v resolved (substitution s) })
+               `tcBind` \_ -> tcPure resolved
+      Nothing -> tcPure (Meta v)
+applySubst e = applySubstChildren e
+  where
+    applySubstChildren (App c args) =
+      applySubst c `tcBind` \c' ->
+        tcMapM applySubst args `tcBind` \args' ->
+          tcPure (App c' args')
+    applySubstChildren (Pi mn a b) =
+      applySubst a `tcBind` \a' ->
+        applySubst b `tcBind` \b' ->
+          tcPure (Pi mn a' b')
+    applySubstChildren (Sigma mn a b) =
+      applySubst a `tcBind` \a' ->
+        applySubst b `tcBind` \b' ->
+          tcPure (Sigma mn a' b')
+    applySubstChildren (RowExtend l t r) =
+      applySubst t `tcBind` \t' ->
+        applySubst r `tcBind` \r' ->
+          tcPure (RowExtend l t' r')
+    applySubstChildren (EffType r t) =
+      applySubst r `tcBind` \r' ->
+        applySubst t `tcBind` \t' ->
+          tcPure (EffType r' t')
+    applySubstChildren (NTuple fields) =
+      tcMapM (\(mn, e') -> applySubst e' `tcBind` \e'' -> tcPure (mn, e'')) fields `tcBind` \fields' ->
+        tcPure (NTuple fields')
+    applySubstChildren (ConTuple ct exprs) =
+      tcMapM applySubst exprs `tcBind` \exprs' ->
+        tcPure (ConTuple ct exprs')
+    applySubstChildren (Typed e' t) =
+      applySubst e' `tcBind` \e'' ->
+        applySubst t `tcBind` \t' ->
+          tcPure (Typed e'' t')
+    applySubstChildren (ArrayLit exprs) =
+      tcMapM applySubst exprs `tcBind` \exprs' ->
+        tcPure (ArrayLit exprs')
+    applySubstChildren (Implicit e') =
+      applySubst e' `tcBind` \e'' -> tcPure (Implicit e'')
+    applySubstChildren (RecordType fields isOpen) =
+      tcMapM (\(n, e') -> applySubst e' `tcBind` \e'' -> tcPure (n, e'')) fields `tcBind` \fields' ->
+        tcPure (RecordType fields' isOpen)
+    applySubstChildren other = tcPure other  -- Id, U, Lit, RowEmpty, UNDEFINED, etc.
 
 -- ============================================================================
 -- Unification
 -- ============================================================================
 
--- | Bind a type variable to a type (with occurs check)
-bind :: TyVar -> Ty -> TC ()
+-- | Bind a metavariable to a type (with occurs check)
+bind :: Int -> Expr -> TC ()
 bind v ty =
   applySubst ty `tcBind` \ty' ->
     case ty' of
-      TVar v' | v == v' -> tcPure ()  -- already same
+      Meta v' | v == v' -> tcPure ()  -- already same
       _ -> if occursIn v ty'
            then tcFail (OccursCheck v ty')
            else tcModify (\st -> st { substitution = Map.insert v ty' (substitution st) })
 
--- | Check if a type variable occurs in a type
-occursIn :: TyVar -> Ty -> Bool
-occursIn v (TVar v')      = v == v'
-occursIn _ (TRigid _)     = False
-occursIn _ (TCon _)       = False
-occursIn v (TApp c args)  = occursIn v c || Prelude.any (occursIn v) args
-occursIn v (TPi _ a b)    = occursIn v a || occursIn v b
-occursIn v (TSigma _ a b) = occursIn v a || occursIn v b
-occursIn v (TId t a b)    = occursIn v t || occursIn v a || occursIn v b
-occursIn v (TForall _ t)  = occursIn v t
-occursIn v (TRecord row)  = occursInRow v row
-occursIn v (TEffect row ty) = occursInRow v row || occursIn v ty
-occursIn _ (TU _)         = False
-occursIn _ TLevel         = False
-occursIn _ (TLit _)       = False
+-- | Check if a metavariable occurs in an expression.
+-- Uses foldMapTypeChildren for structural recursion (Phase 1).
+occursIn :: Int -> Expr -> Bool
+occursIn v = go
+  where
+    go (Meta v') = v == v'
+    go e = Prelude.any go (typeChildren e)
 
-occursInRow :: TyVar -> Row -> Bool
-occursInRow _ REmpty          = False
-occursInRow v (RExtend _ t r) = occursIn v t || occursInRow v r
-occursInRow v (RVar v')       = v == v'
-occursInRow _ (RRigid _)      = False
+-- | Extract the list of immediate type-relevant children (utility for folds).
+typeChildren :: Expr -> [Expr]
+typeChildren (App c args)        = c : args
+typeChildren (Pi _ a b)          = [a, b]
+typeChildren (Sigma _ a b)       = [a, b]
+typeChildren (RowExtend _ t r)   = [t, r]
+typeChildren (EffType r t)       = [r, t]
+typeChildren (NTuple fields)     = Prelude.map snd fields
+typeChildren (ConTuple _ exprs)  = exprs
+typeChildren (Typed e t)         = [e, t]
+typeChildren (ArrayLit exprs)    = exprs
+typeChildren (Implicit e)        = [e]
+typeChildren (RecordType fs _)   = Prelude.map snd fs
+typeChildren _                   = []  -- Meta, Id, U, Lit, RowEmpty, UNDEFINED, etc.
 
 -- | Unify two types. Tries standard unification first; if that fails,
 -- normalizes both sides (evaluating type-level functions) and retries.
-unify :: Ty -> Ty -> TC ()
-unify t1 t2 =
+unify :: Expr -> Expr -> TC ()
+unify t1 t2
+  | t1 == t2  = tcPure ()  -- structural equality short-circuit
+  | otherwise =
   applySubst t1 `tcBind` \t1' ->
     applySubst t2 `tcBind` \t2' ->
-      tcTry (unify' t1' t2') `tcBind` \result ->
+      tcTryE (unify' t1' t2') `tcBind` \result ->
         case result of
-          Just _ -> tcPure ()   -- unified without normalization
-          Nothing ->            -- retry with type-level normalization
-            tcAsk `tcBind` \tenv ->
-              case envCompiler tenv of
-                Just env ->
-                  let t1n = normalizeTy env t1'
-                      t2n = normalizeTy env t2'
-                  in if t1n /= t1' || t2n /= t2'
-                     then unify' t1n t2n      -- normalization changed something, retry
-                     else unify' t1' t2'       -- nothing changed, fail with original error
-                Nothing -> unify' t1' t2'      -- no env, fail with original error
+          Right _ -> tcPure ()
+          Left origErrs ->
+            withCompilerEnv (tcFails origErrs) (\env ->
+              let t1n = normalizeTy env t1'
+                  t2n = normalizeTy env t2'
+              in tcTryE (unify' t1n t2n) `tcBind` \r2 ->
+                   case r2 of
+                     Right _ -> tcPure ()
+                     Left _  -> tcFails origErrs)  -- normalization didn't help, re-raise original error
 
-unify' :: Ty -> Ty -> TC ()
-unify' (TVar v) t = bind v t
-unify' t (TVar v) = bind v t
-unify' (TRigid a) (TRigid b) | a == b = tcPure ()
-unify' (TCon a) (TCon b) | a == b = tcPure ()
-unify' TLevel TLevel = tcPure ()
-unify' (TU l1) (TU l2) = case (levelEq l1 l2, levelLeq l1 l2) of
-  (Just True, _) -> tcPure ()            -- equal levels
-  (_, Just True)  -> tcPure ()           -- cumulativity: U l1 ≤ U l2
-  _ -> tcFail (Mismatch (TU l1) (TU l2))  -- can't decide or l1 > l2
-unify' (TPi mn1 a1 r1) (TPi mn2 a2 r2) =
+-- | Shared helper for Pi/Sigma unification (Phase 1: unifyBinder).
+-- Uses "#$sk_" prefix for Skolem variables — # and $ cannot appear in user identifiers (Phase 2A).
+unifyBinder :: Maybe Name -> Expr -> Expr -> Maybe Name -> Expr -> Expr -> TC ()
+unifyBinder mn1 a1 r1 mn2 a2 r2 =
   unify a1 a2 `tcBind` \_ ->
   case (mn1, mn2) of
     (Just n1, Just n2) | n1 /= n2 ->
       tcGet `tcBind` \st ->
-        let freshName = "__pi_" ++ show (nextVar st)
-            rigid = TRigid freshName
-        in tcModify (\s -> s { nextVar = nextVar s + 1 }) `tcBind` \_ ->
+        let freshName = "#$sk_" ++ show (nextMeta st)
+            rigid = Id freshName
+        in tcModify (\s -> s { nextMeta = nextMeta s + 1 }) `tcBind` \_ ->
           unify (substTyVar n1 rigid r1) (substTyVar n2 rigid r2)
     _ -> unify r1 r2
-unify' (TSigma mn1 a1 r1) (TSigma mn2 a2 r2) =
-  unify a1 a2 `tcBind` \_ ->
-  case (mn1, mn2) of
-    (Just n1, Just n2) | n1 /= n2 ->
-      tcGet `tcBind` \st ->
-        let freshName = "__sigma_" ++ show (nextVar st)
-            rigid = TRigid freshName
-        in tcModify (\s -> s { nextVar = nextVar s + 1 }) `tcBind` \_ ->
-          unify (substTyVar n1 rigid r1) (substTyVar n2 rigid r2)
-    _ -> unify r1 r2
-unify' (TLit l1) (TLit l2) | l1 == l2 = tcPure ()
-unify' (TId t1 a1 b1) (TId t2 a2 b2) =
-  unify t1 t2 `tcBind` \_ -> unify a1 a2 `tcBind` \_ -> unify b1 b2
-unify' (TApp c1 as1) (TApp c2 as2)
+
+unify' :: Expr -> Expr -> TC ()
+unify' (Meta v) t = bind v t
+unify' t (Meta v) = bind v t
+unify' (Id a) (Id b) | a == b = tcPure ()
+unify' (U l1) (U l2) = case levelEq l1 l2 of
+  Just True -> tcPure ()
+  -- Cumulativity (U n <= U m) is handled in subtype', not here.
+  -- Unification requires exact equality of universe levels.
+  _ -> tcFail (Mismatch (U l1) (U l2))
+-- Pi/Sigma unification uses shared helper (Phase 1: unifyBinder)
+unify' (Pi mn1 a1 r1) (Pi mn2 a2 r2) = unifyBinder mn1 a1 r1 mn2 a2 r2
+unify' (Sigma mn1 a1 r1) (Sigma mn2 a2 r2) = unifyBinder mn1 a1 r1 mn2 a2 r2
+unify' (Lit l1) (Lit l2) | l1 == l2 = tcPure ()
+unify' (App f1 as1) (App f2 as2)
   | Prelude.length as1 == Prelude.length as2 =
-      unify c1 c2 `tcBind` \_ ->
+      unify f1 f2 `tcBind` \_ ->
         tcMapM_ (\(a, b) -> unify a b) (Prelude.zip as1 as2)
-unify' (TRecord r1) (TRecord r2) = unifyRows r1 r2
-unify' (TEffect r1 t1) (TEffect r2 t2) =
-  unifyRows r1 r2 `tcBind` \_ -> unify t1 t2
-unify' (TForall a t1) (TForall b t2) =
-  -- Alpha-rename: replace both bound vars with the same fresh rigid var, then unify bodies
-  -- Using a rigid var ensures we check structural equivalence, not unifiability
-  tcGet `tcBind` \st ->
-    let freshName = "__forall_" ++ show (nextVar st)
-        rigid = TRigid freshName
-    in tcModify (\s -> s { nextVar = nextVar s + 1 }) `tcBind` \_ ->
-      let t1' = substTyVar a rigid t1
-          t2' = substTyVar b rigid t2
-      in unify t1' t2'
--- Structural subtyping: TCon (nominal record) vs TRecord (structural record)
--- If a nominal type has a single constructor whose fields match the structural record, unify succeeds.
-unify' (TCon name) (TRecord row) =
-  tcAsk `tcBind` \env ->
-    case envCompiler env of
-      Just cenv -> case expandNominalToRow name cenv of
-        Just nomRow -> unifyRows nomRow row
-        Nothing -> tcFail (Mismatch (TCon name) (TRecord row))
-      Nothing -> tcFail (Mismatch (TCon name) (TRecord row))
-unify' (TRecord row) (TCon name) =
-  tcAsk `tcBind` \env ->
-    case envCompiler env of
-      Just cenv -> case expandNominalToRow name cenv of
-        Just nomRow -> unifyRows row nomRow
-        Nothing -> tcFail (Mismatch (TRecord row) (TCon name))
-      Nothing -> tcFail (Mismatch (TRecord row) (TCon name))
-unify' t1 t2 = tcFail (Mismatch t1 t2)
-
--- | Row unification (Remy-style)
-unifyRows :: Row -> Row -> TC ()
-unifyRows REmpty REmpty = tcPure ()
-unifyRows (RExtend l1 t1 r1) row2 =
+-- Row unification (Remy-style) — merged into unify'
+unify' (RowExtend l1 t1 r1) row2 =
   rowExtract l1 row2 `tcBind` \(t2, r2') ->
     unify t1 t2 `tcBind` \_ ->
-      unifyRows r1 r2'
-unifyRows (RVar v) row = bindRow v row
-unifyRows row (RVar v) = bindRow v row
-unifyRows r1 r2 = tcFail (OtherError $ "Cannot unify rows: " ++ show r1 ++ " vs " ++ show r2)
+      unify r1 r2'
+unify' RowEmpty RowEmpty = tcPure ()
+unify' (EffType r1 t1) (EffType r2 t2) =
+  unify r1 r2 `tcBind` \_ -> unify t1 t2
+-- Structural subtyping: Id (nominal record) vs RowExtend (structural record)
+unify' (Id name) row@(RowExtend _ _ _) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Just cenv -> case expandNominalToRow name cenv of
+        Just nomRow -> unify nomRow row
+        Nothing -> tcFail (Mismatch (Id name) row)
+      Nothing -> tcFail (Mismatch (Id name) row)
+unify' row@(RowExtend _ _ _) (Id name) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Just cenv -> case expandNominalToRow name cenv of
+        Just nomRow -> unify row nomRow
+        Nothing -> tcFail (Mismatch row (Id name))
+      Nothing -> tcFail (Mismatch row (Id name))
+unify' t1 t2 = tcFail (Mismatch t1 t2)
 
 -- | Extract a field from a row
-rowExtract :: Name -> Row -> TC (Ty, Row)
-rowExtract l (RExtend l' t r)
+rowExtract :: Name -> Expr -> TC (Expr, Expr)
+rowExtract l (RowExtend l' t r)
   | l == l'   = tcPure (t, r)
   | otherwise = rowExtract l r `tcBind` \(t', r') ->
-                  tcPure (t', RExtend l' t r')
-rowExtract l (RVar v) =
-  freshTyVar `tcBind` \t ->
-    freshRowVar `tcBind` \r ->
-      bindRow v (RExtend l t r) `tcBind` \_ ->
-        case t of
-          TVar _ -> tcPure (t, r)
-          _      -> tcPure (t, r)
-rowExtract l REmpty = tcFail (MissingField l)
-rowExtract l (RRigid n) = tcFail (OtherError $ "Cannot extract field " ++ l ++ " from rigid row " ++ n)
+                  tcPure (t', RowExtend l' t r')
+rowExtract l (Meta v) =
+  freshMeta `tcBind` \t ->
+    freshMeta `tcBind` \r ->
+      bind v (RowExtend l t r) `tcBind` \_ ->
+        tcPure (t, r)
+rowExtract l RowEmpty = tcFail (MissingField l)
+rowExtract l (Id n) = tcFail (OtherError $ "Cannot extract field " ++ l ++ " from rigid row " ++ n)
+rowExtract l _ = tcFail (MissingField l)
 
--- | Bind a row variable
-bindRow :: TyVar -> Row -> TC ()
-bindRow v row =
-  applySubstRow row `tcBind` \row' ->
-    case row' of
-      RVar v' | v == v' -> tcPure ()
-      _ -> if occursInRow v row'
-           then tcFail (OtherError "Occurs check in row unification")
-           else tcModify (\st -> st { rowSubst = Map.insert v row' (rowSubst st) })
-
--- | Expand a nominal type (TCon) to a structural row, if it's a single-constructor type (record).
--- Returns Just Row if the type has exactly one constructor with named fields, Nothing otherwise.
-expandNominalToRow :: Name -> Environment -> Maybe Row
+-- | Expand a nominal type to a structural row, if it's a single-constructor type (record).
+expandNominalToRow :: Name -> Environment -> Maybe Expr
 expandNominalToRow typeName env =
-  -- Look up the constructor with the same name as the type (record convention)
   case lookupConstructor typeName env of
     Just (lam, _tag) ->
       let ps = params lam
       in if not (Prelude.null ps) && Prelude.all (\v -> Surface.name v /= "" && Surface.name v /= "_") ps
-         then Just (Prelude.foldr (\v r -> RExtend (Surface.name v) (exprToTyPure (typ v)) r) REmpty ps)
+         then Just (Prelude.foldr (\v r -> RowExtend (Surface.name v) (typ v) r) RowEmpty ps)
          else Nothing
     Nothing -> Nothing
-  where
-    -- Simple expression-to-type conversion for constructor parameter types
-    -- (no TC monad needed — constructor types are already concrete)
-    exprToTyPure :: Expr -> Ty
-    exprToTyPure (Id n) = TCon n
-    exprToTyPure (App (Id n) args) = TApp (TCon n) (Prelude.map exprToTyPure args)
-    exprToTyPure (U n) = TU (LConst n)
-    exprToTyPure (Pi mn a b) = TPi mn (exprToTyPure a) (exprToTyPure b)
-    exprToTyPure UNDEFINED = TCon "?"
-    exprToTyPure _ = TCon "?"
 
 -- ============================================================================
 -- Subtype Checking
 -- ============================================================================
 
 -- | Check if t1 is a subtype of t2 (t1 <: t2).
--- First tries unification (exact match); falls back to class hierarchy walk.
-subtype :: Ty -> Ty -> TC ()
+subtype :: Expr -> Expr -> TC ()
 subtype t1 t2 =
   applySubst t1 `tcBind` \t1' ->
     applySubst t2 `tcBind` \t2' ->
       tcTry (unify t1' t2') `tcBind` \result ->
         case result of
-          Just _  -> tcPure ()  -- exact match is always a subtype
+          Just _  -> tcPure ()
           Nothing -> subtype' t1' t2'
 
-subtype' :: Ty -> Ty -> TC ()
-subtype' (TCon a) (TCon b) =
+subtype' :: Expr -> Expr -> TC ()
+subtype' (Id a) (Id b) =
   tcAsk `tcBind` \env ->
     case envCompiler env of
       Just cenv | isSubclassOf a b cenv -> tcPure ()
-      _ -> tcFail (SubtypeMismatch (TCon a) (TCon b))
--- TApp: covariant subtyping for immutable type constructors
-subtype' (TApp (TCon a) as1) (TApp (TCon b) as2)
+      _ -> tcFail (SubtypeMismatch (Id a) (Id b))
+subtype' (App (Id a) as1) (App (Id b) as2)
   | a == b && Prelude.length as1 == Prelude.length as2 =
       tcMapM_ (\(x,y) -> subtype x y) (Prelude.zip as1 as2)
   | otherwise =
@@ -613,233 +580,254 @@ subtype' (TApp (TCon a) as1) (TApp (TCon b) as2)
         case envCompiler env of
           Just cenv | isSubclassOf a b cenv && Prelude.length as1 == Prelude.length as2 ->
             tcMapM_ (\(x,y) -> subtype x y) (Prelude.zip as1 as2)
-          _ -> tcFail (SubtypeMismatch (TApp (TCon a) as1) (TApp (TCon b) as2))
--- Universe cumulativity: U n is a subtype of U m when n ≤ m
-subtype' TLevel TLevel = tcPure ()
-subtype' (TU l1) (TU l2) = case levelLeq l1 l2 of
+          _ -> tcFail (SubtypeMismatch (App (Id a) as1) (App (Id b) as2))
+subtype' (Id "Level") (Id "Level") = tcPure ()
+subtype' (U l1) (U l2) = case levelLeq l1 l2 of
   Just True -> tcPure ()
-  _ -> tcFail (SubtypeMismatch (TU l1) (TU l2))
+  _ -> tcFail (SubtypeMismatch (U l1) (U l2))
 subtype' t1 t2 = tcFail (SubtypeMismatch t1 t2)
 
 -- ============================================================================
 -- Polymorphism: Instantiation & Generalization
 -- ============================================================================
 
--- | Instantiate a polymorphic type by replacing bound type variables with fresh unification vars
-instantiate :: Ty -> TC Ty
-instantiate (TForall a bodyTy) =
-  freshTyVar `tcBind` \freshVar ->
-    instantiate (substTyVar a freshVar bodyTy)
+-- | Instantiate a polymorphic type by replacing bound type variables with fresh metavars.
+-- Handles any universe level (Type, Type1, Type2, ...), not just Type.
+-- Phase 2C: also recognizes Id "Type", Id "Type1" etc. as universe-like domains.
+instantiate :: Expr -> TC Expr
+instantiate (Pi (Just a) dom bodyTy)
+  | isUniverseLike dom =
+    freshMeta `tcBind` \freshVar ->
+      instantiate (substTyVar a freshVar bodyTy)
 instantiate ty = tcPure ty
 
--- | Substitute a rigid type variable name with a Ty throughout a type
-substTyVar :: Name -> Ty -> Ty -> Ty
-substTyVar n replacement (TRigid m) | n == m = replacement
-substTyVar n r (TApp c args) = TApp (substTyVar n r c) (Prelude.map (substTyVar n r) args)
-substTyVar n r (TPi mn a b)
-  | mn == Just n = TPi mn (substTyVar n r a) b  -- shadowed: don't substitute in body
-  | otherwise    = TPi mn (substTyVar n r a) (substTyVar n r b)
-substTyVar n r (TSigma mn a b)
-  | mn == Just n = TSigma mn (substTyVar n r a) b  -- shadowed: don't substitute in body
-  | otherwise    = TSigma mn (substTyVar n r a) (substTyVar n r b)
-substTyVar n r (TId t a b) = TId (substTyVar n r t) (substTyVar n r a) (substTyVar n r b)
-substTyVar n r (TForall m t) | n == m = TForall m t  -- shadowed
-                              | otherwise = TForall m (substTyVar n r t)
-substTyVar n r (TRecord row) = TRecord (substTyVarRow n r row)
-substTyVar n r (TEffect row ty) = TEffect (substTyVarRow n r row) (substTyVar n r ty)
-substTyVar n r (TU l) = TU (substLevel n (tyToLevel r) l)
+-- | Instantiate free lowercase type variable Ids with fresh metas.
+-- Used for constructor types (which use rigid type names from the type definition).
+-- Each unique free lowercase Id gets a consistent fresh meta.
+instantiateFreeTypeVars :: Environment -> Expr -> TC Expr
+instantiateFreeTypeVars cenv ty =
+  let freeVars = Set.toList (collectFreeTypeVarIds ty)
+      unboundVars = Prelude.filter (\n -> isLowercaseTypeVar n && not (isKnownType n)) freeVars
+  in if Prelude.null unboundVars
+     then tcPure ty
+     else tcMapM (\_ -> freshMeta) unboundVars `tcBind` \freshVars ->
+       let mapping = Prelude.zip unboundVars freshVars
+           result = Prelude.foldl (\t (n, fv) -> substTyVar n fv t) ty mapping
+       in tcPure result
   where
-    tyToLevel (TU l') = l'
-    tyToLevel _ = l  -- if replacement isn't a level, keep original
-substTyVar _ _ ty = ty  -- TVar, TCon, TLevel, TLit — atoms don't contain rigid vars
+    isKnownType n = Map.member n (types cenv)
+                 || Map.member n (constructors cenv)
 
-substTyVarRow :: Name -> Ty -> Row -> Row
-substTyVarRow _ _ REmpty = REmpty
-substTyVarRow n r (RExtend l t rest) = RExtend l (substTyVar n r t) (substTyVarRow n r rest)
-substTyVarRow _ _ row = row  -- RVar, RRigid
+-- | Check if an expression represents a universe type (for instantiation).
+-- Recognizes U _, Id "Type", Id "Type1", Id "Type2", etc.
+isUniverseLike :: Expr -> Bool
+isUniverseLike (U _) = True
+isUniverseLike (Id "Type") = True
+isUniverseLike (Id "Type1") = True
+isUniverseLike (Id "Type2") = True
+isUniverseLike _ = False
 
--- | Generalize a type by quantifying over free unification variables
--- that are not bound in the environment
-generalize :: Ty -> TC Ty
+-- | Substitute a named type variable with an Expr throughout a type.
+-- Special cases for: Id match, Pi/Sigma shadowing, U level substitution.
+-- Falls through to mapTypeChildren for all other structural recursion (Phase 1).
+substTyVar :: Name -> Expr -> Expr -> Expr
+substTyVar n r = go
+  where
+    go (Id m) | n == m = r
+    go (Pi mn a b)
+      | mn == Just n = Pi mn (go a) b  -- shadowed in body
+      | otherwise    = Pi mn (go a) (go b)
+    go (Sigma mn a b)
+      | mn == Just n = Sigma mn (go a) b  -- shadowed in body
+      | otherwise    = Sigma mn (go a) (go b)
+    go (U l) = U (substLevel n (exprToLevel r) l)
+    go e = mapTypeChildren go e
+    -- Phase 2D fix: handle Id "Type" / Id "Type1" in level conversion
+    exprToLevel (U l') = l'
+    exprToLevel (Id "Type") = LConst 0
+    exprToLevel (Id "Type1") = LConst 1
+    exprToLevel (Id "Type2") = LConst 2
+    exprToLevel _ = LConst 0  -- conservative fallback
+
+-- | Generalize a type by quantifying over free metavariables
+-- that are not bound in the environment.
+-- Phase 2B: uses U 1 for metas that appear as type constructor heads.
+generalize :: Expr -> TC Expr
 generalize ty =
   applySubst ty `tcBind` \ty' ->
     tcAsk `tcBind` \env ->
-      let freeVars = nub (freeTyVars ty')
+      let freeVars = nub (freeMetas ty')
           envVars = freeEnvVars env
           genVars = Prelude.filter (`Prelude.notElem` envVars) freeVars
-          -- Create names for generalized vars: a, b, c, ...
+          -- Phase 2B: collect metas appearing as App heads (type constructors need U 1)
+          appHeadMetas = collectAppHeadMetas ty'
+          metaKind v = if IntSet.member v appHeadMetas then U (LConst 1) else U (LConst 0)
           names = Prelude.zipWith (\v i -> (v, "t" ++ show i)) genVars [(0::Int)..]
       in if Prelude.null genVars
          then tcPure ty'
-         else let substed = Prelude.foldl (\t (v, nm) -> replaceTVar v (TRigid nm) t) ty' names
-              in tcPure (Prelude.foldr (\(_, nm) t -> TForall nm t) substed names)
+         else let substed = Prelude.foldl (\t (v, nm) -> replaceMeta v (Id nm) t) ty' names
+              in tcPure (Prelude.foldr (\(v, nm) t -> Pi (Just nm) (metaKind v) t) substed names)
 
--- | Find free (unresolved) type variables in a type
-freeTyVars :: Ty -> [TyVar]
-freeTyVars (TVar v) = [v]
-freeTyVars (TApp c args) = freeTyVars c ++ Prelude.concatMap freeTyVars args
-freeTyVars (TPi _ a b) = freeTyVars a ++ freeTyVars b
-freeTyVars (TSigma _ a b) = freeTyVars a ++ freeTyVars b
-freeTyVars (TId t a b) = freeTyVars t ++ freeTyVars a ++ freeTyVars b
-freeTyVars (TForall _ t) = freeTyVars t
-freeTyVars (TRecord row) = freeRowVars row
-freeTyVars (TEffect row ty) = freeRowVars row ++ freeTyVars ty
-freeTyVars _ = []
+-- | Collect metavariable IDs that appear as the head of an App node.
+-- These represent type constructors and should be quantified at U 1.
+collectAppHeadMetas :: Expr -> IntSet.IntSet
+collectAppHeadMetas (App (Meta v) _) = IntSet.singleton v `IntSet.union`
+  IntSet.empty  -- don't recurse into args for the head itself
+collectAppHeadMetas e = Prelude.foldl (\acc child -> acc `IntSet.union` collectAppHeadMetas child) IntSet.empty (typeChildren e)
 
-freeRowVars :: Row -> [TyVar]
-freeRowVars REmpty = []
-freeRowVars (RExtend _ t r) = freeTyVars t ++ freeRowVars r
-freeRowVars (RVar v) = [v]
-freeRowVars _ = []
+-- ============================================================================
+-- Zonking (Phase 4)
+-- ============================================================================
 
--- | Find all free type vars mentioned in the environment's varTypes
-freeEnvVars :: TCEnv -> [TyVar]
-freeEnvVars env = Prelude.concatMap freeTyVars (Map.elems (varTypes env))
+-- | Deep substitution pass: resolves all known metavars and replaces remaining
+-- unresolved metas with readable names (e.g., "?t0", "?t1").
+-- Apply after type checking to clean up types for error messages and annotations.
+zonk :: Expr -> TC Expr
+zonk e =
+  applySubst e `tcBind` \e' ->
+    tcPure (zonkRemaining e')
+  where
+    -- Replace unresolved Meta n with Id "?tN" for readable output
+    zonkRemaining (Meta n) = Id ("?t" ++ show n)
+    zonkRemaining expr = mapTypeChildren zonkRemaining expr
 
--- | Collect free rigid variable names from a type (for existential escape checking)
-freeRigidVars :: Ty -> [Name]
-freeRigidVars (TRigid n) = [n]
-freeRigidVars (TPi (Just n) a b) = freeRigidVars a ++ Prelude.filter (/= n) (freeRigidVars b)
-freeRigidVars (TPi Nothing a b) = freeRigidVars a ++ freeRigidVars b
-freeRigidVars (TSigma (Just n) a b) = freeRigidVars a ++ Prelude.filter (/= n) (freeRigidVars b)
-freeRigidVars (TSigma Nothing a b) = freeRigidVars a ++ freeRigidVars b
-freeRigidVars (TApp f args) = freeRigidVars f ++ Prelude.concatMap freeRigidVars args
-freeRigidVars (TRecord row) = freeRigidVarsRow row
-freeRigidVars (TEffect row t) = freeRigidVarsRow row ++ freeRigidVars t
-freeRigidVars (TForall _ t) = freeRigidVars t
-freeRigidVars (TId t a b) = freeRigidVars t ++ freeRigidVars a ++ freeRigidVars b
-freeRigidVars _ = []
+-- | Find free (unresolved) metavariables in a type expression.
+-- Uses IntSet internally (Phase 6A) for O(n log n) instead of O(n^2) list concat.
+freeMetas :: Expr -> [Int]
+freeMetas e = IntSet.toList (freeMetasSet e)
 
-freeRigidVarsRow :: Row -> [Name]
-freeRigidVarsRow REmpty = []
-freeRigidVarsRow (RExtend _ t r) = freeRigidVars t ++ freeRigidVarsRow r
-freeRigidVarsRow (RRigid n) = [n]
-freeRigidVarsRow _ = []
+-- | IntSet variant of freeMetas for efficient accumulation.
+freeMetasSet :: Expr -> IntSet.IntSet
+freeMetasSet (Meta v) = IntSet.singleton v
+freeMetasSet e = Prelude.foldl (\acc child -> acc `IntSet.union` freeMetasSet child) IntSet.empty (typeChildren e)
 
--- | Replace a TVar with a Ty throughout a type
-replaceTVar :: TyVar -> Ty -> Ty -> Ty
-replaceTVar v r (TVar v') | v == v' = r
-replaceTVar v r (TApp c args) = TApp (replaceTVar v r c) (Prelude.map (replaceTVar v r) args)
-replaceTVar v r (TPi mn a b) = TPi mn (replaceTVar v r a) (replaceTVar v r b)
-replaceTVar v r (TSigma mn a b) = TSigma mn (replaceTVar v r a) (replaceTVar v r b)
-replaceTVar v r (TId t a b) = TId (replaceTVar v r t) (replaceTVar v r a) (replaceTVar v r b)
-replaceTVar v r (TForall n t) = TForall n (replaceTVar v r t)
-replaceTVar v r (TRecord row) = TRecord (replaceTVarRow v r row)
-replaceTVar v r (TEffect row ty) = TEffect (replaceTVarRow v r row) (replaceTVar v r ty)
-replaceTVar _ _ ty = ty
+-- | Find all free metavars in the environment's varTypes
+freeEnvVars :: TCEnv -> [Int]
+freeEnvVars env = Prelude.concatMap freeMetas (Map.elems (varTypes env))
 
-replaceTVarRow :: TyVar -> Ty -> Row -> Row
-replaceTVarRow _ _ REmpty = REmpty
-replaceTVarRow v r (RExtend l t rest) = RExtend l (replaceTVar v r t) (replaceTVarRow v r rest)
-replaceTVarRow v r (RVar v') | v == v' = case r of { TRecord row -> row; _ -> RVar v' }
-replaceTVarRow _ _ row = row
+-- | Collect free rigid variable names from a type (for existential escape checking).
+-- Uses Set internally (Phase 6A) for efficient accumulation.
+-- Pi/Sigma binders shadow their bound name in the body.
+freeRigidVars :: Expr -> [Name]
+freeRigidVars e = Set.toList (freeRigidVarsSet e)
+
+freeRigidVarsSet :: Expr -> Set.Set Name
+freeRigidVarsSet (Id n)
+  | not (Prelude.null n) && Prelude.head n >= 'a' && Prelude.head n <= 'z' = Set.singleton n
+  | otherwise = Set.empty
+freeRigidVarsSet (Pi (Just n) a b) = freeRigidVarsSet a `Set.union` Set.delete n (freeRigidVarsSet b)
+freeRigidVarsSet (Sigma (Just n) a b) = freeRigidVarsSet a `Set.union` Set.delete n (freeRigidVarsSet b)
+freeRigidVarsSet e = Prelude.foldl (\acc child -> acc `Set.union` freeRigidVarsSet child) Set.empty (typeChildren e)
+
+-- | Replace a Meta with an Expr throughout a type.
+-- Uses mapTypeChildren for structural recursion (Phase 1).
+replaceMeta :: Int -> Expr -> Expr -> Expr
+replaceMeta v r = go
+  where
+    go (Meta v') | v == v' = r
+    go e = mapTypeChildren go e
 
 -- ============================================================================
 -- GADT Type Refinement
 -- ============================================================================
--- When pattern matching on a GADT constructor, the constructor's specific return
--- type is unified with the scrutinee's type, producing type refinements.
--- E.g., matching VNil : Vec(a, Z) against scrutinee : Vec(a, n) gives n = Z.
 
 -- | Extract GADT type refinements from ExpandedCase pattern checks.
--- Returns a list of (rigid var name, refined type) pairs that should be
--- applied as substitutions in the branch body.
-gadtRefine :: [Expr] -> TC [(Name, Ty)]
+gadtRefine :: [Expr] -> TC [(Name, Expr)]
 gadtRefine checks =
-  tcAsk `tcBind` \env ->
-    case envCompiler env of
-      Nothing -> tcPure []
-      Just cenv ->
-        -- Collect all constructor tag checks
-        let tagChecks = [(ct, scrut) | PatternGuard (PCheckTag ct) scrut <- checks]
+  withCompilerEnv (tcPure []) (\cenv ->
+    let tagChecks = [(ct, scrut) | PatternGuard (PCheckTag ct) scrut <- checks]
         in case tagChecks of
              [] -> tcPure []
              ((ConsTag cname _, scrutExpr) : _) ->
                case lookupConstructor cname cenv of
                  Nothing -> tcPure []
                  Just (conLam, _) ->
-                   -- Get the parent sum type name from the constructor's return type
                    let parentName = extractTypeName (lamType conLam)
                    in case Map.lookup parentName (types cenv) of
                         Nothing -> tcPure []
                         Just (SumType parentLam) ->
                           let typeParams = Prelude.map name (params parentLam)
-                          in if Prelude.null typeParams
-                             then tcPure []  -- no type params, no refinement possible
+                          -- Only apply GADT refinement when the constructor has a
+                          -- non-default return type. For regular constructors like
+                          -- Pair(a,b) : Pair(a,b), the return type trivially matches
+                          -- the parent type and no refinement is needed. Applying
+                          -- refinement to non-GADT constructors causes false type
+                          -- errors when the function's type variables shadow the
+                          -- constructor's type params.
+                          in if Prelude.null typeParams || not (isGADTConstructor typeParams conLam)
+                             then tcPure []
                              else gadtRefineWithParams typeParams conLam scrutExpr
-                        _ -> tcPure []
+                        _ -> tcPure [])
 
--- | Extract the type name from an expression like App (Id "Vec") [...] or Id "Bool"
+-- | Check if a constructor is a GADT constructor (has a non-default return type).
+-- A default return type is `TypeName(a, b, ...)` where the args are exactly the
+-- parent's type params in order. GADT constructors have more specific return types
+-- like `TypeName(Int, b)` or `TypeName(a, a)`.
+isGADTConstructor :: [Name] -> Lambda -> Bool
+isGADTConstructor typeParams conLam =
+  case lamType conLam of
+    App (Id _) args ->
+      -- Check if args are exactly the type params as Ids, in order
+      not (Prelude.length args == Prelude.length typeParams
+        && Prelude.and (Prelude.zipWith (\arg tp -> case arg of Id n -> n == tp; _ -> False) args typeParams))
+    Id _ -> not (Prelude.null typeParams)  -- Nullary but has type params → GADT
+    _ -> True  -- Complex return type → likely GADT
+
+-- | Extract the type name from an expression
 extractTypeName :: Expr -> Name
 extractTypeName (App (Id n) _) = n
 extractTypeName (Id n) = n
 extractTypeName _ = ""
 
--- | Perform GADT refinement: instantiate type params with fresh vars,
--- convert the constructor's return type, unify with scrutinee type.
-gadtRefineWithParams :: [Name] -> Lambda -> Expr -> TC [(Name, Ty)]
+-- | Perform GADT refinement
+gadtRefineWithParams :: [Name] -> Lambda -> Expr -> TC [(Name, Expr)]
 gadtRefineWithParams typeParams conLam scrutExpr =
-  -- Create fresh unification vars for each type parameter
-  tcMapM (\_ -> freshTyVar) typeParams `tcBind` \freshVars ->
+  tcMapM (\_ -> freshMeta) typeParams `tcBind` \freshVars ->
     let paramMapping = Prelude.zip typeParams freshVars
-        -- Build reverse map: TVar id → TRigid paramName (for resolving var chains)
-        reverseMap = [(v, TRigid n) | (n, TVar v) <- paramMapping]
-        -- Convert the constructor's GADT return type, replacing type params with fresh vars
+        reverseMap = [(v, Id n) | (n, Meta v) <- paramMapping]
     in gadtExprToTy paramMapping (lamType conLam) `tcBind` \gadtRetTy ->
-       -- Infer the scrutinee's type
        infer scrutExpr `tcBind` \scrutTy ->
          applySubst scrutTy `tcBind` \scrutTy' ->
-           -- Replace TRigid type params in scrutinee with the SAME fresh vars
-           -- so that unification can produce refinements
            let scrutTyFresh = Prelude.foldl (\t (n, fv) -> substTyVar n fv t) scrutTy' paramMapping
-           -- Unify the GADT return type with the freshened scrutinee type
-           in tcTry (unify gadtRetTy scrutTyFresh) `tcBind` \_ ->
-             -- Extract refinements: for each type param, see what its fresh var resolved to
-             tcMapM (\(paramName, tv) ->
-               applySubst tv `tcBind` \resolved ->
-                 case resolved of
-                   TVar v' | tv == TVar v' -> tcPure Nothing  -- unresolved, no refinement
-                   ty ->
-                     -- Resolve any remaining fresh vars back to their original param rigids.
-                     -- E.g., if matching Refl : PropEq(a,x,x) against PropEq(a,x,y),
-                     -- y's fresh var resolves to x's fresh var. We map x's fresh var
-                     -- back to TRigid "x" so the refinement is y → TRigid "x".
-                     let resolvedTy = Prelude.foldl (\t' (v, rigid) -> replaceTVar v rigid t') ty reverseMap
-                     in tcPure (Just (paramName, resolvedTy))
-             ) paramMapping `tcBind` \results ->
-               tcPure [(n, t) | Just (n, t) <- results]
+           in tcTry (unify gadtRetTy scrutTyFresh) `tcBind` \unifyResult ->
+             case unifyResult of
+               Nothing -> tcPure []  -- unification failed, no refinements possible
+               Just _ ->
+                 tcMapM (\(paramName, tv) ->
+                   applySubst tv `tcBind` \resolved ->
+                     case resolved of
+                       Meta v' | tv == Meta v' -> tcPure Nothing
+                       ty ->
+                         let resolvedTy = Prelude.foldl (\t' (v, rigid) -> replaceMeta v rigid t') ty reverseMap
+                         in tcPure (Just (paramName, resolvedTy))
+                 ) paramMapping `tcBind` \results ->
+                   tcPure [(n, t) | Just (n, t) <- results]
 
--- | Convert a GADT return type expression to Ty, using fresh vars for type params.
--- E.g., Vec(a, Z) with mapping [(a, ?0), (n, ?1)] → TApp (TCon "Vec") [TVar 0, TCon "Z"]
-gadtExprToTy :: [(Name, Ty)] -> Expr -> TC Ty
+-- | Convert a GADT return type expression, using fresh vars for type params.
+gadtExprToTy :: [(Name, Expr)] -> Expr -> TC Expr
 gadtExprToTy mapping (Id n) =
   case Prelude.lookup n mapping of
-    Just tv -> tcPure tv  -- type param → fresh var
-    Nothing ->
-      -- Check uppercase → TCon, lowercase → try mapping then TRigid
-      if not (Prelude.null n) && n >= "A" && Prelude.head n <= 'Z'
-      then tcPure (TCon n)
-      else tcPure (TRigid n)
+    Just tv -> tcPure tv
+    Nothing -> tcPure (Id n)
 gadtExprToTy mapping (App (Id n) args) =
   tcMapM (gadtExprToTy mapping) args `tcBind` \tyArgs ->
-    tcPure (TApp (TCon n) tyArgs)
+    tcPure (App (Id n) tyArgs)
 gadtExprToTy mapping (Pi mn a b) =
   gadtExprToTy mapping a `tcBind` \ta ->
     gadtExprToTy mapping b `tcBind` \tb ->
-      tcPure (TPi mn ta tb)
+      tcPure (Pi mn ta tb)
 gadtExprToTy mapping (NTuple fields) =
   tcMapM (\(_, e) -> gadtExprToTy mapping e) fields `tcBind` \tys ->
     case tys of
-      []  -> tcPure (TCon "Unit")
+      []  -> tcPure (Id "Unit")
       [t] -> tcPure t
-      _   -> tcPure (Prelude.foldr1 TProd tys)
-gadtExprToTy _ (U n) = tcPure (TU (LConst n))
-gadtExprToTy _ (Lit l) = tcPure (TLit l)
-gadtExprToTy _ e = exprToTy e  -- fallback to normal conversion
+      _   -> tcPure (Prelude.foldr1 (\a b -> Sigma Nothing a b) tys)
+gadtExprToTy _ (U l) = tcPure (U l)
+gadtExprToTy _ (Lit l) = tcPure (Lit l)
+gadtExprToTy _ e = normalizeTypeExpr e
 
 -- | Apply GADT refinements to the type environment.
--- Replaces TRigid occurrences of refined type params with their concrete types.
-applyGADTRefinements :: [(Name, Ty)] -> TCEnv -> TCEnv
+applyGADTRefinements :: [(Name, Expr)] -> TCEnv -> TCEnv
 applyGADTRefinements [] env = env
 applyGADTRefinements refinements env =
   env { varTypes = Map.map applyRefs (varTypes env) }
@@ -849,54 +837,44 @@ applyGADTRefinements refinements env =
 -- ============================================================================
 -- Type-Level Normalization
 -- ============================================================================
--- Uses evalCLMPure from CLM.hs to evaluate type-level function applications.
--- This is the same evaluation logic the runtime uses (applyCLMLam, resolveCases),
--- just without IO/effects. One codebase for all universe levels.
 
--- | Normalize a Ty by evaluating type-level function applications.
--- Only attempts reduction when all arguments are concrete (no unification variables).
--- Falls back to the original type if reduction fails.
-normalizeTy :: Environment -> Ty -> Ty
+-- | Monadic variant of normalizeTy: applies substitution first (Phase 7B).
+-- Precondition: envCompiler must be set in the TCEnv.
+normalizeTyTC :: Expr -> TC Expr
+normalizeTyTC ty =
+  applySubst ty `tcBind` \ty' ->
+    withCompilerEnv (tcPure ty') (\env -> tcPure (normalizeTy env ty'))
+
+-- | Normalize a type expression by evaluating type-level function applications.
+normalizeTy :: Environment -> Expr -> Expr
 normalizeTy env = go
   where
-    go (TApp (TCon name) args) =
+    go (App (Id name) args) =
         let args' = Prelude.map go args
         in tryReduce name args'
-    go (TPi mn a b)    = TPi mn (go a) (go b)
-    go (TSigma (Just n) a b) =
+    go (Pi mn a b)    = Pi mn (go a) (go b)
+    go (Sigma (Just n) a b) =
         let a' = go a
         in if isConcreteTy a'
-           then TSigma (Just n) a' (go (substTyVar n a' b))
-           else TSigma (Just n) a' (go b)
-    go (TSigma Nothing a b) = TSigma Nothing (go a) (go b)
-    go (TApp f args)   = TApp (go f) (Prelude.map go args)
-    go (TId t a b)     = TId (go t) (go a) (go b)
-    go (TForall n t)   = TForall n (go t)
-    go (TRecord row)   = TRecord (goRow row)
-    go (TEffect row t) = TEffect (goRow row) (go t)
-    go t = t  -- TVar, TRigid, TCon, TU — already normal forms
-
-    goRow REmpty = REmpty
-    goRow (RExtend l t r) = RExtend l (go t) (goRow r)
-    goRow r = r
+           then Sigma (Just n) a' (go (substTyVar n a' b))
+           else Sigma (Just n) a' (go b)
+    go (Sigma Nothing a b) = Sigma Nothing (go a) (go b)
+    go (App f args)   = App (go f) (Prelude.map go args)
+    go (RowExtend l t r) = RowExtend l (go t) (go r)
+    go (EffType row t) = EffType (go row) (go t)
+    go t = t  -- Meta, Id, U, Lit, RowEmpty — already normal forms
 
     tryReduce name argTys
         | Prelude.all isConcreteTy argTys =
-            let argCLMs = Prelude.map (tyToCLM env) argTys
-                -- Top-level function lookup (topLambdas + clmLambdas)
+            let argCLMs = Prelude.map (exprToCLMTC env) argTys
                 lookupFn n = case lookupLambda n env of
                     Just lam -> Just (lambdaToCLMLam env lam)
                     Nothing  -> Map.lookup n (clmLambdas env)
-                -- Instance lookup: infer types from concrete args, then find instance.
-                -- Mirrors runtime dispatchInstance: multi-param → prefix → single-param fallback.
-                -- Checks both clmInstances (available after Pass 4) and instanceLambdas
-                -- (available during Pass 3/type checking, converted on-the-fly).
                 consLookup cn = lookupTypeOfConstructor cn env
                 lookupInstanceFn funcNm args =
                     let typeNames = [t | Just t <- Prelude.map (inferTypePure consLookup) args]
                     in if Prelude.null typeNames then Nothing
                        else tryInstanceLookup funcNm typeNames
-                -- Try CLM instance first, then Surface instanceLambda (convert on-the-fly)
                 tryInstance funcNm tns =
                     case lookupCLMInstance funcNm tns env of
                         Just clm -> Just clm
@@ -904,39 +882,33 @@ normalizeTy env = go
                             Just lam -> Just (lambdaToCLMLam env lam)
                             Nothing  -> Nothing
                 tryInstanceLookup funcNm typeNames =
-                    -- 1. Try full multi-param exact key
                     case tryInstance funcNm typeNames of
                         Just clm -> Just clm
                         Nothing ->
-                            -- 2. Try prefix match (morphism dispatch, CLM only)
                             case lookupCLMInstancePrefix funcNm typeNames env of
                                 Just clm -> Just clm
                                 Nothing ->
-                                    -- 3. Fall back to single-param: try each type
                                     let tryKeys [] = Nothing
                                         tryKeys (t:ts) = case tryInstance funcNm [t] of
                                             Just clm -> Just clm
                                             Nothing  -> tryKeys ts
                                     in tryKeys (Data.List.nub typeNames)
                 result = evalCLMPure lookupFn lookupInstanceFn 0 (CLMAPP (CLMID name) argCLMs)
-            in case clmToTy result of
+            in case clmToExpr result of
                 Just ty -> ty
-                Nothing -> TApp (TCon name) argTys  -- can't convert back
-        | otherwise = TApp (TCon name) argTys       -- has unification vars
+                Nothing -> App (Id name) argTys
+        | otherwise = App (Id name) argTys
 
 -- | Convert a Surface Lambda to CLMLam (pure, on-the-fly).
--- Lightweight version of Pipeline.lambdaToCLMLambda for use during type checking
--- when clmLambdas aren't built yet (Pass 3 runs before Pass 4).
 lambdaToCLMLam :: Environment -> Lambda -> CLMLam
-lambdaToCLMLam env (Lambda _ ps Intrinsic _ _) = CLMLam [] CLMPRIMCALL
-lambdaToCLMLam env (Lambda _ ps Derive _ _) = CLMLam [] CLMPRIMCALL
-lambdaToCLMLam env (Lambda _ ps (PatternMatches exs) _ _) =
+lambdaToCLMLam env (Lambda _ ps Intrinsic _ _ _) = CLMLam [] CLMPRIMCALL
+lambdaToCLMLam env (Lambda _ ps Derive _ _ _) = CLMLam [] CLMPRIMCALL
+lambdaToCLMLam env (Lambda _ ps (PatternMatches exs) _ _ _) =
     CLMLamCases (varsToCLMVarsTC env ps) (Prelude.map (exprToCLMTC env) exs)
-lambdaToCLMLam env (Lambda _ ps bdy _ _) =
+lambdaToCLMLam env (Lambda _ ps bdy _ _ _) =
     CLMLam (varsToCLMVarsTC env ps) (exprToCLMTC env bdy)
 
 -- | Minimal Expr → CLMExpr conversion for type-level normalization.
--- Handles the subset of Expr that appears in function bodies used at the type level.
 exprToCLMTC :: Environment -> Expr -> CLMExpr
 exprToCLMTC _ UNDEFINED = CLMEMPTY
 exprToCLMTC env (Id name) =
@@ -954,11 +926,11 @@ exprToCLMTC env (Function lam) = CLMLAM (lambdaToCLMLam env lam)
 exprToCLMTC env (PatternMatches exs) = CLMAPP CLMEMPTY (Prelude.map (exprToCLMTC env) exs)
 exprToCLMTC env (ExpandedCase checks ex _) = CLMCASE (Prelude.map (pcToCLM env) checks) (exprToCLMTC env ex)
 exprToCLMTC _ (Lit l) = CLMLIT l
-exprToCLMTC _ (U n) = CLMU (LConst n)
+exprToCLMTC _ (U l) = CLMU l
 exprToCLMTC env (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLMTC env e)
 exprToCLMTC _ Intrinsic = CLMPRIMCALL
 exprToCLMTC _ (Pi _ _ _) = CLMEMPTY
-exprToCLMTC _ _ = CLMEMPTY  -- other nodes: not needed for type-level eval
+exprToCLMTC _ _ = CLMEMPTY
 
 pcToCLM :: Environment -> Expr -> CLMPatternCheck
 pcToCLM env (PatternGuard (PCheckTag ct) ex) = CLMCheckTag ct (exprToCLMTC env ex)
@@ -968,63 +940,44 @@ pcToCLM _ _ = CLMCheckTag (ConsTag "ERROR" (-1)) CLMEMPTY
 varsToCLMVarsTC :: Environment -> [Var] -> [(Name, CLMExpr)]
 varsToCLMVarsTC env = Prelude.map (\v -> (name v, exprToCLMTC env (val v)))
 
--- | Convert Ty → CLMExpr (for feeding into the pure evaluator).
--- Constructors become CLMCON, type names become CLMID, applications become CLMAPP.
-tyToCLM :: Environment -> Ty -> CLMExpr
-tyToCLM env (TCon name) =
-    case lookupConstructor name env of
-        Just (_, idx) -> CLMCON (ConsTag name idx) []
-        Nothing       -> CLMID name
-tyToCLM env (TApp (TCon name) args) =
-    case lookupConstructor name env of
-        Just (_, idx) -> CLMCON (ConsTag name idx) (Prelude.map (tyToCLM env) args)
-        Nothing       -> CLMAPP (CLMID name) (Prelude.map (tyToCLM env) args)
-tyToCLM _ (TRigid n) = CLMID n
-tyToCLM _ (TU l) = CLMU l
-tyToCLM _ TLevel = CLMID "__Level"
-tyToCLM env (TApp f args) = CLMAPP (tyToCLM env f) (Prelude.map (tyToCLM env) args)
-tyToCLM env (TId t a b) = CLMAPP (CLMID "PropEq") [tyToCLM env t, tyToCLM env a, tyToCLM env b]
-tyToCLM _ (TLit l) = CLMLIT l
-tyToCLM _ _ = CLMEMPTY
+-- | Convert CLMExpr → Expr (for reading back evaluation results).
+clmToExpr :: CLMExpr -> Maybe Expr
+clmToExpr (CLMCON (ConsTag name _) [])   = Just (Id name)
+clmToExpr (CLMCON (ConsTag name _) args) = App (Id name) <$> mapM clmToExpr args
+clmToExpr (CLMID "__Level")              = Just (Id "Level")
+clmToExpr (CLMID name)                   = Just (Id name)
+clmToExpr (CLMU l)                       = Just (U l)
+clmToExpr (CLMLIT l)                     = Just (Lit l)
+clmToExpr (CLMAPP f args)               = App <$> clmToExpr f <*> mapM clmToExpr args
+clmToExpr (CLMIAP f args)               = App <$> clmToExpr f <*> mapM clmToExpr args
+clmToExpr (CLMFieldAccess (nm, idx) e)  = RecFieldAccess (nm, idx) <$> clmToExpr e
+clmToExpr CLMEMPTY                       = Nothing
+clmToExpr _                              = Nothing
 
--- | Convert CLMExpr → Ty (for reading back evaluation results).
-clmToTy :: CLMExpr -> Maybe Ty
-clmToTy (CLMCON (ConsTag name _) [])   = Just (TCon name)
-clmToTy (CLMCON (ConsTag name _) args) = TApp (TCon name) <$> mapM clmToTy args
-clmToTy (CLMID "__Level")              = Just TLevel
-clmToTy (CLMID name)                   = Just (TCon name)
-clmToTy (CLMU l)                       = Just (TU l)
-clmToTy (CLMLIT l)                     = Just (TLit l)
-clmToTy CLMEMPTY                       = Nothing
-clmToTy _                              = Nothing
-
--- | Is a Ty fully concrete (no unification variables)?
--- Rigid type variables are considered concrete (they're bound by forall).
-isConcreteTy :: Ty -> Bool
-isConcreteTy (TVar _)       = False
-isConcreteTy (TRigid _)     = True
-isConcreteTy (TCon _)       = True
-isConcreteTy (TApp f args)  = isConcreteTy f && Prelude.all isConcreteTy args
-isConcreteTy (TU _)         = True
-isConcreteTy TLevel         = True
-isConcreteTy (TPi _ a b)    = isConcreteTy a && isConcreteTy b
-isConcreteTy (TSigma _ a b) = isConcreteTy a && isConcreteTy b
-isConcreteTy (TId t a b)    = isConcreteTy t && isConcreteTy a && isConcreteTy b
-isConcreteTy (TLit _)       = True
-isConcreteTy _              = False
+-- | Is an Expr fully concrete (no unification metavariables)?
+-- Uses typeChildren for structural recursion (Phase 1).
+isConcreteTy :: Expr -> Bool
+isConcreteTy (Meta _) = False
+isConcreteTy e = Prelude.all isConcreteTy (typeChildren e)
 
 -- ============================================================================
 -- Bidirectional Type Checking
 -- ============================================================================
 
--- | Try an action, returning Nothing on failure instead of propagating error
+-- | Try an action, returning Nothing on failure
 tcTry :: TC a -> TC (Maybe a)
 tcTry action env st = case action env st of
   Left _        -> Right (Nothing, st)
   Right (a, st') -> Right (Just a, st')
 
+-- | Try an action, returning Left errors on failure (preserves error info)
+tcTryE :: TC a -> TC (Either [TCError] a)
+tcTryE action env st = case action env st of
+  Left errs      -> Right (Left errs, st)
+  Right (a, st') -> Right (Right a, st')
+
 -- | Lookup a variable in the local TCEnv, then in the compiler Environment
-lookupVarType :: Name -> TC (Maybe Ty)
+lookupVarType :: Name -> TC (Maybe Expr)
 lookupVarType name =
   tcAsk `tcBind` \env ->
     case Map.lookup name (varTypes env) of
@@ -1034,25 +987,30 @@ lookupVarType name =
         Just cenv -> lookupFromCompilerEnv name cenv
 
 -- | Look up a name's type from the compiler environment
-lookupFromCompilerEnv :: Name -> Environment -> TC (Maybe Ty)
+lookupFromCompilerEnv :: Name -> Environment -> TC (Maybe Expr)
 lookupFromCompilerEnv name cenv =
-  -- Try constructor first
   case lookupConstructor name cenv of
-    Just (lam, _tag) -> lamToTy lam `tcBind` \ty -> tcPure (Just ty)
+    Just (lam, _tag) -> inferLamType lam `tcBind` \ty ->
+      -- Constructors of parameterized types use rigid type names (Id "a", Id "b")
+      -- from the type definition. Instantiate these with fresh metas so each use
+      -- gets its own copy (standard Hindley-Milner polymorphism).
+      instantiateFreeTypeVars cenv ty `tcBind` \ty' -> tcPure (Just ty')
     Nothing ->
-      -- Try top-level lambda
       case lookupLambda name cenv of
         Just lam ->
-          -- If it's an implicit-param function (from a structure), emit constraint
-          lamToTy lam `tcBind` \ty ->
+          inferLamType lam `tcBind` \ty ->
             (if hasImplicit lam
              then emitStructConstraint name lam
              else tcPure ()) `tcBind` \_ ->
-              tcPure (Just ty)
+              -- Instantiate free type variables (standard HM polymorphism).
+              -- After instantiate strips Pi-bound type vars, remaining lowercase
+              -- Ids (like 'a', 'b' in structure method sigs) need fresh metas.
+              instantiate ty `tcBind` \ty' ->
+                instantiateFreeTypeVars cenv ty' `tcBind` \ty'' ->
+                  tcPure (Just ty'')
         Nothing ->
-          -- Try type (for Type-level expressions)
           case lookupType name cenv of
-            Just _ -> tcPure (Just (TU (LConst 0)))  -- types have type Type
+            Just _ -> tcPure (Just (U (LConst 0)))
             Nothing -> tcPure Nothing
 
 -- | Emit a structure constraint for an implicit-param function
@@ -1060,83 +1018,140 @@ emitStructConstraint :: Name -> Lambda -> TC ()
 emitStructConstraint funcName lam =
   case params lam of
     (Var _ (Implicit implTy) _ : _) ->
-      -- Extract the structure name from the implicit type
-      -- Implicit types look like: App (Id "StructName") [Id "a"]
       case implTy of
         App (Id structName) typeArgs ->
-          tcMapM exprToTy typeArgs `tcBind` \tyArgs ->
+          tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
             tcModify (\st -> st { constraints = CStructure structName tyArgs : constraints st })
         Id structName ->
           tcModify (\st -> st { constraints = CStructure structName [] : constraints st })
         _ -> tcPure ()
     _ -> tcPure ()
 
--- | Convert a Lambda's signature to a Ty (params -> return type)
--- For implicit-param lambdas, wraps in TForall for the type parameters.
--- Preserves parameter names as TPi (Just name) when the param has a meaningful name,
--- enabling dependent type checking (return type can reference param names).
-lamToTy :: Lambda -> TC Ty
-lamToTy lam =
+-- | Convert a Lambda's signature to a type (params → return type).
+-- For implicit-param lambdas, wraps in Pi (Just n) (U (LConst 0)) for type params.
+-- Preserves parameter names as Pi (Just name) for dependent types.
+inferLamType :: Lambda -> TC Expr
+inferLamType lam =
   let (implVars, ps) = let (imps, rest) = span isImplicitVar (params lam)
                         in (Prelude.map name imps, rest)
       retExpr = lamType lam
-  in tcMapM (\(Var nm tp _) -> exprToTy tp `tcBind` \ty -> tcPure (nm, ty)) ps `tcBind` \namedParams ->
-       exprToTy retExpr `tcBind` \retTy ->
+  in tcMapM (\(Var nm tp _) -> normalizeTypeExpr tp `tcBind` \ty -> tcPure (nm, ty)) ps `tcBind` \namedParams ->
+       normalizeTypeExpr retExpr `tcBind` \retTy ->
          let piTy = Prelude.foldr (\(nm, ty) acc ->
                if nm == "" || nm == "_"
-               then TPi Nothing ty acc
-               else TPi (Just nm) ty acc) retTy namedParams
-         in tcPure (Prelude.foldr TForall piTy implVars)
+               then Pi Nothing ty acc
+               else Pi (Just nm) ty acc) retTy namedParams
+         in tcPure (Prelude.foldr (\n t -> Pi (Just n) (U (LConst 0)) t) piTy implVars)
 
 -- | Extract type variable names from implicit params
--- e.g., [a:Type] gives us ["a"], [a:Type, b:Type] gives ["a", "b"]
 extractImplicitTypeVars :: Lambda -> [Name]
 extractImplicitTypeVars lam =
   Prelude.map name (takeWhile isImplicitVar (params lam))
 
+-- | Infer the universe level of a type expression.
+-- Returns the Level such that the type lives in U(level).
+-- For non-type expressions or unknowns, defaults to LConst 0.
+inferUniverse :: Expr -> TC Level
+inferUniverse expr =
+  infer expr `tcBind` \ty ->
+    applySubst ty `tcBind` \ty' ->
+      case ty' of
+        U l -> tcPure l
+        _   -> tcPure (LConst 0)  -- default: assume Type-level
+
+-- | Resolve field type from constructor definitions for parameterized types.
+-- Given a RecFieldAccess on a type like Pair(Int, Bool), looks up the constructor
+-- fields and substitutes type arguments to produce the concrete field type.
+resolveConstructorField :: Name -> Int -> Expr -> TC Expr
+resolveConstructorField fieldName idx eTy =
+  withCompilerEnv freshMeta (\cenv ->
+    let typeName = extractTypeName eTy
+        typeArgs = extractTypeArgs eTy
+    in case Map.lookup typeName (types cenv) of
+      Just (SumType parentLam) ->
+        let typeParams = Prelude.map Surface.name (params parentLam)
+            paramMapping = Prelude.zip typeParams typeArgs
+        in case body parentLam of
+          Constructors constrs ->
+            resolveFieldFromConstrs fieldName idx paramMapping constrs
+          _ -> freshMeta  -- non-sum type body, field access not applicable
+      _ -> freshMeta)  -- type not found in env
+  where
+    extractTypeArgs (App _ args) = args
+    extractTypeArgs _ = []
+
+-- | Search constructors for a field by name or index, then substitute type params.
+resolveFieldFromConstrs :: Name -> Int -> [(Name, Expr)] -> [Lambda] -> TC Expr
+resolveFieldFromConstrs fieldName idx paramMapping constrs =
+  case findField fieldName idx constrs of
+    Just fieldTy ->
+      let substituted = Prelude.foldl (\t (n, arg) -> substTyVar n arg t) fieldTy paramMapping
+      in normalizeTypeExpr substituted
+    Nothing -> freshMeta
+
+-- | Find a field type in constructors by name (if non-empty) or by index.
+findField :: Name -> Int -> [Lambda] -> Maybe Expr
+findField fieldName idx constrs
+  -- Named field access: search all constructors for matching field name
+  | fieldName /= "" =
+    let allFields = Prelude.concatMap (\c -> params c) constrs
+    in case Prelude.filter (\v -> Surface.name v == fieldName) allFields of
+         (v:_) -> Just (typ v)
+         []    -> Nothing
+  -- Positional field access: only resolve when all constructors that have this
+  -- index agree on the field type. Otherwise it's ambiguous (e.g., Leaf.0:a vs
+  -- Branch.0:Tree(a)) and we return Nothing to let the TC use freshMeta.
+  | otherwise =
+    let candidates = Prelude.filter (\c -> idx < Prelude.length (params c)) constrs
+        fieldTypes = Prelude.map (\c -> typ (params c !! idx)) candidates
+    in case fieldTypes of
+      []    -> Nothing
+      (t:ts) | Prelude.all (== t) ts -> Just t  -- All agree
+      _     -> Nothing  -- Ambiguous — different types at same index
+
 -- | Synthesize/infer the type of an expression
-infer :: Expr -> TC Ty
+infer :: Expr -> TC Expr
 -- Literals
-infer (Lit (LInt _))    = tcPure (TCon "Int")
-infer (Lit (LFloat _))  = tcPure (TCon "Float64")
-infer (Lit (LString _)) = tcPure (TCon "String")
-infer (Lit (LChar _))   = tcPure (TCon "Char")
-infer (Lit (LInt8 _))   = tcPure (TCon "Int8")
-infer (Lit (LInt16 _))  = tcPure (TCon "Int16")
-infer (Lit (LInt32 _))  = tcPure (TCon "Int32")
-infer (Lit (LInt64 _))  = tcPure (TCon "Int64")
-infer (Lit (LWord8 _))  = tcPure (TCon "UInt8")
-infer (Lit (LWord16 _)) = tcPure (TCon "UInt16")
-infer (Lit (LWord32 _)) = tcPure (TCon "UInt32")
-infer (Lit (LWord64 _)) = tcPure (TCon "UInt64")
-infer (Lit (LFloat32 _)) = tcPure (TCon "Float32")
-infer (Lit (LList []))  = freshTyVar `tcBind` \a -> tcPure (TApp (TCon "List") [a])
-infer (Lit (LList (x:_))) = infer x `tcBind` \ty -> tcPure (TApp (TCon "List") [ty])
+infer (Lit (LInt _))    = tcPure (Id "Int")
+infer (Lit (LFloat _))  = tcPure (Id "Float64")
+infer (Lit (LString _)) = tcPure (Id "String")
+infer (Lit (LChar _))   = tcPure (Id "Char")
+infer (Lit (LInt8 _))   = tcPure (Id "Int8")
+infer (Lit (LInt16 _))  = tcPure (Id "Int16")
+infer (Lit (LInt32 _))  = tcPure (Id "Int32")
+infer (Lit (LInt64 _))  = tcPure (Id "Int64")
+infer (Lit (LWord8 _))  = tcPure (Id "UInt8")
+infer (Lit (LWord16 _)) = tcPure (Id "UInt16")
+infer (Lit (LWord32 _)) = tcPure (Id "UInt32")
+infer (Lit (LWord64 _)) = tcPure (Id "UInt64")
+infer (Lit (LFloat32 _)) = tcPure (Id "Float32")
+infer (Lit (LList []))  = freshMeta `tcBind` \a -> tcPure (App (Id "List") [a])
+infer (Lit (LList (x:_))) = infer x `tcBind` \ty -> tcPure (App (Id "List") [ty])
 
 -- Variables / Identifiers
 infer (Id name) =
   lookupVarType name `tcBind` \mty ->
     case mty of
-      Just ty -> instantiate ty  -- instantiate polymorphic types
-      Nothing -> tcWarn (UnboundVar name) `tcBind` \_ -> freshTyVar
+      Just ty -> instantiate ty
+      Nothing -> tcWarnOrFail (UnboundVar name) `tcBind` \_ -> freshMeta
 
 -- Typed expression: e : T
 infer (Typed e tExpr) =
-  exprToTy tExpr `tcBind` \ty ->
+  normalizeTypeExpr tExpr `tcBind` \ty ->
     check e ty `tcBind` \_ ->
       tcPure ty
 
--- Class constructor: ClassName.new(args) — check arity and abstract
+-- Class constructor: ClassName.new(args)
 infer (App (RecFieldAccess ("new", _) (Id className)) args) =
   tcAsk `tcBind` \env ->
     case envCompiler env of
-      Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (TCon className)
+      Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (Id className)
       Just cenv -> case lookupClass className cenv of
-        Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (TCon className)
+        Nothing -> tcMapM infer args `tcBind` \_ -> tcPure (Id className)
         Just cm
           | cmModifier cm == ClassAbstract ->
             tcWarnOrFail (OtherError $ "Cannot instantiate abstract class " ++ className)
-              `tcBind` \_ -> tcPure (TCon className)
+              `tcBind` \_ -> tcPure (Id className)
           | otherwise ->
             let expected = Prelude.length (cmAllFields cm)
                 actual = Prelude.length args
@@ -1144,7 +1159,7 @@ infer (App (RecFieldAccess ("new", _) (Id className)) args) =
                 then tcWarnOrFail (ArityMismatch expected actual)
                 else tcPure ()) `tcBind` \_ ->
               tcMapM infer args `tcBind` \_ ->
-                tcPure (TCon className)
+                tcPure (Id className)
 
 -- Function application: f(args)
 infer (App f args) =
@@ -1153,20 +1168,17 @@ infer (App f args) =
       inferApp fTy' args
 
 -- Constructor tuple: Tag(args) — with GADT support
--- For GADT constructors, instantiate type params with fresh vars so that
--- unification with arg types produces the specific return type.
 infer (ConTuple (ConsTag name _tag) args) =
   tcAsk `tcBind` \env ->
     case envCompiler env of
-      Nothing -> freshTyVar
+      Nothing -> freshMeta
       Just cenv -> case lookupConstructor name cenv of
-        Nothing -> freshTyVar
+        Nothing -> freshMeta
         Just (lam, _) ->
           let ps = params lam
           in if Prelude.length ps /= Prelude.length args
-             then tcWarnOrFail (ArityMismatch (Prelude.length ps) (Prelude.length args)) `tcBind` \_ -> freshTyVar
+             then tcWarnOrFail (ArityMismatch (Prelude.length ps) (Prelude.length args)) `tcBind` \_ -> freshMeta
              else
-               -- Get parent type's type params for GADT instantiation
                let parentName = extractTypeName (lamType lam)
                    mParentLam = case Map.lookup parentName (types cenv) of
                                   Just (SumType pl) -> Just pl
@@ -1175,217 +1187,221 @@ infer (ConTuple (ConsTag name _tag) args) =
                                   Just pl -> Prelude.map Surface.name (params pl)
                                   Nothing -> []
                in if Prelude.null typeParams
-                  then -- Non-parameterized: use original behavior
-                    tcMapM (\(Var _ tp _, arg) -> exprToTy tp `tcBind` \pty -> infer arg `tcBind` \aty ->
-                      tcTry (unify pty aty) `tcBind` \_ -> tcPure ())
+                  then
+                    tcMapM (\(Var _ tp _, arg) -> normalizeTypeExpr tp `tcBind` \pty -> infer arg `tcBind` \aty ->
+                      tcTry (unify pty aty) `tcBind` \result ->
+                        case result of
+                          Just _  -> tcPure ()
+                          Nothing -> tcWarnOrFail (Mismatch pty aty))
                       (Prelude.zip ps args) `tcBind` \_ ->
-                    exprToTy (lamType lam)
-                  else -- GADT: instantiate type params with fresh vars
-                    tcMapM (\_ -> freshTyVar) typeParams `tcBind` \freshVars ->
+                    normalizeTypeExpr (lamType lam)
+                  else
+                    tcMapM (\_ -> freshMeta) typeParams `tcBind` \freshVars ->
                     let mapping = Prelude.zip typeParams freshVars
                     in tcMapM (\(Var _ tp _, arg) ->
                          gadtExprToTy mapping tp `tcBind` \pty ->
                            infer arg `tcBind` \aty ->
-                             tcTry (unify pty aty) `tcBind` \_ -> tcPure ())
+                             tcTry (unify pty aty) `tcBind` \result ->
+                               case result of
+                                 Just _  -> tcPure ()
+                                 Nothing -> tcWarnOrFail (Mismatch pty aty))
                          (Prelude.zip ps args) `tcBind` \_ ->
                        gadtExprToTy mapping (lamType lam)
 
--- NTuple: unified tuple/record literal {a, b} or {x = a, y = b}
--- Positional fields → product type (TSigma), named fields → record type (TRecord)
+-- NTuple: positional → Sigma chain, named → RowExtend chain
 infer (NTuple fields)
   | hasNamedFields fields =
-    -- Named: infer as structural record type
     tcMapM (\(mn, e) -> infer e `tcBind` \ty -> tcPure (case mn of Just n -> n; Nothing -> "", ty)) fields `tcBind` \typedFields ->
-      tcPure (TRecord (Prelude.foldr (\(n,t) r -> RExtend n t r) REmpty typedFields))
+      tcPure (Prelude.foldr (\(n,t) r -> RowExtend n t r) RowEmpty typedFields)
   | otherwise =
-    -- Positional: infer as product type (TSigma chain)
     tcMapM (\(_, e) -> infer e) fields `tcBind` \tys ->
       case tys of
-        []  -> tcPure (TCon "Unit")
+        []  -> tcPure (Id "Unit")
         [t] -> tcPure t
-        _   -> tcPure (Prelude.foldr1 TProd tys)
+        _   -> tcPure (Prelude.foldr1 (\a b -> Sigma Nothing a b) tys)
 
--- Function definition
-infer (Function lam) = inferLambda lam
+-- Function definition (Phase 5: set source info)
+infer (Function lam) =
+  tcLocal (\env -> env { tcSourceInfo = Just (lamSrcInfo lam) }) (inferLambda lam)
 
--- Pattern matches: infer the type of the first branch
+-- Pattern matches
 infer (PatternMatches cases) =
   case cases of
-    [] -> freshTyVar
+    [] -> freshMeta
     (c:_) -> infer c
 
--- CaseOf: infer the body type
-infer (CaseOf _pats bodyExpr _si) = infer bodyExpr
+-- CaseOf: bind pattern variables before inferring body
+infer (CaseOf pats bodyExpr _si) =
+  let bindings = [(Surface.name v, typ v) | v <- pats, Surface.name v /= "", Surface.name v /= "_"]
+  in tcMapM (\(n, tpExpr) -> normalizeTypeExpr tpExpr `tcBind` \ty -> tcPure (n, ty)) bindings `tcBind` \typedBindings ->
+       let extendEnv env = env { varTypes = Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) typedBindings }
+       in tcLocal extendEnv (infer bodyExpr)
 
--- ExpandedCase: apply GADT refinements, then infer body type
-infer (ExpandedCase checks bodyExpr _si) =
-  gadtRefine checks `tcBind` \refinements ->
-    if Prelude.null refinements
-    then infer bodyExpr
-    else tcLocal (applyGADTRefinements refinements) (infer bodyExpr)
+-- ExpandedCase: apply GADT refinements (Phase 5: set source info)
+infer (ExpandedCase checks bodyExpr si) =
+  tcLocal (\env -> env { tcSourceInfo = Just si }) $
+    gadtRefine checks `tcBind` \refinements ->
+      if Prelude.null refinements
+      then infer bodyExpr
+      else tcLocal (applyGADTRefinements refinements) (infer bodyExpr)
 
--- Statements: type is the type of the last statement
+-- Statements
 infer (Statements stmts) =
   case stmts of
-    [] -> tcPure (TCon "Unit")
+    [] -> tcPure (Id "Unit")
     _  -> infer (Prelude.last stmts)
 
--- Unary/Binary ops (already desugared to App, but handle anyway)
+-- Unary/Binary ops
 infer (UnaryOp name e) = infer (App (Id name) [e])
 infer (BinaryOp name e1 e2) = infer (App (Id name) [e1, e2])
 
 -- Universe
-infer (U n) = tcPure (TU (LConst (n + 1)))  -- Type : Type1, etc.
+infer (U l) = tcPure (U (levelSucc l))
 
--- Sum type definitions: parameterized types have higher kind
--- type Nat = ... → Type (no params)
--- type Maybe(a:Type) = ... → Type → Type (one param, lives at Type1)
+-- Sum types
 infer (SumType lam) =
   if Prelude.null (params lam)
-  then tcPure (TU (LConst 0))
+  then tcPure (U (LConst 0))
   else
-    tcMapM (\(Var _ tp _) -> exprToTy tp) (params lam) `tcBind` \paramKinds ->
-    let kind = Prelude.foldr (\k acc -> TPi Nothing k acc) (TU (LConst 0)) paramKinds
+    tcMapM (\(Var _ tp _) -> normalizeTypeExpr tp) (params lam) `tcBind` \paramKinds ->
+    let kind = Prelude.foldr (\k acc -> Pi Nothing k acc) (U (LConst 0)) paramKinds
     in tcPure kind
 
--- Structure definitions have type Type
-infer (Structure _ _) = tcPure (TU (LConst 0))
+-- Structure definitions
+infer (Structure _ _) = tcPure (U (LConst 0))
 
--- Primitive definitions
-infer (Primitive _) = tcPure (TU (LConst 0))
+-- Primitives
+infer (Primitive _) = tcPure (U (LConst 0))
 
--- Instance, Intrinsic, etc. — skip
-infer (Instance _ _ _ _) = tcPure (TCon "Unit")
-infer Intrinsic = freshTyVar
-infer Derive = freshTyVar
-infer UNDEFINED = freshTyVar
+-- Instance, Intrinsic, etc.
+infer (Instance _ _ _ _) = tcPure (Id "Unit")
+infer Intrinsic = freshMeta
+infer Derive = freshMeta
+infer UNDEFINED = freshMeta
 
--- Pi type expression: (x:A) -> B or A -> B is a type, so it has type Type
-infer (Pi _ _ _) = tcPure (TU (LConst 0))
+-- Pi type expression: universe is max of domain and codomain universes
+infer (Pi mn domTy codTy) =
+  inferUniverse domTy `tcBind` \domLevel ->
+    inferUniverse codTy `tcBind` \codLevel ->
+      tcPure (U (levelMax domLevel codLevel))
 
--- If-then-else (should be desugared but handle anyway)
+-- If-then-else
 infer (IfThenElse cond thenE elseE) =
-  check cond (TCon "Bool") `tcBind` \_ ->
+  check cond (Id "Bool") `tcBind` \_ ->
     infer thenE `tcBind` \tTy ->
       check elseE tTy `tcBind` \_ ->
         tcPure tTy
 
--- Let-in (should be desugared but handle anyway)
-infer (LetIn binds bodyExpr) =
-  inferLetBindsAndBody binds bodyExpr
+-- Let-in
+infer (LetIn binds bodyExpr) = inferLetBindsAndBody binds bodyExpr
 
--- PropEq, Implies, Law — type-level/proof constructs
-infer (PropEq _ _) = tcPure (TU (LConst 0))
-infer (Implies _ _) = tcPure (TU (LConst 0))
-infer (Law _ _) = tcPure (TCon "Unit")
+-- PropEq, Implies, Law
+infer (PropEq _ _) = tcPure (U (LConst 0))
+infer (Implies _ _) = tcPure (U (LConst 0))
+infer (Law _ _) = tcPure (Id "Unit")
 
 -- Repr, ReprCast
-infer (Repr _ _ _ _ _) = tcPure (TCon "Unit")
+infer (Repr _ _ _ _ _) = tcPure (Id "Unit")
 infer (ReprCast e tp) =
-  exprToTy tp `tcBind` \targetTy ->
+  normalizeTypeExpr tp `tcBind` \targetTy ->
     tcAsk `tcBind` \env ->
       case envCompiler env of
-        Just cenv | isClassType targetTy cenv -> tcPure (TApp (TCon "Maybe") [targetTy])
+        Just cenv | isClassType targetTy cenv -> tcPure (App (Id "Maybe") [targetTy])
         _ -> tcPure targetTy
   where
-    isClassType (TCon n) cenv = Map.member n (classDecls cenv)
+    isClassType (Id n) cenv = Map.member n (classDecls cenv)
     isClassType _ _ = False
-infer (Value v _) = exprToTy (typ v)
+infer (Value v _) = normalizeTypeExpr (typ v)
 
--- Record type expression: {x:Int, y:Bool}
-infer (RecordType _ _) = tcPure (TU (LConst 0))
+-- Record type expression: universe is max of all field type universes
+infer (RecordType fields _isOpen) =
+  if Prelude.null fields
+  then tcPure (U (LConst 0))
+  else
+    tcMapM (\(_, fTy) -> inferUniverse fTy) fields `tcBind` \levels ->
+      tcPure (U (Prelude.foldl1 levelMax levels))
 
 -- Field access
-infer (RecFieldAccess (fieldName, _idx) e) =
+infer (RecFieldAccess (fieldName, idx) e) =
   infer e `tcBind` \eTy ->
     applySubst eTy `tcBind` \eTy' ->
       case eTy' of
-        TRecord row ->
-          tcTry (rowExtract fieldName row) `tcBind` \result ->
+        RowExtend _ _ _ ->
+          tcTry (rowExtract fieldName eTy') `tcBind` \result ->
             case result of
               Just (ty, _) -> tcPure ty
-              Nothing -> freshTyVar
-        _ -> freshTyVar
+              Nothing -> resolveConstructorField fieldName idx eTy'
+        _ -> resolveConstructorField fieldName idx eTy'
 
 -- Array literal
-infer (ArrayLit []) = freshTyVar `tcBind` \a -> tcPure (TApp (TCon "Array") [a])
-infer (ArrayLit (x:_)) = infer x `tcBind` \ty -> tcPure (TApp (TCon "Array") [ty])
+infer (ArrayLit []) = freshMeta `tcBind` \a -> tcPure (App (Id "Array") [a])
+infer (ArrayLit (x:_)) = infer x `tcBind` \ty -> tcPure (App (Id "Array") [ty])
 
 -- Module system nodes
-infer (ModuleDecl _) = tcPure (TCon "Unit")
-infer (Import _ _ _) = tcPure (TCon "Unit")
-infer (Open _) = tcPure (TCon "Unit")
-infer (Export _ _) = tcPure (TCon "Unit")
+infer (ModuleDecl _) = tcPure (Id "Unit")
+infer (Import _ _ _) = tcPure (Id "Unit")
+infer (Open _) = tcPure (Id "Unit")
+infer (Export _ _) = tcPure (Id "Unit")
 infer (PrivateDecl e) = infer e
-infer (OpaqueTy _ _) = tcPure (TU (LConst 0))
-infer (TargetBlock _ _) = tcPure (TCon "Unit")
-infer (TargetSwitch _) = tcPure (TCon "Unit")
+infer (OpaqueTy _ _) = tcPure (U (LConst 0))
+infer (TargetBlock _ _) = tcPure (Id "Unit")
+infer (TargetSwitch _) = tcPure (Id "Unit")
 
 -- Effect system nodes
-infer (EffectDecl _ _ _) = tcPure (TCon "Unit")
-infer (HandlerDecl _ _ _ _) = tcPure (TCon "Unit")
+infer (EffectDecl _ _ _) = tcPure (Id "Unit")
+infer (HandlerDecl _ _ _ _) = tcPure (Id "Unit")
 infer (HandleWith computation _handler) =
-  -- handle expr with handler: the handler eliminates an effect from the row
-  -- For now, just infer the computation type and return the result type
   infer computation `tcBind` \compTy ->
     applySubst compTy `tcBind` \compTy' ->
       case compTy' of
-        TEffect _row resTy -> tcPure resTy  -- strip effect row
-        _ -> tcPure compTy'                   -- not an effect type, pass through
+        EffType _row resTy -> tcPure resTy
+        _ -> tcPure compTy'
 infer (ActionBlock stmts) =
-  -- Action blocks: infer the type of the last statement
-  -- The overall type is Eff {effects} lastStmtType
   case stmts of
-    [] -> tcPure (TCon "Unit")
+    [] -> tcPure (Id "Unit")
     _ -> inferActionStmt (Prelude.last stmts)
-infer (EffType rowExpr resExpr) =
-  -- Effect type expression: Eff { row } a has type Type
-  tcPure (TU (LConst 0))
+infer (EffType rowExpr resExpr) = tcPure (U (LConst 0))
 
 -- Implicit, Binding, Constructors, etc.
 infer (Implicit e) = infer e
-infer (Binding v) = exprToTy (typ v)
-infer (Constructors _) = tcPure (TU (LConst 0))
-infer (ERROR msg) = tcWarn (OtherError $ "ERROR node: " ++ msg) `tcBind` \_ -> freshTyVar
+infer (Binding v) = normalizeTypeExpr (typ v)
+infer (Constructors _) = tcPure (U (LConst 0))
+infer (ERROR msg) = tcWarnOrFail (OtherError $ "ERROR node: " ++ msg) `tcBind` \_ -> freshMeta
 
 -- Catch-all
 infer e =
-  tcWarn (OtherError $ "Cannot infer type: " ++ showExprBrief e)
-    `tcBind` \_ -> freshTyVar
+  tcWarnOrFail (OtherError $ "Cannot infer type: " ++ showExprBrief e)
+    `tcBind` \_ -> freshMeta
 
 -- | Apply a function type to arguments
-inferApp :: Ty -> [Expr] -> TC Ty
+inferApp :: Expr -> [Expr] -> TC Expr
 inferApp fTy [] = tcPure fTy
--- Dependent Pi: substitute the bound variable in the return type, then normalize
-inferApp (TPi (Just name) paramTy retTy) (arg:rest) =
-  tcWithContext "argument of application" (check arg paramTy) `tcBind` \_ ->
-    infer arg `tcBind` \argTy ->
-      tcAsk `tcBind` \tenv ->
-        let retTy' = substTyVar name argTy retTy
-            -- Normalize type-level function applications after substitution
-            retTy'' = case envCompiler tenv of
-                Just env -> normalizeTy env retTy'
-                Nothing  -> retTy'
-        in applySubst retTy'' `tcBind` \retTy''' ->
+-- Dependent Pi: substitute the bound variable in return type
+inferApp (Pi (Just name) paramTy retTy) (arg:rest) =
+  infer arg `tcBind` \argTy ->
+    tcWithContext "argument of dependent application" (unify argTy paramTy) `tcBind` \_ ->
+      withCompilerEnv (tcPure (substTyVar name argTy retTy)) (\env ->
+        let retTy' = normalizeTy env (substTyVar name argTy retTy)
+        in tcPure retTy') `tcBind` \retTy'' ->
+          applySubst retTy'' `tcBind` \retTy''' ->
              inferApp retTy''' rest
--- Non-dependent arrow: no substitution needed
-inferApp (TArrow paramTy retTy) (arg:rest) =
+-- Non-dependent arrow
+inferApp (Pi Nothing paramTy retTy) (arg:rest) =
   tcWithContext "argument of application" (check arg paramTy) `tcBind` \_ ->
     applySubst retTy `tcBind` \retTy' ->
       inferApp retTy' rest
-inferApp (TVar v) args =
-  -- Unknown function type: create fresh vars for params and result
+-- Unknown function type: create fresh vars
+inferApp (Meta v) args =
   tcMapM (\arg -> infer arg) args `tcBind` \argTys ->
-    freshTyVar `tcBind` \retTy ->
-      let fnTy = Prelude.foldr TArrow retTy argTys
+    freshMeta `tcBind` \retTy ->
+      let fnTy = Prelude.foldr (\a b -> Pi Nothing a b) retTy argTys
       in bind v fnTy `tcBind` \_ -> tcPure retTy
+-- Not an arrow type
 inferApp ty args =
-  -- Not an arrow type — might be polymorphic or error
-  -- For now, just return a fresh var
-  tcMapM infer args `tcBind` \_ -> freshTyVar
+  tcMapM infer args `tcBind` \_ -> freshMeta
 
 -- | Infer type of a Lambda definition
-inferLambda :: Lambda -> TC Ty
+inferLambda :: Lambda -> TC Expr
 inferLambda lam =
   let ps = case params lam of
         (Var _ (Implicit _) _):rest -> rest
@@ -1394,27 +1410,69 @@ inferLambda lam =
       ctx = if selfName /= "" then "function '" ++ selfName ++ "'" else "anonymous lambda"
   in tcWithContext ctx (
     tcMapM (\(Var n tp _) ->
-       exprToTy tp `tcBind` \ty -> tcPure (n, ty)) ps `tcBind` \paramBindings ->
-     freshTyVar `tcBind` \selfTy ->
-     let paramNames = Prelude.map fst paramBindings
-         extendEnv env = env { varTypes =
-           (if selfName /= "" && selfName `Prelude.notElem` paramNames
+       normalizeTypeExpr tp `tcBind` \ty -> tcPure (n, ty)) ps `tcBind` \paramBindings ->
+     normalizeTypeExpr (lamType lam) `tcBind` \retTy ->
+     -- Self-reference: when return type is known, use the declared signature so
+     -- recursive calls type-check correctly. When unknown, use a fresh meta.
+     -- Note: only add self-reference when the name is NOT in the compiler environment,
+     -- since global lookup provides the correct polymorphic type (with fresh metas)
+     -- and avoids issues where instance methods shadow global dispatch
+     -- (e.g., show(val:a) inside Show(Maybe(a)) should dispatch globally, not self-recurse).
+     let paramTys0 = Prelude.map snd paramBindings
+         paramNames = Prelude.map fst paramBindings
+     in tcAsk `tcBind` \tcEnv ->
+     let nameInGlobalEnv = case envCompiler tcEnv of
+           Nothing -> False
+           Just cenv -> case lookupLambda selfName cenv of
+             Just _ -> True
+             Nothing -> case lookupConstructor selfName cenv of
+               Just _ -> True
+               Nothing -> False
+     in (case retTy of
+           Meta _ -> freshMeta
+           _      -> tcPure (Prelude.foldr (\a b -> Pi Nothing a b) retTy paramTys0)
+        ) `tcBind` \selfTy ->
+     let extendEnv env = env { varTypes =
+           (if selfName /= "" && selfName `Prelude.notElem` paramNames && not nameInGlobalEnv
             then Map.insert selfName selfTy else id) $
            Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) paramBindings }
-     in exprToTy (lamType lam) `tcBind` \retTy ->
-          tcLocal extendEnv (
+     in tcLocal extendEnv (
             case retTy of
-              TVar _ -> infer (body lam)
+              Meta _ -> infer (body lam)
               _      -> check (body lam) retTy `tcBind` \_ -> tcPure retTy
           ) `tcBind` \bodyTy ->
             let paramTys = Prelude.map snd paramBindings
-                funcTy = Prelude.foldr TArrow bodyTy paramTys
-            in tcTry (unify selfTy funcTy) `tcBind` \_ ->
-                 tcPure funcTy
+                funcTy = Prelude.foldr (\a b -> Pi Nothing a b) bodyTy paramTys
+            in tcPure funcTy
     )
 
+-- | Collect all free Id names that look like type variables from a type expression.
+-- Descends into Pi, App, Sigma, etc. Respects Pi/Sigma binders (but for simplicity
+-- we just collect all Ids — the caller filters by known types).
+collectFreeTypeVarIds :: Expr -> Set.Set Name
+collectFreeTypeVarIds (Id n) = Set.singleton n
+collectFreeTypeVarIds (App f args) = collectFreeTypeVarIds f <> foldMap collectFreeTypeVarIds args
+collectFreeTypeVarIds (Pi _ a b) = collectFreeTypeVarIds a <> collectFreeTypeVarIds b
+collectFreeTypeVarIds (Sigma _ a b) = collectFreeTypeVarIds a <> collectFreeTypeVarIds b
+collectFreeTypeVarIds (RowExtend _ t r) = collectFreeTypeVarIds t <> collectFreeTypeVarIds r
+collectFreeTypeVarIds _ = Set.empty
+
+-- | Check if a name looks like a type variable (lowercase start, short).
+isLowercaseTypeVar :: Name -> Bool
+isLowercaseTypeVar [] = False
+isLowercaseTypeVar (c:_) = c >= 'a' && c <= 'z'
+
+-- | Check if a name is a known type in the environment (types map, constructors, or built-in primitives).
+isKnownTypeName :: Name -> TCEnv -> Bool
+isKnownTypeName n env =
+  case envCompiler env of
+    Nothing -> False
+    Just cenv -> Map.member n (types cenv)
+             || Map.member n (constructors cenv)
+             || Map.member n (topLambdas cenv)
+
 -- | Infer the type of an action statement
-inferActionStmt :: ActionStmt -> TC Ty
+inferActionStmt :: ActionStmt -> TC Expr
 inferActionStmt (ActionBind _name expr) = infer expr
 inferActionStmt (ActionLet _name expr) = infer expr
 inferActionStmt (ActionExpr expr) = infer expr
@@ -1428,8 +1486,8 @@ inferLetBinds ((v, e):rest) =
       inferLetBinds rest
     )
 
--- | Infer let bindings with body — keeps bindings in scope for body
-inferLetBindsAndBody :: [(Var, Expr)] -> Expr -> TC Ty
+-- | Infer let bindings with body
+inferLetBindsAndBody :: [(Var, Expr)] -> Expr -> TC Expr
 inferLetBindsAndBody [] bodyExpr = infer bodyExpr
 inferLetBindsAndBody ((v, e):rest) bodyExpr =
   infer e `tcBind` \ty ->
@@ -1438,42 +1496,29 @@ inferLetBindsAndBody ((v, e):rest) bodyExpr =
     )
 
 -- | Check that an expression has the expected type
-check :: Expr -> Ty -> TC ()
--- Function definition: check body against expected return type
-check (Function lam) expectedTy =
-  inferLambda lam `tcBind` \inferredTy ->
-    tcTry (unify inferredTy expectedTy) `tcBind` \result ->
-      case result of
-        Just _ -> tcPure ()
-        Nothing ->
-          tcTry (subtype inferredTy expectedTy) `tcBind` \subResult ->
-            case subResult of
-              Just _  -> tcPure ()
-              Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy)
+check :: Expr -> Expr -> TC ()
 
--- Pattern matches: check each branch
+-- Pattern matches
 check (PatternMatches cases) expectedTy =
   tcMapM_ (\c -> check c expectedTy) cases
 
--- CaseOf: check the body
+-- CaseOf
 check (CaseOf pats bodyExpr si) expectedTy =
-  -- Extend env with pattern variable bindings
   let bindings = [(name v, tp) | v@(Var n tp val) <- pats, n /= ""]
-  in tcMapM (\(n, tpExpr) -> exprToTy tpExpr `tcBind` \ty -> tcPure (n, ty)) bindings `tcBind` \typedBindings ->
+  in tcMapM (\(n, tpExpr) -> normalizeTypeExpr tpExpr `tcBind` \ty -> tcPure (n, ty)) bindings `tcBind` \typedBindings ->
        let extendEnv env = env { varTypes = Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) typedBindings }
        in tcLocal extendEnv (check bodyExpr expectedTy)
 
--- ExpandedCase: apply GADT refinements from constructor patterns, then check body
+-- ExpandedCase: apply GADT refinements
 check (ExpandedCase checks bodyExpr _si) expectedTy =
   gadtRefine checks `tcBind` \refinements ->
     if Prelude.null refinements
     then check bodyExpr expectedTy
     else
-      -- Apply refinements to both the environment and the expected type
       let refinedExpected = Prelude.foldl (\t (n, r) -> substTyVar n r t) expectedTy refinements
       in tcLocal (applyGADTRefinements refinements) (check bodyExpr refinedExpected)
 
--- Subsumption: infer, try unify, then try subtype
+-- Subsumption
 check expr expectedTy =
   infer expr `tcBind` \inferredTy ->
     tcTry (unify inferredTy expectedTy) `tcBind` \result ->
@@ -1482,7 +1527,7 @@ check expr expectedTy =
         Nothing ->
           tcTry (subtype inferredTy expectedTy) `tcBind` \subResult ->
             case subResult of
-              Just _  -> tcPure ()  -- subtype match (Dog <: Animal), no runtime coercion needed
+              Just _  -> tcPure ()
               Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy)
 
 -- ============================================================================
@@ -1490,8 +1535,6 @@ check expr expectedTy =
 -- ============================================================================
 
 -- | Type check pass — inserted between case optimization and CLM conversion.
--- In permissive mode (default): type errors are logged as warnings.
--- With --strict-types: type errors are fatal.
 typeCheckPass :: IntState ()
 typeCheckPass = do
     st <- get
@@ -1502,60 +1545,119 @@ typeCheckPass = do
         tcSt = initTCState mode
         tcEnv = buildTCEnvFromEnvironment env
         logFn = if isStrict then logError else logWarning
-    -- Type check each top-level declaration with accumulated state
+        tl = topLambdas env
+        il = instanceLambdas env
+        -- Use post-optimization lambdas from topLambdas/instanceLambdas when
+        -- available. Case optimization (Pass 2) transforms CaseOf patterns
+        -- into ExpandedCase/PatternGuard forms in topLambdas but does NOT
+        -- update parsedModule. Using pre-optimization CaseOf causes false
+        -- "unbound variable" warnings because pattern-bound variables (from
+        -- val fields) aren't in the TC's scope.
+        useOptimized (Function lam, si) =
+            case Map.lookup (lamName lam) tl of
+                Just optLam -> (Function optLam, si)
+                Nothing     -> (Function lam, si)
+        useOptimized (Instance sn targs impls reqs, si) =
+            let typeNames = Prelude.map exprToName targs
+                optImpl (Function implLam) =
+                    let key = lamName implLam ++ "\0" ++ intercalate "\0" typeNames
+                    in case Map.lookup key il of
+                        Just optLam -> Function optLam
+                        Nothing     -> Function implLam
+                optImpl other = other
+            in (Instance sn targs (Prelude.map optImpl impls) reqs, si)
+        useOptimized other = other
+        exprToName (Id n) = n
+        exprToName (App (Id n) _) = n
+        exprToName e = showExprBrief e
+        md' = Prelude.map useOptimized md
     _ <- foldM (\accSt (expr, srcInfo) ->
         case runTC (checkTopLevel expr) tcEnv accSt of
             Left errs -> do
+                let errMsgs = Prelude.map showTCError errs
                 forM_ errs $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                return accSt  -- continue with previous state on error
+                -- Count and collect errors
+                modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length errs
+                                , tcCollectedErrors = tcCollectedErrors s ++ errMsgs })
+                return accSt
             Right (_, tcSt') -> do
-                forM_ (tcErrors tcSt') $ \err ->
+                let newErrors = tcErrors tcSt'
+                let errMsgs = Prelude.map showTCError newErrors
+                forM_ newErrors $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                return (tcSt' { tcErrors = [] })  -- clear reported errors
-      ) tcSt md
-    pure () -- Type-directed dispatch annotation is done in lamToCLMPass (Pipeline.hs)
+                -- Count and collect errors
+                unless (Prelude.null newErrors) $
+                    modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length newErrors
+                                    , tcCollectedErrors = tcCollectedErrors s ++ errMsgs })
+                return (tcSt' { tcErrors = [] })
+      ) tcSt md'
+    pure ()
 
 -- | Build a TCEnv from the compiler's Environment
 buildTCEnvFromEnvironment :: Environment -> TCEnv
 buildTCEnvFromEnvironment env = emptyTCEnv { envCompiler = Just env }
 
--- | Resolve accumulated structure constraints against the compiler environment.
--- For each CStructure constraint, check that an instance exists.
+-- | Resolve accumulated structure constraints.
+-- Phase 3: fixpoint loop — resolving constraint A may solve a meta that enables constraint B.
+-- Loops up to 10 iterations until no more constraints are resolved.
 resolveConstraints :: TC ()
-resolveConstraints =
-  tcGet `tcBind` \st ->
-    tcAsk `tcBind` \env ->
-      let cs = constraints st
-      in tcMapM_ (resolveOne env) cs `tcBind` \_ ->
-           tcModify (\s -> s { constraints = [] })
+resolveConstraints = resolveLoop 10
   where
+    resolveLoop 0 = warnRemaining
+    resolveLoop n =
+      tcGet `tcBind` \st ->
+        let before = Prelude.length (constraints st)
+        in if before == 0 then tcPure ()
+           else resolveOnce `tcBind` \_ ->
+             tcGet `tcBind` \st' ->
+               let after = Prelude.length (constraints st')
+               in if after < before then resolveLoop (n - 1) else warnRemaining
+
+    warnRemaining =
+      tcGet `tcBind` \st ->
+        tcAsk `tcBind` \env ->
+          tcMapM_ (warnOne env) (constraints st) `tcBind` \_ ->
+            tcModify (\s -> s { constraints = [] })
+
+    warnOne env (CStructure structName tyArgs) =
+      tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
+        let typeNames = Prelude.map tyToName resolvedArgs
+        in if Prelude.any (== "") typeNames then tcPure ()
+           else tcWarnOrFail (ConstraintUnsolved (CStructure structName resolvedArgs))
+    warnOne _ (CRowLack _ _) = tcPure ()
+
+    resolveOnce =
+      tcGet `tcBind` \st ->
+        tcAsk `tcBind` \env ->
+          let cs = constraints st
+          in tcModify (\s -> s { constraints = [] }) `tcBind` \_ ->
+             tcMapM_ (resolveOne env) cs
+
     resolveOne env (CStructure structName tyArgs) =
-      -- Try to resolve type args via substitution
       tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
         let typeNames = Prelude.map tyToName resolvedArgs
         in if Prelude.any (== "") typeNames
-           then tcPure ()  -- unresolved vars, can't check yet — that's OK
+           then tcModify (\s -> s { constraints = CStructure structName tyArgs : constraints s })
            else case envCompiler env of
              Nothing -> tcPure ()
              Just cenv ->
-               -- Check if instance exists for any function in this structure
                case lookupType structName cenv of
                  Just (Structure structLam _) -> case body structLam of
                    DeclBlock exs ->
                      let funcNames = [lamName l | Function l <- exs]
                      in if Prelude.any (\fn -> instanceExists cenv fn typeNames) funcNames
                         then tcPure ()
-                        else tcWarn (ConstraintUnsolved (CStructure structName resolvedArgs))
+                        else tcModify (\s -> s { constraints = CStructure structName resolvedArgs : constraints s })
                    _ -> tcPure ()
-                 _ -> tcPure ()  -- structure not found, skip
-    resolveOne _ (CRowLack _ _) = tcPure ()  -- row constraints handled during unification
+                 _ -> tcPure ()
+    resolveOne _ (CRowLack n e) =
+      tcModify (\s -> s { constraints = CRowLack n e : constraints s })
 
-    -- Check if an instance exists for a function with given types
     instanceExists cenv funcName typeNames =
       case lookupInstanceLambda funcName typeNames cenv of
         Just _  -> True
-        Nothing -> -- try with structure inheritance
+        Nothing ->
           Prelude.any (\tn ->
             let parents = getAllParents tn cenv
             in Prelude.any (\p -> case lookupInstanceLambda funcName [p] cenv of
@@ -1563,35 +1665,120 @@ resolveConstraints =
                                     Nothing -> False) parents
           ) typeNames
 
--- | Convert a resolved Ty to a type name (for instance lookup)
-tyToName :: Ty -> Name
-tyToName (TCon n) = n
-tyToName (TApp (TCon n) _) = n
-tyToName _ = ""  -- unresolved
+-- | Convert a resolved Expr to a type name (for instance lookup)
+tyToName :: Expr -> Name
+tyToName (Id n) = n
+tyToName (App (Id n) _) = n
+tyToName _ = ""
 
 -- | Check a top-level declaration
 checkTopLevel :: Expr -> TC ()
--- Type check a function definition
 checkTopLevel (Function lam) =
   inferLambda lam `tcBind` \_ -> resolveConstraints
 
--- Type check an instance: check each implementation function
-checkTopLevel (Instance _structName _targs impls _reqs) =
-  tcMapM_ (\impl -> infer impl `tcBind` \_ -> tcPure ()) impls
+checkTopLevel (Instance structName targs impls _reqs) =
+  tcAsk `tcBind` \env ->
+    case envCompiler env of
+      Nothing -> inferImpls impls
+      Just cenv ->
+        tcWithContext ("instance " ++ structName ++ "(" ++ intercalate "," (Prelude.map showExprBrief targs) ++ ")") $
+          case lookupType structName cenv of
+            Just (Structure structLam _) ->
+              let sigFuncs = [l | Function l <- case body structLam of DeclBlock exs -> exs; _ -> []]
+                  typeVars = Prelude.map Surface.name (Prelude.filter isImplicitVar (params structLam))
+              in tcMapM_ (checkInstanceImpl cenv typeVars targs sigFuncs) impls
+                 `tcBind` \_ -> resolveConstraints
+            _ -> inferImpls impls  -- fallback for non-structure targets
+  where
+    inferImpls is = tcMapM_ (\impl -> infer impl `tcBind` \_ -> tcPure ()) is
 
--- Effect and handler declarations — register but no deep checking needed
+    isImplicitVar (Var _ (Implicit _) _) = True
+    isImplicitVar (Var _ tp _) = isUniverseLike tp
+
+    isUniverseLike (U _) = True
+    isUniverseLike (Id "Type") = True
+    isUniverseLike (Id "Type1") = True
+    isUniverseLike (Id "Type2") = True
+    isUniverseLike _ = False
+
+    checkInstanceImpl cenv typeVars targs' sigFuncs impl = case impl of
+      Function implLam ->
+        case [sf | sf <- sigFuncs, lamName sf == lamName implLam] of
+          (sigLam:_) -> checkImplAgainstSig typeVars targs' implLam sigLam
+          [] -> infer impl `tcBind` \_ -> tcPure ()  -- no matching sig, just infer
+      _ -> infer impl `tcBind` \_ -> tcPure ()  -- Intrinsic, Derive, etc.
+
+    checkImplAgainstSig typeVars' targs' implLam sigLam =
+      -- Instantiate sig with concrete type args
+      let paramMapping = Prelude.zip typeVars' targs'
+          substSigTy ty = Prelude.foldl (\t (n, arg) -> substTyVar n arg t) ty paramMapping
+          -- Only check return types when they are concrete (no remaining type vars)
+          sigRetTy = substSigTy (lamType sigLam)
+          hasTypeVars = hasUnsubstitutedVars typeVars' sigRetTy
+      in if hasTypeVars
+         -- When the algebra has type variables that aren't in targs (e.g. Functor has 'a','b'),
+         -- just infer the implementation without checking against the signature
+         then inferLambda implLam `tcBind` \_ -> tcPure ()
+         else inferLambda implLam `tcBind` \implTy ->
+           normalizeTypeExpr sigRetTy `tcBind` \expectedRetTy ->
+             let implRetTy = stripPiReturn implTy
+             in tcTry (unify implRetTy expectedRetTy) `tcBind` \result ->
+               case result of
+                 Just _  -> tcPure ()
+                 Nothing -> tcWarnOrFail (OtherError $
+                   "Instance method '" ++ lamName implLam ++ "' return type mismatch: expected "
+                   ++ showTy expectedRetTy ++ " but got " ++ showTy implRetTy)
+
+    stripPiReturn (Pi _ _ b) = stripPiReturn b
+    stripPiReturn t = t
+
+    -- Check if a type expression still contains unsubstituted type variables
+    hasUnsubstitutedVars :: [Name] -> Expr -> Bool
+    hasUnsubstitutedVars allTypeVars expr =
+      let freeIds = collectFreeIds expr
+      in Prelude.any (`Prelude.elem` freeIds) allTypeVars
+       || Prelude.any isLowercaseFreeVar freeIds
+
+    collectFreeIds :: Expr -> [Name]
+    collectFreeIds (Id n) = [n]
+    collectFreeIds (App e args) = collectFreeIds e ++ Prelude.concatMap collectFreeIds args
+    collectFreeIds (Pi _ a b) = collectFreeIds a ++ collectFreeIds b
+    collectFreeIds _ = []
+
+    isLowercaseFreeVar :: Name -> Bool
+    isLowercaseFreeVar [] = False
+    isLowercaseFreeVar (c:_) = c >= 'a' && c <= 'z'
+
 checkTopLevel (EffectDecl _ _ _) = tcPure ()
 checkTopLevel (HandlerDecl _ _ _ _) = tcPure ()
 
--- Sum types, structures, primitives — just validate form, no deep checking needed
-checkTopLevel (SumType _) = tcPure ()
-checkTopLevel (Structure _ _) = tcPure ()
+checkTopLevel (SumType lam) =
+  tcWithContext ("type " ++ lamName lam) $
+    case body lam of
+      Constructors constrs ->
+        tcMapM_ (\cLam ->
+          tcMapM_ (\(Var _ tp _) ->
+            tcTry (normalizeTypeExpr tp) `tcBind` \_ -> tcPure ()
+          ) (params cLam)
+        ) constrs
+      _ -> tcPure ()
+
+checkTopLevel (Structure lam _si) =
+  tcWithContext ("structure " ++ lamName lam) $
+    case body lam of
+      DeclBlock exs ->
+        tcMapM_ (\e -> case e of
+          Function methodLam ->
+            tcTry (inferLamType methodLam) `tcBind` \_ -> tcPure ()
+          _ -> tcPure ()
+        ) exs
+      _ -> tcPure ()
 checkTopLevel (Primitive _) = tcPure ()
 checkTopLevel (Repr _ _ _ _ _) = tcPure ()
 checkTopLevel Intrinsic = tcPure ()
 checkTopLevel Derive = tcPure ()
 
--- Type check a class declaration: validate fields, check method bodies, overrides, implements
+-- Type check a class declaration
 checkTopLevel (ClassDecl lam cinfo) =
   tcAsk `tcBind` \env ->
     case envCompiler env of
@@ -1599,15 +1786,13 @@ checkTopLevel (ClassDecl lam cinfo) =
       Just cenv ->
         let className = lamName lam
         in tcWithContext ("class " ++ className) (
-        -- 1. Validate field types are well-formed
         tcMapM_ (\(Var _ tp _) ->
-          tcTry (exprToTy tp) `tcBind` \_ -> tcPure ()
+          tcTry (normalizeTypeExpr tp) `tcBind` \_ -> tcPure ()
           ) (params lam) `tcBind` \_ ->
-        -- 2. Check each method body
         let methods = case body lam of
               DeclBlock exs -> [l | Function l <- exs]
               _ -> []
-            selfTy = TCon className
+            selfTy = Id className
         in tcMapM_ (\methodLam ->
              let methodEnv envT = envT { varTypes =
                    Map.insert "self" selfTy (varTypes envT) }
@@ -1616,7 +1801,6 @@ checkTopLevel (ClassDecl lam cinfo) =
                     inferLambda methodLam `tcBind` \_ -> tcPure ()
                   ))
              ) methods `tcBind` \_ ->
-        -- 3. Validate override signatures match parent
         (case classParent cinfo of
           Nothing -> tcPure ()
           Just (parentName, _) ->
@@ -1629,8 +1813,8 @@ checkTopLevel (ClassDecl lam cinfo) =
                 in tcMapM_ (\overrideName ->
                      case (findLam overrideName methods, findLam overrideName parentMethods) of
                        (Just child, Just parent) ->
-                         lamToTy child `tcBind` \childTy ->
-                           lamToTy parent `tcBind` \parentTy ->
+                         inferLamType child `tcBind` \childTy ->
+                           inferLamType parent `tcBind` \parentTy ->
                              tcTry (unify childTy parentTy) `tcBind` \result ->
                                case result of
                                  Just _ -> tcPure ()
@@ -1641,7 +1825,6 @@ checkTopLevel (ClassDecl lam cinfo) =
                    ) overrideNames
               _ -> tcPure ()
         ) `tcBind` \_ ->
-        -- 4. Validate implements contracts
         let implNames = [n | Id n <- classImplements cinfo]
             methodNames = [lamName l | l <- methods]
         in tcMapM_ (\algName ->
@@ -1661,66 +1844,149 @@ checkTopLevel (ClassDecl lam cinfo) =
         resolveConstraints
         )
 
--- For any other top-level expression, just infer its type
+-- Fixity declarations are non-semantic, no type checking needed
+checkTopLevel (FixityDecl _ _ _) = tcPure ()
+
+-- Module system nodes: no type checking needed
+checkTopLevel (ModuleDecl _) = tcPure ()
+checkTopLevel (Import _ _ _) = tcPure ()
+checkTopLevel (Open _) = tcPure ()
+checkTopLevel (Export _ _) = tcPure ()
+checkTopLevel (PrivateDecl e) = checkTopLevel e
+
 checkTopLevel expr = infer expr `tcBind` \_ -> resolveConstraints
 
--- | Convert a TCError to a LogPayload for reporting
-mkTCLogPayload :: SourceInfo -> TCError -> LogPayload
-mkTCLogPayload si err = mkLogPayload si (showTCError err)
+-- ============================================================================
+-- Pretty Printing
+-- ============================================================================
 
--- | Pretty-print a type checker error
+-- | Convert a TCError to a LogPayload for reporting.
+-- Phase 5: extracts source info from WithSource wrapper when available.
+mkTCLogPayload :: SourceInfo -> TCError -> LogPayload
+mkTCLogPayload si err =
+  let (si', err') = extractSourceInfo si err
+  in mkLogPayload si' (showTCError err')
+  where
+    extractSourceInfo _defSi (WithSource si' inner) = (si', inner)
+    extractSourceInfo defSi other = (defSi, other)
+
+-- | Pretty-print a type checker error.
+-- Phase 4: uses zonkRemaining to show resolved types instead of raw metas.
 showTCError :: TCError -> String
-showTCError (Mismatch t1 t2) = "[TC] Type mismatch: expected " ++ showTy t1 ++ " but got " ++ showTy t2
-showTCError (OccursCheck v t) = "[TC] Infinite type: " ++ showTyVar v ++ " occurs in " ++ showTy t
+showTCError (Mismatch t1 t2) =
+    "[TC] Type mismatch: expected " ++ showTyZonked t1 ++ " but got " ++ showTyZonked t2
+    ++ mismatchHint t1 t2
+showTCError (OccursCheck v t) = "[TC] Infinite type: ?" ++ show v ++ " occurs in " ++ showTyZonked t
+    ++ "\n    Hint: This usually means a recursive type needs an explicit annotation"
 showTCError (UnboundVar n) = "[TC] Unbound variable: " ++ n
+    ++ "\n    Hint: Check spelling or add a type annotation. Is '" ++ n ++ "' defined and in scope?"
 showTCError (MissingField n) = "[TC] Missing record field: " ++ n
 showTCError (ArityMismatch e a) = "[TC] Arity mismatch: expected " ++ show e ++ " arguments, got " ++ show a
 showTCError (ConstraintUnsolved c) = "[TC] Unsolved constraint: " ++ showConstraint c ++ " — no matching instance found"
+    ++ "\n    Hint: Add an instance declaration or a 'requires " ++ showConstraint c ++ "' clause"
 showTCError (OtherError s) = "[TC] " ++ s
 showTCError (WithContext ctx inner) = showTCError inner ++ "\n    in " ++ ctx
-showTCError (SubtypeMismatch t1 t2) = "[TC] Subtype mismatch: " ++ showTy t1 ++ " is not a subtype of " ++ showTy t2
+showTCError (WithSource si inner) = showSourceLoc si ++ showTCError inner
+showTCError (SubtypeMismatch t1 t2) = "[TC] Subtype mismatch: " ++ showTyZonked t1 ++ " is not a subtype of " ++ showTyZonked t2
+
+-- | Generate a hint for type mismatches when patterns are recognizable
+mismatchHint :: Expr -> Expr -> String
+mismatchHint _ _ = ""
+
+-- | Show a type with remaining metas replaced by readable names (Phase 4).
+-- Assigns sequential letter names (_a, _b, _c, ...) instead of raw meta IDs.
+showTyZonked :: Expr -> String
+showTyZonked expr =
+    let metas = collectMetas expr
+        -- Assign unique letter names: _a, _b, _c, ...
+        metaNames = Prelude.zip (nub metas) (Prelude.map metaLetter [0..])
+        metaLetter i
+            | i < 26   = '_' : [toEnum (fromEnum 'a' + i)]
+            | otherwise = "_t" ++ show i
+        nameMap = Map.fromList [(m, n) | (m, n) <- metaNames]
+        zonkReadable (Meta n) = case Map.lookup n nameMap of
+            Just nm -> Id nm
+            Nothing -> Id ("_?" ++ show n)
+        zonkReadable e = mapTypeChildren zonkReadable e
+    in showTy (zonkReadable expr)
+  where
+    collectMetas (Meta n) = [n]
+    collectMetas e = concatMap collectMetas (typeChildren e)
+
+-- | Format source location for error messages (Phase 5).
+showSourceLoc :: SourceInfo -> String
+showSourceLoc (SourceInfo l c f _) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
+showSourceLoc SourceInteractive = ""
 
 showConstraint :: Constraint -> String
 showConstraint (CStructure n tys) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")"
 showConstraint (CRowLack n _) = "row lacks " ++ n
 
--- | Pretty-print a Ty
-showTy :: Ty -> String
-showTy (TVar v) = showTyVar v
-showTy (TRigid n) = n
-showTy (TCon n) = n
-showTy (TApp c args) = showTy c ++ "(" ++ intercalate ", " (Prelude.map showTy args) ++ ")"
-showTy (TPi Nothing a b) = showTyArg a ++ " -> " ++ showTy b
-showTy (TPi (Just n) a b) = "(" ++ n ++ ":" ++ showTy a ++ ") -> " ++ showTy b
-showTy (TSigma Nothing a b) = "(" ++ showTy a ++ ", " ++ showTy b ++ ")"
-showTy (TSigma (Just n) a b) = "(" ++ n ++ ":" ++ showTy a ++ " * " ++ showTy b ++ ")"
-showTy (TId t a b) = "Id(" ++ showTy t ++ ", " ++ showTy a ++ ", " ++ showTy b ++ ")"
-showTy (TForall n t) = "forall " ++ n ++ ". " ++ showTy t
-showTy (TRecord row) = "{" ++ showRow row ++ "}"
-showTy (TEffect row ty) = "Eff {" ++ showRow row ++ "} " ++ showTy ty
-showTy TLevel = "Level"
-showTy (TU (LConst 0)) = "Type"
-showTy (TU (LConst n)) = "Type" ++ show n
-showTy (TU l) = "U(" ++ showLevel l ++ ")"
-showTy (TLit l) = show l
+-- | Pretty-print a type (Expr used as type)
+showTy :: Expr -> String
+showTy (Meta v) = "?" ++ show v
+showTy (Id n) = n
+showTy (App (Id "PropEq") [t, a, b]) = "PropEq(" ++ showTy t ++ ", " ++ showTy a ++ ", " ++ showTy b ++ ")"
+showTy (App f args) = showTy f ++ "(" ++ intercalate ", " (Prelude.map showTy args) ++ ")"
+showTy (Pi (Just n) (U (LConst 0)) t) = "forall " ++ n ++ ". " ++ showTy t
+showTy (Pi Nothing a b) = showTyArg a ++ " -> " ++ showTy b
+showTy (Pi (Just n) a b) = "(" ++ n ++ ":" ++ showTy a ++ ") -> " ++ showTy b
+showTy (Sigma Nothing a b) = "(" ++ showTy a ++ ", " ++ showTy b ++ ")"
+showTy (Sigma (Just n) a b) = "(" ++ n ++ ":" ++ showTy a ++ " * " ++ showTy b ++ ")"
+showTy (EffType r t) = "Eff {" ++ showRow r ++ "} " ++ showTy t
+showTy (U (LConst 0)) = "Type"
+showTy (U (LConst n)) = "Type" ++ show n
+showTy (U l) = "U(" ++ showLevel l ++ ")"
+showTy (Lit l) = show l
+showTy e@(RowExtend _ _ _) = "{" ++ showRow e ++ "}"
+showTy RowEmpty = "{}"
+showTy _ = "?"
 
-showTyArg :: Ty -> String
-showTyArg t@(TPi Nothing _ _) = "(" ++ showTy t ++ ")"
+-- | Pretty-print a row
+showRow :: Expr -> String
+showRow RowEmpty = ""
+showRow (RowExtend l t RowEmpty) = l ++ ":" ++ showTy t
+showRow (RowExtend l t r) = l ++ ":" ++ showTy t ++ ", " ++ showRow r
+showRow (Meta v) = ".." ++ "?" ++ show v
+showRow (Id n) = ".." ++ n
+showRow _ = "?"
+
+showTyArg :: Expr -> String
+showTyArg t@(Pi Nothing _ _) = "(" ++ showTy t ++ ")"
 showTyArg t = showTy t
 
-showTyVar :: TyVar -> String
-showTyVar v = "?" ++ show v
-
-showRow :: Row -> String
-showRow REmpty = ""
-showRow (RExtend l t REmpty) = l ++ ":" ++ showTy t
-showRow (RExtend l t r) = l ++ ":" ++ showTy t ++ ", " ++ showRow r
-showRow (RVar v) = ".." ++ showTyVar v
-showRow (RRigid n) = ".." ++ n
-
--- | Truncated show for expressions (for error messages)
+-- | Depth-limited show for expressions (for error messages).
+-- Avoids generating the full string for deeply nested expressions.
 showExprBrief :: Expr -> String
-showExprBrief e = let s = show e in if length s > 80 then take 77 s ++ "..." else s
+showExprBrief = go 3
+  where
+    go 0 _ = "..."
+    go d (Id n) = n
+    go d (Meta n) = "?" ++ show n
+    go d (U (LConst 0)) = "Type"
+    go d (U (LConst n)) = "Type" ++ show n
+    go d (U l) = "Type(" ++ showLevel l ++ ")"
+    go d (App f args) = go (d-1) f ++ "(" ++ intercalate ", " (Prelude.map (go (d-1)) args) ++ ")"
+    go d (Pi Nothing a b) = go (d-1) a ++ " -> " ++ go (d-1) b
+    go d (Pi (Just n) a b) = "(" ++ n ++ ":" ++ go (d-1) a ++ ") -> " ++ go (d-1) b
+    go d (Sigma Nothing a b) = go (d-1) a ++ " * " ++ go (d-1) b
+    go d (Sigma (Just n) a b) = "(" ++ n ++ ":" ++ go (d-1) a ++ ") * " ++ go (d-1) b
+    go d (RowExtend n t r) = "{" ++ n ++ ":" ++ go (d-1) t ++ " | " ++ go (d-1) r ++ "}"
+    go _ RowEmpty = "{}"
+    go d (NTuple fields) = "{" ++ intercalate ", " (Prelude.map (goField (d-1)) fields) ++ "}"
+    go d (Lit l) = show l
+    go d (Function lam) = "function " ++ lamName lam ++ "(...)"
+    go _ UNDEFINED = "_"
+    go _ Intrinsic = "intrinsic"
+    go _ Derive = "derive"
+    go d (RecordType fs _) = "{" ++ intercalate ", " [n ++ ":" ++ go (d-1) t | (n,t) <- fs] ++ "}"
+    go d (EffType r t) = "Eff " ++ go (d-1) r ++ " " ++ go (d-1) t
+    go d (Implicit e) = "Implicit(" ++ go (d-1) e ++ ")"
+    go d (ConTuple (ConsTag n _) args) = n ++ "(" ++ intercalate ", " (Prelude.map (go (d-1)) args) ++ ")"
+    go d (ArrayLit es) = "[" ++ intercalate ", " (Prelude.map (go (d-1)) es) ++ "]"
+    go _ e = let s = show e in if Prelude.length s > 60 then Prelude.take 57 s ++ "..." else s
+    goField d (Nothing, e) = go d e
+    goField d (Just n, e) = n ++ " = " ++ go d e
 
 -- | Find a lambda by name in a list
 findLam :: Name -> [Lambda] -> Maybe Lambda

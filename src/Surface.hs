@@ -170,6 +170,24 @@ data Literal = LInt !Int | LFloat !Double | LChar !Char | LString !String | LLis
   deriving (Eq, Show, Generic)
 instance Binary Literal
 
+-- | Canonical mapping from a Literal to its type name.
+-- Single source of truth — used by CLM, Interpreter, reflection intrinsics.
+litTypeName :: Literal -> Maybe Name
+litTypeName (LInt _)     = Just "Int"
+litTypeName (LFloat _)   = Just "Float64"
+litTypeName (LString _)  = Just "String"
+litTypeName (LChar _)    = Just "Char"
+litTypeName (LInt8 _)    = Just "Int8"
+litTypeName (LInt16 _)   = Just "Int16"
+litTypeName (LInt32 _)   = Just "Int32"
+litTypeName (LInt64 _)   = Just "Int64"
+litTypeName (LWord8 _)   = Just "UInt8"
+litTypeName (LWord16 _)  = Just "UInt16"
+litTypeName (LWord32 _)  = Just "UInt32"
+litTypeName (LWord64 _)  = Just "UInt64"
+litTypeName (LFloat32 _) = Just "Float32"
+litTypeName _            = Nothing
+
 -- Lambda - represents EVERYTHING pretty much (see README in HoTT folder). Its type signature is
 -- also obvious from the definition, so it encodes Pi types already!
 data Lambda = Lambda {
@@ -178,6 +196,9 @@ data Lambda = Lambda {
   , body       :: Expr -- whatever our lambda is bound to
   , lamType    :: Expr -- return type of the function, used in type checking:
    -- Type for type constructors, Sigma for typeclasses etc, specific type for type constructors and functions etc
+  , lamRequires :: [Expr] -- per-function constraints: requires Monoid(a), Ord(b)
+   -- Stored as [App (Id "Monoid") [Id "a"], App (Id "Ord") [Id "b"]]
+   -- Type checker substitutes concrete types and emits CStructure constraints at call site
   , lamSrcInfo :: SourceInfo -- source location of this lambda definition
 } deriving (Show, Eq, Generic)
 instance Binary Lambda
@@ -185,7 +206,7 @@ instance Binary Lambda
 -- | Convenience constructor for Lambda with no source info (SourceInteractive).
 -- Use this in compiler-generated lambdas (desugaring, passes, etc.)
 mkLambda :: Name -> Record -> Expr -> Expr -> Lambda
-mkLambda n p b t = Lambda n p b t SourceInteractive
+mkLambda n p b t = Lambda n p b t [] SourceInteractive
 
 -- lambda is only a constructor if its body is a tuple and it has a clear
 -- return type!
@@ -233,8 +254,12 @@ data Expr =
   -- body expression being a tuple of Lambdas which are constructors
   | UnaryOp Name Expr
   | BinaryOp Name Expr Expr
-  | U Int -- Universe hierarchy: U 0 = Type, U 1 = Kind, etc.
+  | U Level -- Universe hierarchy: U (LConst 0) = Type, U (LConst 1) = Kind, etc.
   -- Prim/PrimCall removed: use Function + Intrinsic instead
+  | Meta !Int -- Unification metavariable (created during type checking)
+  | RowEmpty -- Closed row (no more fields)
+  | RowExtend Name Expr Expr -- Row field extension: {name:Type | rest}
+  | Sigma (Maybe Name) Expr Expr -- Dependent pair type: (x:A) * B(x)
   | Implicit Expr -- current solution for implicit parameter functions
   -- that result e.g. from structure (typeclass) expansions -
   -- only used in the TYPE place!!!
@@ -279,6 +304,10 @@ data Expr =
   -- Class system nodes
   | ClassDecl Lambda ClassInfo          -- class Name(fields) [extends Parent(args)] [implements A,B] = { methods }
   | FixityDecl Assoc Int [Name]        -- infixl/infixr/infix prec (op1), (op2), ...
+  | ExternFunc Name [Var] Expr (Maybe (Name, String))
+    -- ^ extern function name(params) : RetType [= inline "add" | = llvm "llvm.sqrt.f64"];
+    -- Nothing = plain C function call (runtime). Just ("inline", "add") = inline instruction.
+    -- Just ("llvm", "llvm.sqrt.f64") = LLVM intrinsic call.
   | ERROR String
 
 
@@ -290,7 +319,7 @@ instance Binary Expr
 
 -- Convenience pattern synonym so existing code matching on Type keeps working
 pattern Type :: Expr
-pattern Type = U 0
+pattern Type = U (LConst 0)
 
 -- | Non-dependent arrow type: A -> B = Pi Nothing A B
 -- Backward-compatible pattern synonym — existing code using ArrowType still works.
@@ -384,7 +413,11 @@ traverseExpr f (SumType lam) = SumType $ lam { body = f $ traverseExpr f (body l
 traverseExpr f (Constructors lams) = Constructors $ map (\l-> l {body = f $ traverseExpr f (body l) } ) lams
 traverseExpr f (Binding (Var nm tp val)) = Binding (Var nm (f $ traverseExpr f tp) (f $ traverseExpr f val))
 traverseExpr _ e@(U _) = e
-traverseExpr f (Instance nm targs impls reqs) = Instance nm (map (traverseExpr f) targs) (map (traverseExpr f) impls) (map (traverseExpr f) reqs)
+traverseExpr _ e@(Meta _) = e
+traverseExpr _ RowEmpty = RowEmpty
+traverseExpr f (RowExtend n t r) = RowExtend n (f $ traverseExpr f t) (f $ traverseExpr f r)
+traverseExpr f (Sigma mn e1 e2) = Sigma mn (f $ traverseExpr f e1) (f $ traverseExpr f e2)
+traverseExpr f (Instance nm targs impls reqs) = Instance nm (map (f . traverseExpr f) targs) (map (f . traverseExpr f) impls) (map (f . traverseExpr f) reqs)
 traverseExpr f (IfThenElse c t e) = IfThenElse (f $ traverseExpr f c) (f $ traverseExpr f t) (f $ traverseExpr f e)
 traverseExpr f (LetIn binds body) = LetIn (map (\(v,ex) -> (v, f $ traverseExpr f ex)) binds) (f $ traverseExpr f body)
 traverseExpr f (Law lam ex) = Law (lam { body = f $ traverseExpr f (body lam) }) (f $ traverseExpr f ex)
@@ -423,6 +456,7 @@ traverseExpr f (EffType row res) = EffType (f $ traverseExpr f row) (f $ travers
 traverseExpr f (ClassDecl lam ci) = ClassDecl (lam { body = f $ traverseExpr f (body lam) }) ci
 -- Fixity declarations (leaf node)
 traverseExpr _ e@(FixityDecl _ _ _) = e
+traverseExpr _ e@(ExternFunc _ _ _ _) = e
 traverseExpr _ e@(ERROR _) = e
 traverseExpr f e = ERROR $ "Traverse not implemented for: " ++ ppr e
 
@@ -506,6 +540,8 @@ collectIdRefs = go
     go (Typed e _)        = go e
     go (Lit _)            = []
     go UNDEFINED          = []
+    go (RowExtend _ t r)  = go t ++ go r
+    go (Sigma _ a b)      = go a ++ go b
     go _                  = []
 
 -- --------------------------------- PRETTY PRINTING --------------------------------------------
@@ -609,8 +645,16 @@ instance PrettyPrint Expr where
     ++ pprImplements (classImplements ci)
     ++ " = " ++ ppr (body lam)
   ppr (FixityDecl assoc prec ops) = pprAssoc assoc ++ " " ++ show prec ++ " " ++ showListPlainSep (\o -> "(" ++ o ++ ")") ", " ops
-  ppr (U 0) = "Type"
-  ppr (U n) = "Type" ++ show n
+  ppr (ExternFunc nm ps ret Nothing) = "extern function " ++ nm ++ "(" ++ showListPlainSep ppr ", " ps ++ ") : " ++ ppr ret
+  ppr (ExternFunc nm ps ret (Just (kind, spec))) = "extern function " ++ nm ++ "(" ++ showListPlainSep ppr ", " ps ++ ") : " ++ ppr ret ++ " = " ++ kind ++ " \"" ++ spec ++ "\""
+  ppr (U (LConst 0)) = "Type"
+  ppr (U (LConst n)) = "Type" ++ show n
+  ppr (U l) = "Type(" ++ showLevel l ++ ")"
+  ppr (Meta n) = "?" ++ show n
+  ppr RowEmpty = "{}"
+  ppr (RowExtend n t r) = "{" ++ n ++ ":" ++ ppr t ++ " | " ++ ppr r ++ "}"
+  ppr (Sigma Nothing a b) = ppr a ++ " * " ++ ppr b
+  ppr (Sigma (Just n) a b) = "(" ++ n ++ ":" ++ ppr a ++ ") * " ++ ppr b
   ppr e = show e
   -- λ
 

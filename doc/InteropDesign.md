@@ -533,7 +533,173 @@ This is deferred. Extern mutability covers 95% of practical needs.
 
 ---
 
-## 9. Generics Mapping
+## 9. Method Purity Classification
+
+### 9.1 The Problem
+
+tulam's type system distinguishes **pure** computation (algebras, functions, data types) from **effectful** computation (effects, handlers, action blocks). When extern platform types participate in tulam's algebra system, this distinction must be preserved — a `.NET List<T>.Add()` is mutation (effectful), but `.Count` is observation (pure). The compiler must know the difference.
+
+### 9.2 Automatic Purity Inference from Metadata
+
+The compiler infers method purity from metadata signals that already exist on each platform. **The programmer writes zero annotations in the common case.**
+
+| Platform | Pure Signal | Impure Signal |
+|----------|-------------|---------------|
+| **C/C++** | `const` method, `const` reference/pointer params, `__attribute__((pure))`, `__attribute__((const))` | Non-`const` method, pointer-to-non-const params, `volatile` |
+| **.NET** | `[Pure]` attribute, readonly struct methods, get-only properties, `IReadOnly*` / `IImmutable*` types, `System.String` (entire type is immutable) | `void` return + instance method (likely mutator), set-only or get/set properties, known mutator patterns (`.Add()`, `.Remove()`, `.Sort()`, `.Clear()`) |
+| **JS/TS** | `readonly` properties, `ReadonlyArray<T>`, `Readonly<T>` mapped types, methods returning new values without `void` return | Setter properties, known DOM mutation APIs, `void`-returning methods on mutable types |
+
+**Heuristic priority** (when metadata is ambiguous):
+
+1. Explicit annotations (user overrides) take highest priority
+2. Type-level immutability (entire type is immutable → all methods pure)
+3. Method-level metadata (`const`, `[Pure]`, `readonly`)
+4. Pattern matching (return type, parameter types, naming conventions)
+5. **Default: impure** (conservative — safe by default)
+
+### 9.3 Purity Classification Storage
+
+The metadata resolver (InteropDesign §2.4) stores purity flags in the extern environment:
+
+```haskell
+data ExternMethod = ExternMethod
+  { emName :: Name
+  , emParams :: [(Name, Ty)]
+  , emReturnType :: Ty
+  , emPurity :: MethodPurity    -- NEW
+  , emIsStatic :: Bool
+  }
+
+data MethodPurity
+  = Pure            -- safe for use in algebra instances
+  | Impure          -- requires effect context (action block or handler)
+  | PureOverride    -- user explicitly marked as pure (overriding compiler inference)
+  | ContainedMutate -- locally mutates but result is pure (see §9.5)
+  deriving (Show, Eq)
+```
+
+### 9.4 Enforcement Rules
+
+**Rule 1: Algebra instances may only call `Pure` or `PureOverride` extern methods.**
+
+```tulam
+target dotnet {
+    // OK: String.Length is a get-only property → inferred Pure
+    instance Eq(System.String) = {
+        function (==)(x, y) = x.Equals(y);    // Equals is Pure (returns Bool, no mutation)
+    };
+
+    // OK: IReadOnlyList<T> is entirely immutable
+    instance Foldable(System.Collections.Generic.IReadOnlyList) = {
+        function foldl(f, init, xs) = xs.Aggregate(init, f);  // Pure
+        function length(xs) = xs.Count;                         // Pure
+    };
+
+    // COMPILE ERROR: List<T>.Add() is Impure
+    instance Buildable(System.Collections.Generic.List(a)) = {
+        function append(xs, x) = xs.Add(x);  // ERROR: Add is Impure, cannot use in algebra
+    };
+};
+```
+
+**Rule 2: Effect handlers and action blocks may call any methods.**
+
+```tulam
+target dotnet {
+    handler StdConsole : Console = {
+        function putStrLn(s) = System.Console.WriteLine(s);  // Impure, fine in handler
+        function readLine()  = System.Console.ReadLine();     // Impure, fine in handler
+    };
+};
+```
+
+**Rule 3: `repr` declarations may only bridge pure-to-pure.**
+
+```tulam
+// OK: both sides are immutable value types
+repr Nat as Int;
+repr String as const_char_ptr target native;
+
+// COMPILE ERROR: .NET List<T> is mutable — cannot be a pure repr target
+repr List(a) as System.Collections.Generic.List(a) target dotnet;  // ERROR
+
+// OK: IReadOnlyList<T> is immutable
+repr List(a) as System.Collections.Generic.IReadOnlyList(a) target dotnet;  // OK
+```
+
+### 9.5 The "Contained Mutation" Pattern
+
+Sometimes an algorithm needs local mutation but produces a pure result — like sorting a copy. The `@contained` annotation marks a method body as locally impure but externally pure:
+
+```tulam
+target dotnet {
+    instance Sortable(List(a)) = {
+        @contained  // "I promise: mutation does not escape"
+        function sort(xs:List(a)) : List(a) requires Ord(a) =
+            let tmp = System.Collections.Generic.List.new(toDotNetList(xs)) in
+            let _ = tmp.Sort() in      // Impure call, but locally contained
+            fromDotNetList(tmp);        // Result is a fresh pure List
+    };
+};
+```
+
+**Enforcement levels** (configurable, progressive):
+
+| Level | Name | Behavior |
+|-------|------|----------|
+| 1 | Honor system | `@contained` suppresses the error. Compiler trusts programmer. (Default for Phase A.1) |
+| 2 | Warnings | Compiler warns on Impure calls in algebra instances without `@contained`. With `@contained`, trusts but verifies simple cases (result doesn't alias mutated refs). |
+| 3 | Full verification | Like Haskell's `runST` — compiler verifies mutable references don't escape the local scope. Requires uniqueness/linearity analysis. (Future) |
+
+### 9.6 User Overrides for Purity
+
+When the compiler's heuristic is wrong, the user can override per-method:
+
+```tulam
+// Override: compiler thinks Snapshot() is impure (non-const), but it's actually pure
+extern class MyLib.Cache(K,V) target native {
+    override pure method Snapshot() : Map(K,V);
+};
+```
+
+This is the **only** case where the programmer annotates purity on extern methods. Everything else is inferred from metadata.
+
+### 9.7 The `maps` Declaration and Purity
+
+The `maps` mechanism (§7.3) only allows mapping between algebras/interfaces whose methods are all pure:
+
+```tulam
+// OK: IComparable<T>.CompareTo is a pure observation
+algebra Ord(a) maps IComparable(a) target dotnet;
+
+// OK: IEquatable<T>.Equals is pure
+algebra Eq(a) maps IEquatable(a) target dotnet;
+
+// OK: IEnumerable<T> is read-only iteration
+algebra Foldable(c) maps IEnumerable(c) target dotnet;
+
+// ERROR: ICollection<T> has impure methods (Add, Remove, Clear)
+// Cannot map wholesale to a pure algebra
+algebra Collection(c) maps ICollection(c) target dotnet;  // COMPILE ERROR
+```
+
+For interfaces with mixed pure/impure methods, the programmer maps selectively or splits into algebra + effect:
+
+```tulam
+// Pure observation part → algebra
+algebra Foldable(c) maps IEnumerable(c) target dotnet;
+
+// Mutation part → effect (not algebra)
+effect MutableCollection(c:Type, a:Type) = {
+    function add(coll:c, item:a) : Unit;
+    function remove(coll:c, item:a) : Bool;
+    function clear(coll:c) : Unit
+};
+```
+
+---
+
+## 10. Generics Mapping
 
 ### 9.1 Per-Target Generic Strategy
 
@@ -568,7 +734,7 @@ tulam supports HKT (`Functor(f:Type1)`). Target platforms generally do not. The 
 
 ---
 
-## 10. Target-Specific Code
+## 11. Target-Specific Code
 
 ### 10.1 Target Blocks
 
@@ -619,7 +785,7 @@ The build system selects the appropriate platform modules based on the compilati
 
 ---
 
-## 11. Compilation Strategy per Target
+## 12. Compilation Strategy per Target
 
 ### 11.1 .NET (CLR)
 
@@ -703,7 +869,7 @@ typedef struct {
 
 ---
 
-## 12. Worked Example: Full .NET Interop
+## 13. Worked Example: Full .NET Interop
 
 A complete example showing how a tulam program uses .NET's Windows Forms:
 
@@ -753,7 +919,7 @@ action main() = {
 
 ---
 
-## 13. Worked Example: Full JS Interop
+## 14. Worked Example: Full JS Interop
 
 ```
 // app.tl — a simple web app
@@ -781,7 +947,7 @@ action main() = {
 
 ---
 
-## 14. Worked Example: Full C Interop
+## 15. Worked Example: Full C Interop
 
 ```
 // math_native.tl — SIMD vector math
@@ -814,7 +980,7 @@ action main() = {
 
 ---
 
-## 15. Implementation Phases
+## 16. Implementation Phases
 
 ### Phase 1: Foundation
 - New AST nodes: `Import`, `Extern`, `MethodCall`, `PropertyAccess`, `StaticAccess`
@@ -858,7 +1024,7 @@ action main() = {
 
 ---
 
-## 16. Open Questions
+## 17. Open Questions
 
 1. **Memory management for native target**: Reference counting (Swift/Rust-like), tracing GC (like Go/OCaml), or region-based (like Cyclone)? This significantly affects the native interop story.
 
@@ -876,7 +1042,7 @@ action main() = {
 
 ---
 
-## 17. Algebra-Based Interop Pattern
+## 18. Algebra-Based Interop Pattern
 
 The general interop mechanism is formalized as a three-part pattern: **algebra** (contract) + **repr** (data bridge) + **target-qualified extern instances** (native method binding). This pattern applies to strings, collections, IO, date/time, concurrency, and any domain where native platforms have optimized implementations.
 
@@ -888,12 +1054,13 @@ The string library (`lib/String/`) serves as the first complete worked example:
 
 See [doc/InteropPattern.md](InteropPattern.md) for the full design document describing this pattern in detail.
 
-## 18. Relation to Existing Design Documents
+## 19. Relation to Existing Design Documents
 
 | Document | Relationship |
 |----------|-------------|
 | `CategoricalDesign.md` | Algebras/morphisms become the bridge between tulam and target platform interfaces (Section 7) |
 | `PrimitiveDesign.md` | `primitive` is the predecessor of `extern`. Intrinsics extend to extern method dispatch. SIMD/GPU plans feed into native target (Section 14) |
 | `RecordDesign.md` | Records with row polymorphism enable structural subtyping for JS interop (Section 4.2) |
+| `EffectDesign.md` | Section 14: Target-specific effect handler compilation — handlers use actual platform calls. Section 9 here (purity classification) determines which extern methods can appear in algebra instances vs effect handlers. |
 | `ImplementationPlan.md` | Interop phases should be integrated after the current Phase 8 (type checker completion) |
 | `LanguageReference.md` | New keywords (`import`, `extern`, `target`) and syntax to be documented |

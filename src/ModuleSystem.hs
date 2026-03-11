@@ -262,13 +262,23 @@ runModulePasses = do
     positivityCheckPass
     coverageCheckPass
     clearAllLogs
+    -- Reset TC error count before type checking this module
+    modify (\s -> s { tcErrorCount = 0 })
     timedPass "Pass 3 (typecheck)" typeCheckPass
     terminationCheckPass
     clearAllLogs
-    timedPass "Pass 4 (CLM)" lamToCLMPass
-    clearAllLogs
-    timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
-    clearAllLogs
+    -- In strict mode, halt pipeline if type errors were found in this module
+    st <- get
+    let moduleErrors = tcErrorCount st
+    let shouldHalt = strictTypes (currentFlags st) && moduleErrors > 0
+    if shouldHalt
+      then liftIO $ putStrLn $ "[TC] " ++ show moduleErrors
+             ++ " type error(s) found. Halting compilation (strict mode)."
+      else do
+        timedPass "Pass 4 (CLM)" lamToCLMPass
+        clearAllLogs
+        timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
+        clearAllLogs
 
 -- | Finalize a compiled module: compute public/private names, build ModuleEnv,
 -- enforce visibility, and write cache if applicable.

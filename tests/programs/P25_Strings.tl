@@ -24,16 +24,16 @@ function extractMaybeChar(r:Maybe(Char)) : Int = match
 // === UTF-8 Codec Tests ===
 
 // T1: Encode ASCII code point (1 byte)
-function t1() : Int = length(encodeCodePoint(65));
+function t1() : Int = size(encodeCodePoint(65));
 
 // T2: Encode 2-byte code point (e.g., U+00E9 = e-acute)
-function t2() : Int = length(encodeCodePoint(0xE9));
+function t2() : Int = size(encodeCodePoint(0xE9));
 
 // T3: Encode 3-byte code point (e.g., U+4E16 = CJK char)
-function t3() : Int = length(encodeCodePoint(0x4E16));
+function t3() : Int = size(encodeCodePoint(0x4E16));
 
 // T4: Encode 4-byte code point (e.g., U+1F600 = grinning face emoji)
-function t4() : Int = length(encodeCodePoint(0x1F600));
+function t4() : Int = size(encodeCodePoint(0x1F600));
 
 // T5: Decode ASCII byte — should return 65
 function t5() : Int = extractCp(decodeAt([intToByte(0x41)], 0));

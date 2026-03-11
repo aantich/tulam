@@ -16,7 +16,7 @@ function testRefWrite() : Int =
 // modifyRef applies function
 function testRefModify() : Int =
     let r = newRef(5) in
-    let u = modifyRef(r, \x -> x + 10) in
+    let u = modifyRef(r, fn(x) = x + 10) in
     readRef(r);
 
 // two refs are independent
@@ -65,7 +65,7 @@ function testMutPush() : Int =
 // ref in closure
 function testRefClosure() : Int =
     let r = newRef(0) in
-    let inc = \x -> modifyRef(r, \v -> v + x) in
+    let inc = fn(x) = modifyRef(r, fn(v) = v + x) in
     let u1 = inc(3) in
     let u2 = inc(7) in
     readRef(r);

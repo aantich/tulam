@@ -391,13 +391,13 @@ stringEntries =
 
 arrayEntries :: [(IntrinsicKey, IntrinsicFn)]
 arrayEntries =
-    [ (mkKey "length" "Array",      arrayLength)
+    [ (mkKey "size" "Array",         arrayLength)
     , (mkKey "index" "Array",       arrayIndex)
     , (mkKey "slice" "Array",       arraySlice)
     , (mkKey "generate" "Array",    arrayGenerate)
-    , (mkKey "set" "Array",         arraySet)
-    , (mkKey "push" "Array",        arrayPush)
-    , (mkKey "arrayConcat" "Array", arrayConcat')
+    , (mkKey "update" "Array",      arraySet)
+    , (mkKey "snoc" "Array",        arraySnoc)
+    , (mkKey "combine" "Array",      arrayConcat')
     , (mkKey "reverse" "Array",     arrayReverse)
     , (mkKey "range" "Array",       arrayRange)
     ]
@@ -417,8 +417,8 @@ arrayEntries =
         | i >= 0 && i < length xs = Just $ CLMARRAY (take i xs ++ [val] ++ drop (i + 1) xs)
         | otherwise = Just $ CLMERR ("Array set: index " ++ show i ++ " out of bounds") SourceInteractive
     arraySet _ = Nothing
-    arrayPush [CLMARRAY xs, val] = Just $ CLMARRAY (xs ++ [val])
-    arrayPush _ = Nothing
+    arraySnoc [CLMARRAY xs, val] = Just $ CLMARRAY (xs ++ [val])
+    arraySnoc _ = Nothing
     arrayConcat' [CLMARRAY xs, CLMARRAY ys] = Just $ CLMARRAY (xs ++ ys)
     arrayConcat' _ = Nothing
     arrayReverse [CLMARRAY xs] = Just $ CLMARRAY (reverse xs)
@@ -569,6 +569,10 @@ stringExtEntries =
     , (mkKey "replace" "String",   strReplace)
     , (mkKey "parseInt" "String",  strParseInt)
     , (mkKey "parseFloat" "String", strParseFloat)
+    , (mkKey "split" "String",     strSplit)
+    , (mkKey "join" "String",      strJoin)
+    , (mkKey "fromChar" "String",  strFromChar')
+    , (mkKey "fromChar" "Char",    strFromChar')
     ]
   where
     strCharAt [CLMLIT (LString s), CLMLIT (LInt i)]
@@ -611,6 +615,42 @@ stringExtEntries =
         Just f  -> Just $ CLMCON (ConsTag "Just" 1) [CLMLIT (LFloat f)]
         Nothing -> Just $ CLMCON (ConsTag "Nothing" 0) []
     strParseFloat _ = Nothing
+    strSplit [CLMLIT (LString s), CLMLIT (LString delim)]
+        | Prelude.null delim = Just $ stringListToCLM [s]
+        | otherwise = Just $ stringListToCLM (splitOn delim s)
+    strSplit _ = Nothing
+    strJoin [clmList, CLMLIT (LString sep)] =
+        case clmListToStrings clmList of
+            Just parts -> Just $ CLMLIT (LString (intercalate' sep parts))
+            Nothing    -> Nothing
+    strJoin _ = Nothing
+    strFromChar' [CLMLIT (LChar c)] = Just $ CLMLIT (LString [c])
+    strFromChar' _ = Nothing
+    -- Helper: split string on delimiter
+    splitOn :: String -> String -> [String]
+    splitOn _ [] = [""]
+    splitOn delim s
+        | delim `isPrefixOf` s = "" : splitOn delim (drop (length delim) s)
+        | otherwise = case splitOn delim (Prelude.tail s) of
+            (first:rest) -> (Prelude.head s : first) : rest
+            []           -> [[Prelude.head s]]
+    -- Helper: intercalate (join with separator)
+    intercalate' :: String -> [String] -> String
+    intercalate' _ []     = ""
+    intercalate' _ [x]    = x
+    intercalate' sep (x:xs) = x ++ sep ++ intercalate' sep xs
+    -- Helper: convert Haskell string list to CLM List
+    stringListToCLM :: [String] -> CLMExpr
+    stringListToCLM [] = CLMCON (ConsTag "Nil" 0) []
+    stringListToCLM (x:xs) = CLMCON (ConsTag "Cons" 1) [CLMLIT (LString x), stringListToCLM xs]
+    -- Helper: extract strings from CLM List
+    clmListToStrings :: CLMExpr -> Maybe [String]
+    clmListToStrings (CLMCON (ConsTag "Nil" _) []) = Just []
+    clmListToStrings (CLMCON (ConsTag "Cons" _) [CLMLIT (LString s), rest]) =
+        case clmListToStrings rest of
+            Just ss -> Just (s : ss)
+            Nothing -> Nothing
+    clmListToStrings _ = Nothing
 
 -- ============================================================================
 -- SIMD stubs

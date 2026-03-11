@@ -21,12 +21,12 @@ function treeDepth(t:Tree(a)) : Nat = match
     | Branch(l, r) -> Succ(natMax(treeDepth(l), treeDepth(r)));
 
 /// Applies a function to every leaf value, preserving structure.
-function treeMap(f:a, t:Tree(a)) : Tree(b) = match
+function treeMap(f:(a -> b), t:Tree(a)) : Tree(b) = match
     | f, Leaf(x) -> Leaf(f(x))
     | f, Branch(l, r) -> Branch(treeMap(f, l), treeMap(f, r));
 
 /// Catamorphism — fold a tree by replacing Leaf and Branch with functions.
-function treeFold(f:a, g:b, t:Tree(a)) : b = match
+function treeFold(f:(a -> b), g:(b -> b -> b), t:Tree(a)) : b = match
     | f, g, Leaf(x) -> f(x)
     | f, g, Branch(l, r) -> g(treeFold(f, g, l), treeFold(f, g, r));
 

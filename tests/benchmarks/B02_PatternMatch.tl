@@ -39,6 +39,6 @@ function mkList(n:Int) : List(Int) =
 
 function benchListOps() : Int =
     let xs = mkList(200) in
-    let doubled = listMap(\x -> x * 2, xs) in
-    let filtered = listFilter(\x -> x > 100, doubled) in
+    let doubled = listMap(fn(x) = x * 2, xs) in
+    let filtered = listFilter(fn(x) = x > 100, doubled) in
     listLength(filtered);

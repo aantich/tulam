@@ -261,7 +261,7 @@ processBinding (Action lam, si) env = pure $ addLambda (lamName lam) lam env
 
 -- now extracting constructors from SumTypes, body is guaranteed to be
 -- a list of Lambdas under Constructors constructor
-processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _)), si) env = do
+processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _ _)), si) env = do
     -- resolve any spread fields (..Name) in constructor params
     let cons' = Prelude.map (resolveSpreadFields env) cons
     -- For constructors with no args that match existing record types, inherit their fields.
@@ -278,17 +278,17 @@ processBinding ( tp@(SumType lam@(Lambda typName typArgs (Constructors cons) typ
             then Nothing  -- no params → no function to register (it's just a Type)
             else
                 let retBody = App (Id typName) (Prelude.map (\v -> Id (name v)) typArgs)
-                in Just $ (mkLambda typName typArgs retBody (U 0)) { lamSrcInfo = lamSrcInfo lam }
+                in Just $ (mkLambda typName typArgs retBody (U (LConst 0))) { lamSrcInfo = lamSrcInfo lam }
     let env1 = addManyNamedConstructors 0 newCons (addNamedSumType newTp env)
     pure $ case typeLevelLam of
         Just tll -> addLambda typName tll env1
         Nothing  -> env1
-    where fixCons i lam@(Lambda nm args ex typ _) = if (ex /= UNDEFINED)
+    where fixCons i lam@(Lambda nm args ex typ _ _) = if (ex /= UNDEFINED)
             then lam
             else lam { body = ConTuple (ConsTag nm i) $ Prelude.map (\v -> Id $ name v) args}
           -- If a constructor has no args and its name matches an existing record constructor,
           -- inherit that record's fields so the sum type variant carries the same data.
-          inheritRecordFields e cl@(Lambda nm args _ _ _)
+          inheritRecordFields e cl@(Lambda nm args _ _ _ _)
             | Prelude.null args, body cl == UNDEFINED
             , Just (recLam, _tag) <- lookupConstructor nm e
             , not (Prelude.null (params recLam))
@@ -606,7 +606,8 @@ processBinding (OpaqueTy lam reprTy, si) env = do
     -- Opaque type: register as a primitive type (opaque to outside, transparent inside)
     let typeName = lamName lam
     pure $ env { types = Map.insert typeName (Primitive lam) (types env) }
-processBinding (TargetBlock _ _, _) env = pure env  -- target blocks: resolved during codegen
+-- Target block: parse inner declarations and store target-qualified instances/handlers
+processBinding (TargetBlock targetName decls, si) env = foldM (processTargetDecl targetName si) env decls
 processBinding (TargetSwitch _, _) env = pure env   -- target switches: resolved during codegen
 -- Fixity declarations: register in fixity table (already done at parse time, but needed for cache restore)
 processBinding (FixityDecl assoc prec ops, _) env =
@@ -655,6 +656,44 @@ processBinding (ex, si) env = do
                     ++ "\nThe expression is parsed and stored in LTProgram, but is not in the Environment.")
     logWarning lpl
     return env
+
+-- | Process a declaration inside a target block.
+-- Instances and handlers are stored in target-qualified maps (not in the main env).
+-- Other declarations inside target blocks are silently ignored.
+processTargetDecl :: Name -> SourceInfo -> Environment -> Expr -> IntState Environment
+processTargetDecl targetName si env (Instance structName typeArgs impls _reqs) = do
+    let extractTypeName (Id nm) = Just nm
+        extractTypeName (App (Id nm) _) = Just nm
+        extractTypeName _ = Nothing
+    let typeNames = [nm | Just nm <- Prelude.map extractTypeName typeArgs]
+    if Prelude.null typeNames
+    then do
+        logWarning (mkLogPayload si
+            ("Target " ++ targetName ++ ": instance has no valid type argument: " ++ structName ++ "\n"))
+        pure env
+    else do
+        -- Store each function/value in the target-qualified instance map
+        foldM (addTargetInstanceFunc targetName structName typeNames si) env impls
+processTargetDecl targetName _si env (HandlerDecl handlerName effectName hParams impls) = do
+    pure $ addTargetHandler targetName handlerName (effectName, hParams, impls) env
+processTargetDecl targetName _si env (ExternFunc funcName funcParams retType spec) = do
+    pure $ addTargetExtern targetName funcName (funcParams, retType, spec) env
+processTargetDecl targetName si env expr = do
+    logWarning (mkLogPayload si
+        ("Target " ++ targetName ++ ": unsupported declaration inside target block: " ++ ppr expr ++ "\n"))
+    pure env
+
+-- | Add a function/value from a target block instance to target-qualified storage.
+addTargetInstanceFunc :: Name -> Name -> [Name] -> SourceInfo -> Environment -> Expr -> IntState Environment
+addTargetInstanceFunc targetName _structName typeNames _si env (Function lam) =
+    pure $ addTargetInstance targetName (lamName lam) typeNames lam env
+addTargetInstanceFunc targetName _structName typeNames _si env (Value v ex) =
+    let lam = mkLambda (name v) [] ex (typ v)
+    in pure $ addTargetInstance targetName (name v) typeNames lam env
+addTargetInstanceFunc targetName _structName _typeNames si env expr = do
+    logWarning (mkLogPayload si
+        ("Target " ++ targetName ++ ": invalid expression inside instance, expected function: " ++ ppr expr ++ "\n"))
+    pure env
 
 -- Generate algebra instance from class methods for the implements clause
 generateClassAlgebraInstance :: Name -> [(Name, Lambda)] -> SourceInfo -> Environment -> Name -> IntState Environment
@@ -1041,7 +1080,7 @@ validateRequiresForInstance env reqs typeNames structName si = do
     resolveArg nm = nm
     -- Check if name starts with uppercase
     headIsUpper' nm = not (Prelude.null nm) && Prelude.head nm >= 'A' && Prelude.head nm <= 'Z'
-    headIsUpper _ _ = True  -- placeholder
+    headIsUpper nm _ = headIsUpper' nm
 
 -- Extract type arguments from a structure reference expression
 extractStructRefArgs :: Expr -> [Expr]
@@ -1297,7 +1336,7 @@ exprToCLM env e@(App (Id nm) exs) =
 exprToCLM env (App ex exs) = CLMAPP (exprToCLM env ex) (Prelude.map (exprToCLM env) exs)
 exprToCLM env (Function lam) = CLMLAM $ lambdaToCLMLambda env lam
 exprToCLM env (Lit l) = CLMLIT l
-exprToCLM _ (U n) = CLMU (LConst n)
+exprToCLM _ (U l) = CLMU l
 -- ReprCast: resolve direction based on repr map
 -- If targetType is a user type (key in reprMap) → use fromRepr
 -- If targetType is a repr type (value in reprMap) → use toRepr
@@ -1425,13 +1464,13 @@ inferClassFromExpr env (App (Id nm) _)
 inferClassFromExpr _ _ = Nothing
 
 lambdaToCLMLambda :: Environment -> Lambda -> CLMLam
-lambdaToCLMLambda env (Lambda nm params Intrinsic tp _) =
+lambdaToCLMLambda env (Lambda nm params Intrinsic tp _ _) =
     CLMLam [] CLMPRIMCALL
-lambdaToCLMLambda env (Lambda nm params Derive tp _) =
+lambdaToCLMLambda env (Lambda nm params Derive tp _ _) =
     CLMLam [] CLMPRIMCALL
-lambdaToCLMLambda env (Lambda nm params (PatternMatches exs) tp _) =
+lambdaToCLMLambda env (Lambda nm params (PatternMatches exs) tp _ _) =
     CLMLamCases (varsToCLMVars env params) (Prelude.map (exprToCLM env) exs)
-lambdaToCLMLambda env (Lambda nm params body tp _) =
+lambdaToCLMLambda env (Lambda nm params body tp _ _) =
     CLMLam (varsToCLMVars env params) (exprToCLM env body)
 
 --------------------------------------------------------------------------------
@@ -1458,7 +1497,7 @@ compileExprToJS' :: Expr -> String
 compileExprToJS' e = intercalate ("\n" :: String) (compileExprToJS e) 
 
 compileExprToJS :: Expr -> [String]
-compileExprToJS (SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _)) =
+compileExprToJS (SumType lam@(Lambda typName typArgs (Constructors cons) typTyp _ _)) =
     imap (compileConstructorToJS ("cons_" ++ typName ++ "_") ) cons
 compileExprToJS (Function lam) = [compileFunctionToJS "" lam]
 compileExprToJS e = ["/* NOT SUPPORTED:\n" ++ ppr e ++ "\n*/"]
@@ -1473,13 +1512,13 @@ argsToTupleFields args = showListPlainSep f ", " args
 
 -- taking out prefix in names for now
 compileConstructorToJS :: String -> Int -> Lambda -> String
-compileConstructorToJS pref i (Lambda nm args ex tp _) = "function " ++nm ++
+compileConstructorToJS pref i (Lambda nm args ex tp _ _) = "function " ++nm ++
                          argsToString args 
                          ++ " { return { __consTag: " ++ (show i) ++ ", "
                          ++ argsToTupleFields args ++ " } } "                         
     
 compileFunctionToJS :: String -> Lambda -> String
-compileFunctionToJS pref lam@(Lambda nm args ex tp _) =
+compileFunctionToJS pref lam@(Lambda nm args ex tp _ _) =
     if (isLambdaConstructor lam) then ""
     else "function " ++ pref++nm ++ argsToString args ++ funBodyToString ex
 

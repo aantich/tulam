@@ -154,18 +154,142 @@ When the compiler encounters `function foo(x:Int) : Int = intrinsic`:
 2. It looks up `foo` in a built-in table of known intrinsic functions
 3. If not found, it's a compile error (typo protection)
 
-### 2.4 Intrinsic Registry
+### 2.4 Intrinsic Registry (Interpreter)
 
-The compiler maintains a registry mapping `(function_name, type)` pairs to target-specific code generation. This registry is populated at compiler initialization, not at parse time. Adding a new intrinsic requires modifying the compiler, not the standard library.
+For the **interpreter**, the compiler maintains a Haskell-side registry mapping `(function_name, type)` pairs to Haskell evaluation functions. This powers interactive development and testing.
 
-Example entries:
+Example entries (interpreter only):
 
 ```
-("(+)",  "Int")     → x86: ADD, JS: +, .NET: op_Addition
-("(+)",  "Float64") → x86: ADDSD, JS: +, .NET: op_Addition
-("sqrt", "Float64") → x86: SQRTSD, JS: Math.sqrt, .NET: System.Math.Sqrt
-("(==)", "Int")     → x86: CMP+SETE, JS: ===, .NET: op_Equality
+("(+)",  "Int")     → Haskell: (+) on Int64
+("(+)",  "Float64") → Haskell: (+) on Double
+("sqrt", "Float64") → Haskell: sqrt on Double
+("(==)", "Int")     → Haskell: (==) on Int64
 ```
+
+### 2.5 Target-Declarative Intrinsics (Compilation Backends)
+
+For **compilation backends** (.NET, JS, native/LLVM), the `intrinsic` keyword is resolved through **target-qualified algebra instances** — declarative tulam files that map algebra operations to backend-specific primitive operations. The programmer never writes these files; they ship with the compiler as part of the standard library.
+
+#### Architecture
+
+Three layers, all declarative:
+
+```
+Layer 3 (user code):       function main() = putStrLn(show(1 + 2));
+                           ↓ algebra dispatch
+Layer 2 (target stdlib):   target native { instance Additive(Int) = { (+)(x,y) = __add_i64(x,y) } }
+                           ↓ primitive op lookup
+Layer 1 (compiler):        __add_i64 → LIR instruction LAdd
+```
+
+**Layer 1 — Primitive Operations (compiler-internal):** A minimal set of named operations per backend, each mapping to exactly one backend instruction. These are the *only* things hardcoded in the compiler's Haskell code. ~30-40 per backend.
+
+```
+-- Native/LLVM primitives (compiler-internal, never visible to users)
+__add_i64, __sub_i64, __mul_i64, __sdiv_i64, __srem_i64    -- Int arithmetic
+__add_f64, __sub_f64, __mul_f64, __fdiv_f64                 -- Float64 arithmetic
+__icmp_eq_i64, __icmp_lt_i64, __icmp_le_i64, ...            -- Int comparison
+__fcmp_eq_f64, __fcmp_lt_f64, ...                            -- Float comparison
+__and_i64, __or_i64, __xor_i64, __shl_i64, __shr_i64       -- Bitwise
+__sext_i32_i64, __trunc_i64_i32, __sitofp_i64_f64, ...     -- Conversions
+__print_string, __print_int, __print_newline, __error       -- IO (extern C calls)
+```
+
+**Layer 2 — Target Standard Library (shipped with compiler, auto-generated or hand-written):** Declarative tulam files that compose Layer 1 primitives into algebra instances and effect handlers. Located in `lib/Backend/LLVM/Native.tl`, `lib/Backend/DotNet/Native.tl`, `lib/Backend/JS/Native.tl`.
+
+```tulam
+// lib/Backend/LLVM/Native.tl (shipped with compiler, programmer never touches this)
+target native {
+    instance Additive(Int) = {
+        function (+)(x:Int, y:Int) : Int = __add_i64(x, y);
+        function (-)(x:Int, y:Int) : Int = __sub_i64(x, y);
+        function negate(x:Int) : Int     = __sub_i64(0, x);
+    };
+
+    instance Multiplicative(Int) = {
+        function (*)(x:Int, y:Int) : Int = __mul_i64(x, y);
+        function (/)(x:Int, y:Int) : Int = __sdiv_i64(x, y);
+        function (%)(x:Int, y:Int) : Int = __srem_i64(x, y);
+    };
+
+    instance Eq(Int) = {
+        function (==)(x:Int, y:Int) : Bool = __icmp_eq_i64(x, y);
+        function (!=)(x:Int, y:Int) : Bool = __icmp_ne_i64(x, y);
+    };
+
+    instance Ord(Int) = {
+        function (<)(x:Int, y:Int)  : Bool = __icmp_lt_i64(x, y);
+        function (<=)(x:Int, y:Int) : Bool = __icmp_le_i64(x, y);
+        function (>)(x:Int, y:Int)  : Bool = __icmp_gt_i64(x, y);
+        function (>=)(x:Int, y:Int) : Bool = __icmp_ge_i64(x, y);
+    };
+
+    instance Additive(Float64) = {
+        function (+)(x:Float64, y:Float64) : Float64 = __add_f64(x, y);
+        function (-)(x:Float64, y:Float64) : Float64 = __sub_f64(x, y);
+        function negate(x:Float64) : Float64          = __sub_f64(0.0, x);
+    };
+
+    handler StdConsole : Console = {
+        function putStrLn(s) = action { __print_string(s); __print_newline() };
+        function putStr(s)   = __print_string(s);
+        function readLine()  = __read_line()
+    };
+};
+```
+
+```tulam
+// lib/Backend/DotNet/Native.tl (same pattern, .NET primitives)
+target dotnet {
+    instance Additive(Int) = {
+        function (+)(x:Int, y:Int) : Int = System.Int64.op_Addition(x, y);
+        function (-)(x:Int, y:Int) : Int = System.Int64.op_Subtraction(x, y);
+    };
+    handler StdConsole : Console = {
+        function putStrLn(s) = System.Console.WriteLine(s);
+        function readLine()  = System.Console.ReadLine();
+    };
+};
+```
+
+```tulam
+// lib/Backend/JS/Native.tl (same pattern, JS primitives)
+target js {
+    // JS arithmetic uses native operators, resolved from JS runtime metadata
+    instance Additive(Int) = intrinsic;  // compiler maps to JS + operator
+    handler StdConsole : Console = {
+        function putStrLn(s) = console.log(s);
+        function readLine()  = prompt("");
+    };
+};
+```
+
+**Layer 3 — User Code (completely platform-agnostic):** The programmer writes pure tulam. The compiler selects the appropriate target instance at compilation time.
+
+#### Key Properties
+
+1. **The compiler's hardcoded knowledge is minimal** — just the mapping from ~30-40 primitive op names to backend instructions per target. Everything else is declarative tulam.
+2. **Adding a new backend** means writing a new `lib/Target/<Backend>.tl` file that maps algebra operations to that backend's primitives. No Haskell compiler changes needed (beyond the primitive op table).
+3. **The programmer never sees any of this** — they write `x + y` and it works on all backends.
+4. **Inline expansion** — target-qualified instance bodies are inlined at call sites, not compiled as wrapper functions. The result is identical to hand-written backend code (e.g., `add i64 %x, %y` on LLVM).
+5. **`instance X(T) = intrinsic;`** remains valid as a shorthand meaning "the compiler knows the primitive ops for this algebra on this type." The target stdlib files are the expanded form of what `intrinsic` means.
+
+#### Relationship to `intrinsic`
+
+`intrinsic` is now understood as a **shorthand** for the target-declarative pattern:
+
+```tulam
+// Shorthand (what the programmer writes in lib/Algebra.tl):
+instance Additive(Int) = intrinsic;
+
+// Expanded (what the compiler resolves from lib/Backend/LLVM/Native.tl):
+target native { instance Additive(Int) = { (+)(x,y) = __add_i64(x,y); ... } };
+target dotnet { instance Additive(Int) = { (+)(x,y) = System.Int64.op_Addition(x,y); ... } };
+target js     { instance Additive(Int) = intrinsic; };  // JS: compiler handles natively
+```
+
+The interpreter uses the Haskell-side registry (§2.4). Each compilation backend uses its target-qualified instance. The user code is identical in all cases.
 
 ---
 

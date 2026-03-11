@@ -858,7 +858,142 @@ action readAndParse(path:String) : Eff { fileio: FileIO } List(Int) = {
 
 ---
 
-## 14. Open Questions and Future Directions
+## 14. Target-Specific Effect Handler Compilation
+
+Effect handlers compile differently per backend target. The key principle: **effect declarations are pure contracts** (platform-agnostic), while **handler implementations are target-qualified** with actual platform calls in the method bodies. The compiler selects the appropriate handler for the compilation target.
+
+### 14.1 The Pattern
+
+Each effect has:
+1. A **pure contract** (the `effect` declaration) — never inside a `target` block
+2. A **pure tulam handler** (intrinsic-backed) — works in interpreter and as fallback on all targets
+3. **Target-qualified handlers** — one per backend, calling that platform's actual API
+
+```tulam
+// 1. Pure contract (lib/Effect.tl)
+effect Console = {
+    function readLine() : String;
+    function putStrLn(s:String) : Unit;
+    function putStr(s:String) : Unit
+};
+
+// 2. Pure tulam handler (interpreter fallback)
+handler StdConsole : Console = {
+    function readLine() = intrinsic;
+    function putStrLn(s) = intrinsic;
+    function putStr(s) = intrinsic
+};
+
+// 3. Target-qualified handlers
+target dotnet {
+    import System target dotnet;
+    handler StdConsole : Console = {
+        function putStrLn(s) = System.Console.WriteLine(s);
+        function putStr(s)   = System.Console.Write(s);
+        function readLine()  = System.Console.ReadLine()
+    };
+};
+
+target js {
+    import { console, prompt } from globals target js;
+    handler StdConsole : Console = {
+        function putStrLn(s) = console.log(s);
+        function putStr(s)   = process.stdout.write(s);
+        function readLine()  = prompt("")
+    };
+};
+
+target native {
+    extern function tlm_print_string(s:String) : Unit target native;
+    extern function tlm_print_newline() : Unit target native;
+    extern function tlm_read_line() : String target native;
+    handler StdConsole : Console = {
+        function putStrLn(s) = action { tlm_print_string(s); tlm_print_newline() };
+        function putStr(s)   = tlm_print_string(s);
+        function readLine()  = tlm_read_line()
+    };
+};
+```
+
+### 14.2 Compilation Strategy
+
+| Aspect | Interpreter | .NET | JS | Native (LLVM) |
+|--------|-------------|------|----|---------------|
+| **IO effects** | Haskell intrinsics (`dispatchIOIntrinsic`) | Direct CLR API calls | Direct JS API calls | Direct C extern function calls |
+| **Custom effects** | Handler stack (`CLMHANDLE`) | Evidence passing (interface params) | Handler dict objects | Vtable struct pointers |
+| **Effect erasure** | Effect rows erased at CLM conversion | Effect rows erased at IL emission | Effect rows erased at JS emission | Effect rows erased at LIR lowering |
+| **Handler selection** | Runtime (handler stack) | Compile-time (target block) | Compile-time (target block) | Compile-time (target block) |
+
+For **IO effects** (Console, FileIO, etc.), the target-qualified handler is resolved at compile time and the handler indirection is eliminated — the compiler **inlines the handler body** at the call site, emitting direct platform calls. No handler dict, no vtable, no wrapper functions, no overhead. This uses the same inline expansion mechanism as algebra intrinsics (see PrimitiveDesign.md §2.5).
+
+For **custom effects** (State, Exception, user-defined), the handler is passed as evidence (dictionary/vtable/interface) and dispatch goes through it at runtime.
+
+### 14.3 Native Backend Effect Compilation
+
+On the native (LLVM) backend, effect handler compilation works as follows:
+
+1. **Extern function declarations** (`extern function ... target native;`) register C-callable functions in the extern environment with their LLVM-level signatures
+2. **Target-qualified handler bodies** are lowered as normal function calls — `tlm_print_string(s)` becomes `CLMAPP "tlm_print_string" [s]` in CLM, then `call void @tlm_print_string(ptr %s)` in LLVM IR
+3. **No special IO dispatch in CLMToLIR** — the lowering module doesn't need to know about IO. It just emits `call` instructions for any function in the extern/function registry
+4. **Runtime library** (`runtime/LLVM/tlm_runtime.cpp`) provides the C implementations linked at compile time
+
+This means **adding a new IO operation** (e.g., `readFile`) requires:
+- Declaring the effect operation in the `effect` declaration
+- Adding a C function to `runtime/LLVM/tlm_runtime.cpp`
+- Adding the handler body in `lib/Backend/LLVM/Native.tl` that calls the primitive op
+- No changes to the compiler's Haskell code
+
+**The same pattern applies to algebras.** Adding `(+)` for a new numeric type requires: declaring the algebra, adding the primitive op to the runtime (if needed), writing the target instance in `lib/Backend/LLVM/Native.tl`. See PrimitiveDesign.md §2.5 for the three-layer architecture (primitive ops → target stdlib → user code) that unifies algebra intrinsics and effect handler compilation.
+
+### 14.4 Repr at Effect Boundaries
+
+When effect handler parameters cross the tulam/platform boundary, `repr` conversions are automatically inserted by the compiler:
+
+```tulam
+target native {
+    // String in tulam → const char* in C
+    // Compiler auto-inserts toRepr(s) at the call boundary
+    handler StdConsole : Console = {
+        function putStrLn(s) = action { tlm_print_string(s); tlm_print_newline() };
+        //                                              ^
+        //                     compiler inserts: toRepr(s) if String repr exists for native
+    };
+};
+```
+
+For primitive types (`Int`, `String`, `Float64`), the repr is typically identity (zero-cost). For user-defined types, the repr's `toRepr`/`fromRepr` functions are called at the boundary. See `InteropDesign.md §9.4` for purity enforcement on repr.
+
+### 14.5 Standard Library Target Files (Future)
+
+The stdlib will include per-backend handler files, mirroring the Haskell source and runtime directory conventions:
+
+```
+src/Backends/
+  LLVM/               -- Haskell compiler modules for LLVM backend
+  DotNet/             -- (future) Haskell compiler modules for .NET backend
+  JS/                 -- (future) Haskell compiler modules for JS backend
+
+runtime/
+  LLVM/               -- C++ runtime for LLVM backend (tlm_object.hpp, tlm_runtime.cpp)
+  DotNet/             -- (future) .NET runtime support
+  JS/                 -- (future) JS runtime support
+
+lib/
+  Effect.tl           -- Pure effect contracts (backend-agnostic)
+  Backend/
+    LLVM/
+      Native.tl       -- target native { handler StdConsole, StdFileIO, ... + algebra instances }
+    DotNet/
+      Native.tl       -- target dotnet { handler StdConsole, ... + algebra instances }
+    JS/
+      Native.tl       -- target js { handler StdConsole, ... + algebra instances }
+```
+
+All three layers (Haskell compiler, C++ runtime, tulam stdlib) use the same `Backend/<Name>/` convention. The build system selects the appropriate backend files based on the compilation target. The interpreter uses the pure tulam handlers (intrinsic-backed) from `Effect.tl`.
+
+---
+
+## 15. Open Questions and Future Directions
 
 ### Effect Polymorphism and Higher-Order Functions
 
@@ -914,13 +1049,14 @@ The exact semantics of `fork`/`await` (green threads? OS threads? event loop?) a
 
 ---
 
-## 15. Relation to Other Design Documents
+## 16. Relation to Other Design Documents
 
 | Document | Relationship |
 |----------|-------------|
 | `CategoricalDesign.md` | Effects are orthogonal to algebras/morphisms. `action` keyword from Section 9 becomes effect-typed do-notation. |
 | `ImplementationPlan.md` | Phase 9 (Do-Notation) becomes Phase B of the effect system. New phases A, C-F extend the plan. |
 | `PrimitiveDesign.md` | Intrinsics provide the built-in implementations for effect operations (Console, FileIO). |
-| `InteropDesign.md` | Extern operations auto-tagged with effect labels from metadata. Sandboxing uses effect row restriction. Section 8.3 action blocks gain effect types. |
+| `InteropDesign.md` | Extern operations auto-tagged with effect labels from metadata. Sandboxing uses effect row restriction. Section 8.3 action blocks gain effect types. **Section 9: Method purity classification** — determines which extern methods can appear in algebra instances vs effect handlers. |
+| `InteropPattern.md` | Purity-aware interop section describes how the three-part pattern (algebra + repr + target instance) respects purity: pure observations → algebras, effectful operations → handlers, repr bridges pure-to-pure only. |
 | `DependencyDesign.md` | Capability-based security maps to effect label denial at import boundaries. |
 | `RecordDesign.md` | Row polymorphism is shared infrastructure — same `Row` type, same unification algorithm. |

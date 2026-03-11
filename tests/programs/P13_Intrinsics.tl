@@ -91,13 +91,13 @@ function testParseIntBad() : Maybe(Int) = parseInt("abc");
 
 // === Array ops ===
 // Test 29: array push
-function testArrayPush() : Int = length(push([1, 2, 3], 4));
+function testArrayPush() : Int = size(snoc([1, 2, 3], 4));
 
-// Test 30: array reverse (check length preserved)
-function testArrayReverse() : Int = length(reverse([1, 2, 3]));
+// Test 30: array reverse (check size preserved)
+function testArrayReverse() : Int = size(reverse([1, 2, 3]));
 
 // Test 31: array range
-function testRange() : Int = length(range(0, 5));
+function testRange() : Int = size(range(0, 5));
 
 // Test 32: error function
 function testError() : Int = error("boom");

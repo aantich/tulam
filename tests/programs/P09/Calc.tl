@@ -20,4 +20,4 @@ function safeCalc(a:Int, op:Token, b:Int) : Maybe(Int) =
     calcToMaybe(evalSimple(a, op, b));
 
 function calcAndDouble(a:Int, op:Token, b:Int) : Maybe(Int) =
-    bind(safeCalc(a, op, b), \r -> Just(r + r));
+    bind(safeCalc(a, op, b), fn(r) = Just(r + r));

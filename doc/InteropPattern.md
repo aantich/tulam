@@ -525,3 +525,78 @@ When this code is compiled for .NET, calls to `trim`, `toUpper`, `join`, and `co
 5. **The compiler decides.** The programmer writes portable code against the algebra. The compiler selects the best available implementation for the compilation target. No `#ifdef`, no conditional compilation in user code.
 
 6. **Laws transfer.** When a target-qualified instance replaces a pure instance, the laws from the algebra still apply. If a native platform method violates a law (e.g., locale-dependent string comparison violating transitivity), the target-qualified instance should use the correct variant (e.g., `ToLowerInvariant` instead of `ToLower`).
+
+7. **Purity is preserved across the bridge.** Algebras are pure — target-qualified algebra instances may only call extern methods that the compiler has classified as pure (see `InteropDesign.md §9`). Repr declarations may only bridge between immutable representations. Effectful platform operations belong in effect handlers, not algebra instances. When locally-contained mutation is needed for performance (e.g., sort-by-copy), the `@contained` annotation explicitly marks the boundary.
+
+8. **Zero boilerplate for purity.** The compiler infers method purity automatically from platform metadata — C++ `const`, .NET `[Pure]`/`readonly`/`IReadOnly*`, TypeScript `readonly`/`Readonly<T>`. The programmer only annotates purity overrides for edge cases where the compiler's heuristic is wrong.
+
+---
+
+## Purity-Aware Interop
+
+The three-part pattern (algebra + repr + target instance) respects tulam's purity discipline:
+
+### Pure Observations → Algebra Instances
+
+Extern methods classified as pure can be used in algebra instances. The compiler verifies this automatically:
+
+```tulam
+target dotnet {
+    // OK: all these .NET String methods are pure observations
+    instance StringLike(System.String) = {
+        function charLength(x) = x.Length;        // get-only property → Pure
+        function indexOf(x, pattern) = x.IndexOf(pattern);  // returns Int → Pure
+        function toLower(x) = x.ToLowerInvariant();          // returns new String → Pure
+    };
+};
+```
+
+### Effectful Operations → Effect Handlers
+
+Impure extern methods go in effect handlers, which are already in effectful context:
+
+```tulam
+target dotnet {
+    handler DotNetConsole : Console = {
+        function putStrLn(s) = System.Console.WriteLine(s);  // Impure, fine in handler
+        function readLine()  = System.Console.ReadLine();     // Impure, fine in handler
+    };
+};
+
+target native {
+    extern function tlm_print_string(s:String) : Unit target native;
+    extern function tlm_print_newline() : Unit target native;
+    extern function tlm_read_line() : String target native;
+
+    handler StdConsole : Console = {
+        function putStrLn(s) = action { tlm_print_string(s); tlm_print_newline() };
+        function putStr(s)   = tlm_print_string(s);
+        function readLine()  = tlm_read_line()
+    };
+};
+
+target js {
+    import { console, prompt } from globals target js;
+
+    handler StdConsole : Console = {
+        function putStrLn(s) = console.log(s);
+        function putStr(s)   = process.stdout.write(s);
+        function readLine()  = prompt("")
+    };
+};
+```
+
+### Repr: Pure-to-Pure Only
+
+Repr bridges immutable representations. Mutable platform types cannot be repr targets:
+
+```tulam
+// OK: both sides are immutable
+repr String as System.String target dotnet;         // System.String is immutable
+repr List(a) as IReadOnlyList(a) target dotnet;     // IReadOnlyList is immutable
+
+// ERROR: List<T> is mutable — cannot bridge from pure tulam List
+repr List(a) as System.Collections.Generic.List(a) target dotnet;  // COMPILE ERROR
+```
+
+Conversion to mutable platform types happens explicitly inside effect handlers or `@contained` blocks, not silently via repr.

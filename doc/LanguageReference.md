@@ -549,9 +549,15 @@ function sqrt(x:Float64) : Float64 = intrinsic;
 - Helper functions: `plus`, `mult`
 - Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`, `compare`
 
-**String operations** (via `StringOps(String)`, `Eq(String)`, `Ord(String)`):
-- String manipulation: `concat`, `length`
+**String operations** (via `StringOps(String)`, `StringExt(String)`, `StringLike(String)`, `Semigroup(String)`, `Monoid(String)`, `Eq(String)`, `Ord(String)`):
+- Core: `concat`, `length`, `combine`, `empty`
+- Character: `charAt`, `fromChar`, `charCount`, `nthChar`, `toChars`
+- Substrings: `substring`, `indexOf`, `split`, `join`, `replace`
+- Transformation: `trim`, `toUpper`, `toLower`
+- Predicates: `startsWith`, `endsWith`
+- Parsing: `parseInt`, `parseFloat`
 - Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`, `compare`
+- StringLike defaults: `strSplit`, `strJoin`, `strStartsWith`, `strEndsWith`, `strTrim`, `strToUpper`, `strToLower`, `strReplace`, `strFromChar`, `strSlice`, `strDecodeAt`, `strIndexOf`, `byteLength`
 
 **Array operations** (via intrinsic functions on `Array(a)`):
 - `length` — returns the number of elements

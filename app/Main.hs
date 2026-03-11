@@ -8,7 +8,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict -- trying state monad transformer to maintain state
 import State
-import Control.Monad (zipWithM_, void, when)
+import Control.Monad (zipWithM_, void, when, forM_)
 
 import qualified Data.Text.IO as T (readFile)
 import qualified Data.Text as T
@@ -25,6 +25,7 @@ import Util.PrettyPrinting as TC
 import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses)
 import Interface (cacheVersion, toCachePath, ensureCacheDir)
 import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
+import Backends.LLVM.NativeCompile (compileNative, CompileResult(..), NativeConfig(..), defaultNativeConfig)
 
 import Text.Pretty.Simple (pPrint, pShow)
 
@@ -73,7 +74,7 @@ showHelp = do
     putStrLn ":q[uit]           -- quit"
     putStrLn ":a[ll]            -- list everything that was parsed, -d - in core format"
     putStrLn ":l[oad] <name>    -- load and interpret file <name>"
-    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off, :s verbose on/off)"
+    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off, :s verbose on/off, :s stricttypes on/off)"
     putStrLn ":s optimize on/off      -- toggle all CLM optimization passes"
     putStrLn ":s opt:list             -- show all passes with status"
     putStrLn ":s opt:<name> on/off    -- toggle individual pass"
@@ -82,7 +83,7 @@ showHelp = do
     putStrLn ":clm              -- show CLM (core list machine) format functions"
     putStrLn ":clm-raw          -- show pre-optimization CLM (raw)"
     putStrLn ":inspect <name>        -- show full detail of a type, function, or constructor"
-    putStrLn ":list <types, functions, constructors> [-d] -- list all global functions / types / constructors"
+    putStrLn ":list <types, functions, constructors, targets> [-d] -- list all global functions / types / constructors / target decls"
     putStrLn ":cache status         -- show module cache stats"
     putStrLn ":cache clear          -- delete all cached modules"
     putStrLn ":cache rebuild        -- clear cache and recompile all modules"
@@ -407,7 +408,9 @@ processCommand (":help":_) = liftIO showHelp
 processCommand (":quit":_) = liftIO $ putStrLn "Goodbye." >> exitSuccess
 processCommand (":load":xs) = loadFileNew (head xs)
 processCommand (":set":s:xs) = processSet s xs
-processCommand (":compile":_) = compile2JSpass
+processCommand (":compile":"native":args) = compileNativeCmd args False
+processCommand (":compile":"native-ir":args) = compileNativeCmd args True
+processCommand (":compile":_) = liftIO $ putStrLn "Usage: :compile native [funcName] | :compile native-ir [funcName]"
 processCommand (":inspect":name:_) = inspectName name
 processCommand (":inspect":_) = liftIO $ putStrLn "Usage: :inspect <name>"
 processCommand (":list":"types":"-d":_) = do
@@ -435,6 +438,28 @@ processCommand (":env":"-d":_) = do
 processCommand (":list":"types":_) = listTypes
 processCommand (":list":"functions":_) = listFunctions
 processCommand (":list":"constructors":_) = listConstructors
+processCommand (":list":"targets":_) = do
+    env <- gets (currentEnvironment)
+    let tInst = targetInstances env
+        tHand = targetHandlers env
+        tExtn = targetExterns env
+    if Map.null tInst && Map.null tHand && Map.null tExtn
+    then liftIO $ putStrLn "No target declarations loaded."
+    else do
+        forM_ (Map.toList tExtn) $ \(tgt, extMap) -> do
+            liftIO $ putStrLn $ TC.as [bold, green] ("\nTarget: " ++ tgt ++ " — extern functions (" ++ show (Map.size extMap) ++ "):")
+            forM_ (Map.toList extMap) $ \(nm, (_, _, spec)) ->
+                liftIO $ putStrLn $ "  " ++ nm ++ case spec of
+                    Nothing -> ""
+                    Just (kind, s) -> " = " ++ kind ++ " \"" ++ s ++ "\""
+        forM_ (Map.toList tInst) $ \(tgt, instMap) -> do
+            liftIO $ putStrLn $ TC.as [bold, green] ("\nTarget: " ++ tgt ++ " — instances (" ++ show (Map.size instMap) ++ "):")
+            forM_ (Map.keys instMap) $ \key ->
+                liftIO $ putStrLn $ "  " ++ key
+        forM_ (Map.toList tHand) $ \(tgt, handMap) -> do
+            liftIO $ putStrLn $ TC.as [bold, green] ("\nTarget: " ++ tgt ++ " — handlers (" ++ show (Map.size handMap) ++ "):")
+            forM_ (Map.toList handMap) $ \(nm, (eff, _, _)) ->
+                liftIO $ putStrLn $ "  " ++ nm ++ " : " ++ eff
 
 processCommand (":clm":"-d":_) = do
     liftIO $ putStrLn "\n--------------- CLM LAMBDAS ----------------"
@@ -542,6 +567,28 @@ processCommand (":e":xs) = processCommand (":env":xs)
 
 processCommand _ = liftIO $ putStrLn "Unknown command. Type :h[elp] to show available list."
 
+-- | Compile function(s) to native binary via LLVM backend.
+compileNativeCmd :: [String] -> Bool -> IntState ()
+compileNativeCmd args emitIR = do
+    st <- get
+    let env = currentEnvironment st
+    -- Check if Native.tl is loaded
+    case Map.lookup "native" (targetExterns env) of
+        Nothing -> liftIO $ putStrLn "Native target not loaded. Run: :load lib/Backend/LLVM/Native.tl"
+        Just _ -> do
+            let funcNames = args
+                config = defaultNativeConfig
+                    { ncEmitIR = emitIR
+                    , ncEntryPoint = case funcNames of
+                        [f] -> Just f
+                        _   -> Nothing
+                    }
+            result <- liftIO $ compileNative env st config funcNames
+            case result of
+                CompileOK path -> liftIO $ putStrLn $ TC.as [TC.bold, TC.green] "Compiled: " ++ path
+                CompileIR ir   -> liftIO $ putStr ir
+                CompileError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Error: " ++ e
+
 -- various environment settings
 -- processSet :: String -> IntState ()
 processSet "strict" _ = do
@@ -596,6 +643,14 @@ processSet "coverage" ("on":_) = do
 processSet "coverage" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = False} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking off"
+
+processSet "stricttypes" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "strict type checking on"
+
+processSet "stricttypes" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "strict type checking off"
 
 processSet "newstrings" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { newStrings = True} } )

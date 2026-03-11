@@ -87,6 +87,9 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `doc/PrimitiveDesign.md` — Primitive types, intrinsics, repr system, SIMD, GPU acceleration design
 - `doc/RecordDesign.md` — Record system design (nominal, structural, spread, functions-as-fields)
 - `doc/LanguageReference.md` — Full language reference documentation
+- `doc/backends/LLVMBackendDesign.md` — LLVM native code backend: evaluation strategy, memory representation, Perceus RC, monomorphization, unboxing, defunctionalization, SIMD. 1700-line comprehensive design with comparison tables vs GHC/OCaml/MLton/Lean/Koka/Rust.
+- `doc/backends/LazinessAndThreadingDesign.md` — Laziness treatment (Lazy(a) type, ~syntax, demand analysis, corecursion detection) and multi-threading options (biased RC, STM, green threads, fork-join). Options exploration, no final decisions. Includes §18 phased strategy (single-threaded first → OS threads → full concurrency).
+- `doc/backends/PhaseA1_Design.md` — Detailed implementation design for Phase A.1 (LLVM backend foundation): LIR types, CLM→LIR lowering, LLVM IR emission, C runtime, memory representation, build pipeline, test strategy, implementation order.
 
 ### Data Files
 
@@ -96,8 +99,8 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
   - `lib/Algebra.tl` — All algebra definitions: Semigroup, Monoid, Group, Additive, Multiplicative, Ring, Field, Floating, Absolute, Bits, StringOps, Eq, Ord, Show, Bounded, Enum, Hashable, Lattice, StringExt, StringLike.
   - `lib/Morphism.tl` — Multi-type structures: Convertible, Embed, Iso.
   - `lib/Instances.tl` — ALL instance declarations: reflection intrinsics, Core type instances, numeric intrinsic instances, Show/Bounded/Enum/Hashable/Lattice instances, numeric conversions.
-  - `lib/HKT.tl` — Higher-kinded types: Functor, Applicative, Monad + instances.
-  - `lib/Collection.tl` — Array higher-order functions (Functor/Applicative/Monad instances).
+  - `lib/Categorical.tl` — Category theory: Category, Arrow, Functor, Applicative, Monad + instances for Maybe/List.
+  - `lib/Collection.tl` — Container algebras: Foldable, Sized, Searchable, Filterable, Buildable, Indexable, Traversable, Sortable, Zippable, Sliceable + Array instances.
   - `lib/Effect.tl` — Effect declarations and handlers: Console, FileIO, Exception, State.
   - `lib/Mutable.tl` — Mutable references: Ref, MutArray.
   - `lib/SIMD.tl` — SIMD vector types and Lane algebra.
@@ -135,3 +138,5 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `ClassName.new(args)` = construction. `obj.method(args)` = method call (dynamic dispatch). `obj.field` = field access.
 - `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super` are reserved words.
 - `infixl N (op);` / `infixr N (op);` / `infix N (op);` = operator fixity declarations. N is precedence 0-9. Default for unknown ops is `infixl 9`. `infixl`, `infixr`, `infix` are reserved words.
+- `fn(x) = expr` = anonymous lambda (ML-style). Mirrors named function syntax: `fn(x:Int, y:Int) : Int = x + y`. Supports `fn(x) = match | pat -> body` for pattern matching. `fn` is a **reserved word**.
+- Per-function `requires` constraints: `function fold(xs:c(a)) : a requires Monoid(a);` — constraints checked at call site by the type checker. Multiple constraints comma-separated: `requires Monoid(a), Ord(b)`. Stored in `Lambda.lamRequires`.
