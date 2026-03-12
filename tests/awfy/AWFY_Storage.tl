@@ -20,9 +20,12 @@ function buildChildren(n:Int, depth:Int, seed:Ref(Int), count:Ref(Int), acc:List
         buildChildren(n - 1, depth, seed, count, Cons(child, acc));
 
 function benchStorage() : Int =
-    let seed = newRef(74755) in
-    let count = newRef(0) in
-    let tree = buildTreeDepth(7, seed, count) in
+    let { seed = newRef(74755); count = newRef(0); tree = buildTreeDepth(7, seed, count) } in
     readRef(count);
 
 function verifyStorage() : Bool = benchStorage() == 5461;
+
+function main() : Unit =
+    let { result = benchStorage(); u = putStrLn("AWFY Storage: " ++ show(result)) } in
+    if verifyStorage() then putStrLn("PASS")
+    else putStrLn("FAIL: expected 5461");

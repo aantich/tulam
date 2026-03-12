@@ -17,31 +17,35 @@ function placeQueen(c:Int, n:Int, queenRows:MutArray(Int), freeRows:MutArray(Int
 function tryRow(r:Int, c:Int, n:Int, queenRows:MutArray(Int), freeRows:MutArray(Int), freeMaxs:MutArray(Int), freeMins:MutArray(Int)) : Bool =
     if r == n then False
     else
-        let fr = mutRead(freeRows, r) in
-        let fmx = mutRead(freeMaxs, r + c) in
-        let fmn = mutRead(freeMins, r - c + n - 1) in
+        let { fr = mutRead(freeRows, r); fmx = mutRead(freeMaxs, r + c); fmn = mutRead(freeMins, r - c + n - 1) } in
         if fr == 1 then
             if fmx == 1 then
                 if fmn == 1 then
-                    let u1 = mutWrite(queenRows, c, r) in
-                    let u2 = mutWrite(freeRows, r, 0) in
-                    let u3 = mutWrite(freeMaxs, r + c, 0) in
-                    let u4 = mutWrite(freeMins, r - c + n - 1, 0) in
+                    let {
+                        u1 = mutWrite(queenRows, c, r);
+                        u2 = mutWrite(freeRows, r, 0);
+                        u3 = mutWrite(freeMaxs, r + c, 0);
+                        u4 = mutWrite(freeMins, r - c + n - 1, 0);
+                    } in
                     if placeQueen(c + 1, n, queenRows, freeRows, freeMaxs, freeMins) then True
                     else
-                        let u5 = mutWrite(freeRows, r, 1) in
-                        let u6 = mutWrite(freeMaxs, r + c, 1) in
-                        let u7 = mutWrite(freeMins, r - c + n - 1, 1) in
+                        let {
+                            u5 = mutWrite(freeRows, r, 1);
+                            u6 = mutWrite(freeMaxs, r + c, 1);
+                            u7 = mutWrite(freeMins, r - c + n - 1, 1);
+                        } in
                         tryRow(r + 1, c, n, queenRows, freeRows, freeMaxs, freeMins)
                 else tryRow(r + 1, c, n, queenRows, freeRows, freeMaxs, freeMins)
             else tryRow(r + 1, c, n, queenRows, freeRows, freeMaxs, freeMins)
         else tryRow(r + 1, c, n, queenRows, freeRows, freeMaxs, freeMins);
 
 function queens(n:Int) : Bool =
-    let queenRows = newMutArray(n, 0) in
-    let freeRows = newMutArray(n, 1) in
-    let freeMaxs = newMutArray(2 * n, 1) in
-    let freeMins = newMutArray(2 * n, 1) in
+    let {
+        queenRows = newMutArray(n, 0);
+        freeRows = newMutArray(n, 1);
+        freeMaxs = newMutArray(2 * n, 1);
+        freeMins = newMutArray(2 * n, 1);
+    } in
     placeQueen(0, n, queenRows, freeRows, freeMaxs, freeMins);
 
 function queensRepeat(i:Int, n:Int) : Bool =
@@ -53,3 +57,8 @@ function queensRepeat(i:Int, n:Int) : Bool =
 function benchQueens() : Bool = queensRepeat(10, 8);
 
 function verifyQueens() : Bool = benchQueens() == True;
+
+function main() : Unit =
+    let { result = benchQueens(); u = putStrLn("AWFY Queens: " ++ show(result)) } in
+    if verifyQueens() then putStrLn("PASS")
+    else putStrLn("FAIL: expected True");

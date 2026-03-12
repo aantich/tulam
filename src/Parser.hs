@@ -750,8 +750,9 @@ pHandlerDecl = do
     reservedOp ":"
     effName <- uIdentifier
     reservedOp "="
+    isDefault <- option False (reserved "default" >> return True)
     impls <- braces (sepEndBy pHandlerMember (reservedOp ";"))
-    return $ HandlerDecl name effName ps impls
+    return $ HandlerDecl name effName isDefault ps impls
 
 -- Parse a handler member: either a let binding or a function
 pHandlerMember :: Parser Expr
@@ -1148,10 +1149,49 @@ pIfThenElse = do
 pLetIn :: Parser Expr
 pLetIn = do
     reserved "let"
-    bindings <- sepBy1 pLetBinding (reservedOp ",")
+    bindings <- try pLetBlock <|> sepBy1 pLetBinding (reservedOp ",")
     reserved "in"
     bdy <- pExpr
     return $ LetIn bindings bdy
+
+-- Multi-binding let block: let { x = 1; f(n) = n * 2; y = f(x) } in body
+pLetBlock :: Parser [(Var, Expr)]
+pLetBlock = braces (sepEndBy1 pLetBlockDecl (reservedOp ";"))
+
+pLetBlockDecl :: Parser (Var, Expr)
+pLetBlockDecl = try pLetBlockFuncExplicit   -- function name(params) = body
+            <|> try pLetBlockBareFunc       -- name(params) = body
+            <|> pLetBlockVal                -- name = expr
+
+-- Explicit function keyword in let block (reuses pFuncL)
+pLetBlockFuncExplicit :: Parser (Var, Expr)
+pLetBlockFuncExplicit = do
+    lam <- pFuncL
+    return (Var (lamName lam) UNDEFINED UNDEFINED, Function lam)
+
+-- Bare function definition: name(params) : RetType = body
+pLetBlockBareFunc :: Parser (Var, Expr)
+pLetBlockBareFunc = do
+    pos <- getPosition
+    nm <- identifier
+    args <- pVars  -- requires parens — disambiguates from simple binding
+    tp <- typeSignature
+    reqs <- parseRequires
+    reservedOp "="
+    let lam = Lambda { lamName = nm, params = args, body = UNDEFINED
+                     , lamType = tp, lamRequires = reqs, lamSrcInfo = mkSrcInfo pos }
+    bdy <- try (reserved "match" >> PatternMatches <$> many1 (reservedOp "|" >> pPatternMatch lam))
+           <|> pExpr
+    return (Var nm UNDEFINED UNDEFINED, Function (lam { body = bdy }))
+
+-- Simple value binding in let block
+pLetBlockVal :: Parser (Var, Expr)
+pLetBlockVal = do
+    nm <- identifier
+    tp <- typeSignature
+    reservedOp "="
+    val <- pExpr
+    return (Var nm tp UNDEFINED, val)
 
 pLetBinding :: Parser (Var, Expr)
 pLetBinding = do
@@ -1289,8 +1329,29 @@ symbolId = do
 pApp :: Parser Expr
 pApp = do
     func <- try (parens pExpr) <|> try (Id <$> parens operator) <|> (Id <$> identifier)
+    -- Optional bracket overrides: func [Console = SilentConsole, ...] (args)
+    mOverrides <- optionMaybe (try pBracketOverrides)
     args <- parens (sepBy pExpr (reservedOp ",") )
-    return $ App func args
+    case mOverrides of
+        Nothing -> return $ App func args
+        Just overrides -> return $ OverrideApp func overrides args
+
+-- | Parse bracket overrides: [override1, override2, ...]
+-- Each override is either named (Effect = Handler) or positional (Handler or type)
+pBracketOverrides :: Parser [(Maybe Name, Expr)]
+pBracketOverrides = brackets (sepBy1 pOverrideItem (reservedOp ","))
+  where
+    pOverrideItem = try pNamedOverride <|> pPositionalOverride
+    -- Named: Console = SilentConsole
+    pNamedOverride = do
+        nm <- uIdentifier
+        reservedOp "="
+        h <- pExpr
+        return (Just nm, h)
+    -- Positional: SilentConsole or Int or _ (wildcard)
+    pPositionalOverride = do
+        e <- pExpr
+        return (Nothing, e)
 
 -- MODULE SYSTEM PARSING ---------------------------------------------------
 

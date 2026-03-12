@@ -351,6 +351,22 @@ lowerExpr (CLMAPP (CLMID funcName) args) = do
               Nothing   -> (llvmName, map operandType ops, LTInt64)
         emitFresh "r_" retTy (LCall llvmName ops retTy)
 
+-- Immediately-applied lambda: beta-reduce (let bindings, if/then/else)
+-- CLMAPP (CLMLAM (CLMLam [vars] body)) [args] → bind vars=args, lower body
+lowerExpr (CLMAPP (CLMLAM (CLMLam vars body)) args) = do
+  ops <- mapM lowerExpr args
+  -- Bind each param to its argument value
+  mapM_ (\((name, _), op) -> bindVar name op) (zip vars ops)
+  lowerExpr body
+
+-- Immediately-applied case lambda: bind params, then lower case chain
+-- CLMAPP (CLMLAM (CLMLamCases [vars] cases)) [args] → bind vars=args, match cases
+lowerExpr (CLMAPP (CLMLAM (CLMLamCases vars cases)) args) = do
+  ops <- mapM lowerExpr args
+  mapM_ (\((name, _), op) -> bindVar name op) (zip vars ops)
+  -- Lower cases as a chain of checks (same as lowerCaseChain but inline)
+  lowerCaseExprChain cases
+
 -- Application where func is not a simple name
 lowerExpr (CLMAPP func args) = do
   funcOp <- lowerExpr func
@@ -418,10 +434,10 @@ lowerExpr (CLMCASE checks body)
 lowerExpr (CLMTYPED inner _ty) = lowerExpr inner
 
 -- Lambda value — closures not supported in Phase A.1
-lowerExpr (CLMLAM _)          = throwL "Inline lambda values (closures) not supported in Phase A.1"
+lowerExpr (CLMLAM clm)        = throwL $ "Inline lambda values (closures) not supported in Phase A.1: " ++ take 200 (show clm)
 
 -- Unsupported nodes
-lowerExpr (CLMIAP _ _)        = throwL "CLMIAP not supported in Phase A.1 (needs monomorphization)"
+lowerExpr (CLMIAP f args)     = throwL $ "CLMIAP not supported in Phase A.1 (needs monomorphization): " ++ take 200 (show f) ++ " applied to " ++ show (length args) ++ " args"
 lowerExpr (CLMPAP _ _)        = throwL "CLMPAP not supported in Phase A.1 (needs closures)"
 lowerExpr (CLMMCALL _ _ _)    = throwL "CLMMCALL not supported in Phase A.1"
 lowerExpr (CLMSCALL _ _ _)    = throwL "CLMSCALL not supported in Phase A.1"
@@ -486,9 +502,10 @@ lowerFunction name clmLam funcMap extMap = do
     CLMLam _vars body -> do
       resultOp <- lowerExpr body
       st <- getS
-      let finalBlock = LBlock (lsCurrentBlock st)
+      let terminator = if operandType resultOp == LTVoid then LRetVoid else LRet resultOp
+          finalBlock = LBlock (lsCurrentBlock st)
                         (reverse (lsCurrentInstrs st))
-                        (LRet resultOp)
+                        terminator
           allBlocks = reverse (finalBlock : lsBlocks st)
       return (allBlocks, reverse (lsGlobals st))
 
@@ -542,6 +559,57 @@ lowerCaseChain cases _retTy = do
                     LUnreachable
       allBlocks = reverse (failBlock : lsBlocks st)
   return (allBlocks, reverse (lsGlobals st))
+
+-- | Lower an inline case chain (from immediately-applied CLMLamCases).
+-- Unlike lowerCaseChain (which uses LRet for each branch), this produces
+-- a phi node to merge results — for use inside expressions.
+lowerCaseExprChain :: [CLMExpr] -> LowerM LOperand
+lowerCaseExprChain [] = return LLitNull
+lowerCaseExprChain cases = do
+  mergeLabel <- freshBlock "match_merge_"
+  failLabel  <- freshBlock "match_fail_"
+
+  -- Generate labels for each case
+  labels <- forM (zip [0..] cases) $ \(i, _) -> do
+    chk  <- freshBlock ("mc" ++ show (i :: Int) ++ "_chk_")
+    bd   <- freshBlock ("mc" ++ show (i :: Int) ++ "_bd_")
+    return (chk, bd)
+
+  -- Branch from current block to first case check
+  let firstCheck = fst (head labels)
+  sealBlock (LBr firstCheck) firstCheck
+
+  -- For each case: check guards → body or next, branch to merge
+  let nextChecks = map fst (tail labels) ++ [failLabel]
+  results <- forM (zip3 cases labels nextChecks) $ \(caseExpr, (_chkLabel, bodyLabel), nextCheck) ->
+    case caseExpr of
+      CLMCASE checks caseBody -> do
+        if null checks
+          then sealBlock (LBr bodyLabel) bodyLabel
+          else do
+            cond <- lowerPatternChecks checks
+            sealBlock (LCondBr cond bodyLabel nextCheck) bodyLabel
+        resultOp <- lowerExpr caseBody
+        fromBlock <- getsS lsCurrentBlock
+        sealBlock (LBr mergeLabel) nextCheck
+        return (resultOp, fromBlock)
+      _ -> do
+        resultOp <- lowerExpr caseExpr
+        fromBlock <- getsS lsCurrentBlock
+        sealBlock (LBr mergeLabel) nextCheck
+        return (resultOp, fromBlock)
+
+  -- Failure block → error + unreachable, then merge
+  errStr <- getOrCreateString "pattern match failure"
+  _ <- emitFresh "_err_" LTVoid
+    (LCall "tlm_error" [LLitString errStr "pattern match failure"] LTVoid)
+  sealBlock (LBr mergeLabel) mergeLabel  -- unreachable path, but need valid block
+
+  -- Merge with phi
+  let retTy = case results of
+        ((op, _):_) -> operandType op
+        []          -> LTInt64
+  emitFresh "phi_" retTy (LPhi results retTy)
 
 -- ============================================================================
 -- Module lowering

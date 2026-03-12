@@ -369,6 +369,21 @@ target native {
 };
 
 // ============================================================================
+// Sequence effect handler — strict sequential execution
+// ============================================================================
+
+target native {
+
+    /// In strict native code, seq/bind just apply the continuation to the value.
+    /// No thunk forcing needed — Lazy(a) is handled via explicit force().
+    handler NativeSequence : Sequence = {
+        function effectSeq(a, f) = f(a);
+        function effectBind(a, f) = f(a)
+    };
+
+};
+
+// ============================================================================
 // Console effect handler
 // ============================================================================
 
@@ -578,6 +593,39 @@ target native {
 };
 
 // ============================================================================
+// MutableRef effect handler
+// ============================================================================
+
+target native {
+
+    handler NativeRef : MutableRef = {
+        function newRef(val) = __newref(val);
+        function readRef(r) = __readref(r);
+        function writeRef(r, val) = __writeref(r, val);
+        function modifyRef(r, f) = __modifyref(r, f)
+    };
+
+};
+
+// ============================================================================
+// MutableArray effect handler
+// ============================================================================
+
+target native {
+
+    handler NativeMutArray : MutableArray = {
+        function newMutArray(n, val) = __newmutarray(n, val);
+        function mutRead(arr, i) = __mutread(arr, i);
+        function mutWrite(arr, i, val) = __mutwrite(arr, i, val);
+        function mutLength(arr) = __mutlength(arr);
+        function freeze(arr) = __freeze(arr);
+        function thaw(arr) = __thaw(arr);
+        function mutPush(arr, val) = __mutpush(arr, val)
+    };
+
+};
+
+// ============================================================================
 // Primitive op declarations — IO / Effects
 // ============================================================================
 
@@ -591,4 +639,29 @@ target native {
     extern function __file_exists(path:String) : Bool;
     extern function __error(msg:String) : Unit;
     extern function __try_catch(body:Unit, h:Unit) : Unit;
+};
+
+// ============================================================================
+// Primitive op declarations — Mutable Ref
+// ============================================================================
+
+target native {
+    extern function __newref(val:Int) : Ref(Int);
+    extern function __readref(r:Ref(Int)) : Int;
+    extern function __writeref(r:Ref(Int), val:Int) : Unit;
+    extern function __modifyref(r:Ref(Int), f:Int) : Unit;
+};
+
+// ============================================================================
+// Primitive op declarations — Mutable Array
+// ============================================================================
+
+target native {
+    extern function __newmutarray(n:Int, val:Int) : MutArray(Int);
+    extern function __mutread(arr:MutArray(Int), i:Int) : Int;
+    extern function __mutwrite(arr:MutArray(Int), i:Int, val:Int) : Unit;
+    extern function __mutlength(arr:MutArray(Int)) : Int;
+    extern function __freeze(arr:MutArray(Int)) : Array(Int);
+    extern function __thaw(arr:Array(Int)) : MutArray(Int);
+    extern function __mutpush(arr:MutArray(Int), val:Int) : Unit;
 };

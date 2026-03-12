@@ -16,6 +16,5 @@ function isEvenDigit(d:Digit) : Bool =
     mod(r, 2) == 0;
 
 function nextDigit(d:Digit) : Digit =
-    let r = d as Int in
-    let r2 = if r >= 9 then 0 else r + 1 in
+    let { r = d as Int; r2 = if r >= 9 then 0 else r + 1 } in
     r2 as Digit;

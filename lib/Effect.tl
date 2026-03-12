@@ -1,5 +1,29 @@
-/// Effect declarations and handlers: Console, FileIO, Exception, State.
+/// Effect declarations and handlers: Sequence, Console, FileIO, Exception, State.
 module Effect;
+
+// ============================================================================
+// Sequence — core effect sequencing
+// ============================================================================
+
+/// Sequential execution of effectful computations.
+/// In strict evaluation, seq(a, f) = f(a) — evaluate a, pass result to f.
+/// bind is identical to seq; both exist for clarity in desugared action blocks.
+/// Lazy(a) values are handled naturally: delay() creates a thunk value in strict
+/// eval, and force() is called explicitly where needed — seq itself never forces.
+effect Sequence = {
+    function effectSeq(a:a, f:a -> b) : b;
+    function effectBind(a:a, f:a -> b) : b
+};
+
+/// Default strict sequencing handler.
+/// Used by the interpreter when no other handler is active.
+/// StrictSequence is NOT marked as default because effectBind/effectSeq
+/// dispatch is handled specially by the interpreter (supports Monad instances).
+/// Only use as explicit handler when overriding sequencing behavior.
+handler StrictSequence : Sequence = {
+    function effectSeq(a, f) = f(a);
+    function effectBind(a, f) = f(a)
+};
 
 // ============================================================================
 // Console
@@ -11,7 +35,7 @@ effect Console = {
     function putStr(s:String) : Unit
 };
 
-handler StdConsole : Console = {
+handler StdConsole : Console = default {
     function readLine() = intrinsic;
     function putStrLn(s) = intrinsic;
     function putStr(s) = intrinsic
@@ -34,7 +58,7 @@ effect FileIO = {
     function fileExists(path:String) : Bool
 };
 
-handler StdFileIO : FileIO = {
+handler StdFileIO : FileIO = default {
     function readFile(path) = intrinsic;
     function writeFile(path, content) = intrinsic;
     function appendFile(path, content) = intrinsic;
@@ -50,7 +74,7 @@ effect Exception = {
     function catch(m:b, h: a -> b) : b
 };
 
-handler DefaultException : Exception = {
+handler DefaultException : Exception = default {
     function throw(err) = error(show(err));
     function catch(m, h) = m
 };

@@ -67,7 +67,6 @@ compileNative env state config funcNames = do
         Just allTexterns -> do
             -- Step 1: Build compilation plan (reachability + monomorphization)
             let plan = buildCompilationPlan funcNames "native" env state
-
             let compilable = cpFunctions plan
             if Map.null compilable
                 then return $ CompileError
@@ -89,9 +88,14 @@ compileNative env state config funcNames = do
                                  , surfaceRetTypeToLType (lamType lam)
                                  )) | (n, lam) <- Map.toList compilable]
 
-                    -- Step 5: Lower CLM → LIR
-                    results <- mapM (\(n, clm) -> lowerFunction n clm funcTypeMap extMap)
-                                    (Map.toList clmFuncs)
+                    -- Step 5: Lower CLM → LIR (with per-function error reporting)
+                    results <- mapM (\(n, clm) -> do
+                        r <- lowerFunction n clm funcTypeMap extMap
+                        case r of
+                            Left (LowerError err) -> return $ Left $ LowerError $
+                                "in function '" ++ n ++ "': " ++ err
+                            Right ok -> return $ Right ok
+                        ) (Map.toList clmFuncs)
 
                     case sequence results of
                         Left (LowerError err) -> return $ CompileError $
@@ -143,19 +147,24 @@ generateMain entryName funcTypeMap =
     let (llvmName, _, retTy) = fromMaybe
             ("tulam_" ++ sanitizeName entryName, [], LTInt64)
             (Map.lookup entryName funcTypeMap)
-        callInstr = ("result", LCall llvmName [] retTy)
-        printInstr = case retTy of
-            LTInt64   -> ("_p", LCall "tlm_print_int" [LVar "result" LTInt64] LTVoid)
-            LTFloat64 -> ("_p", LCall "tlm_print_float" [LVar "result" LTFloat64] LTVoid)
-            LTBool    -> ("_p", LCall "tlm_print_bool" [LVar "result" LTInt32] LTVoid)
-            LTPtr     -> ("_p", LCall "tlm_print_string" [LVar "result" LTPtr] LTVoid)
-            _         -> ("_p", LCall "tlm_print_int" [LVar "result" LTInt64] LTVoid)
-        nlInstr = ("_n", LCall "tlm_print_newline" [] LTVoid)
+        -- For void-returning functions (Unit), just call without printing
+        instrs = case retTy of
+            LTVoid ->
+                [ ("_call", LCall llvmName [] LTVoid) ]
+            _ ->
+                [ ("result", LCall llvmName [] retTy)
+                , printResult retTy
+                , ("_n", LCall "tlm_print_newline" [] LTVoid)
+                ]
     in LFunction "main" [] LTInt32
-        [ LBlock "entry"
-            [callInstr, printInstr, nlInstr]
-            (LRet (LLitInt 0 LTInt32))
+        [ LBlock "entry" instrs (LRet (LLitInt 0 LTInt32))
         ] False
+  where
+    printResult LTInt64   = ("_p", LCall "tlm_print_int" [LVar "result" LTInt64] LTVoid)
+    printResult LTFloat64 = ("_p", LCall "tlm_print_float" [LVar "result" LTFloat64] LTVoid)
+    printResult LTBool    = ("_p", LCall "tlm_print_bool" [LVar "result" LTInt32] LTVoid)
+    printResult LTPtr     = ("_p", LCall "tlm_print_string" [LVar "result" LTPtr] LTVoid)
+    printResult _         = ("_p", LCall "tlm_print_int" [LVar "result" LTInt64] LTVoid)
 
 -- | Check if a Var has Implicit type
 isImplicitVar :: Var -> Bool

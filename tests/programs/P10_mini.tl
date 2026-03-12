@@ -55,8 +55,7 @@ function priorities(tasks:List(TaskItem)) : List(Int) =
 function maxScore(tasks:List(TaskItem)) : Int = match
     | Nil -> 0
     | Cons(Task(p, s, e), rest) ->
-        let pr = score(p) in
-        let mr = maxScore(rest) in
+        let { pr = score(p); mr = maxScore(rest) } in
         if pr > mr then pr else mr;
 
 function projectHealth(tasks:List(TaskItem)) : Maybe(Int) =

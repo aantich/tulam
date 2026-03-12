@@ -25,6 +25,7 @@ import qualified Data.Sequence as Seq
 import System.Directory (doesFileExist)
 import CaseOptimization (positivityCheckPass, terminationCheckPass, coverageCheckPass)
 import LLVMSpec (llvmTests)
+import BytecodeSpec (bytecodeTests)
 
 -- Helper: run an IntState action with a fresh state
 runFresh :: IntState a -> IO a
@@ -57,6 +58,8 @@ setupEnv = do
         allModules <- liftIO $ resolveAllDeps searchPaths Set.empty [baseModulePath]
         -- Load each module in dependency order
         mapM_ (\(_, filePath) -> loadFileQuiet filePath) allModules
+        -- Install default effect handlers
+        installDefaultHandlers
 
 -- Helper: parse a string as a tulam file, returning the expressions
 parseTestString :: String -> IO (Either String [Expr])
@@ -168,6 +171,7 @@ main = do
     st <- setupEnv
     hspec $ do
         llvmTests
+        bytecodeTests
         describe "Parser" $ do
             it "parses simple Id" $ do
                 res <- runFresh $ parseExpr (T.pack "Z")
@@ -304,6 +308,39 @@ main = do
             it "let x = Succ(Z) in plus(x, x) = Succ(Succ(Z))" $ do
                 result <- evalExpr st "let x = Succ(Z) in plus(x, x)"
                 result `shouldBe` nat 2
+
+            -- Multi-binding let blocks
+            it "let { x = 1; y = 2 } in x + y = 3" $ do
+                result <- evalExpr st "let { x = 1; y = 2 } in x + y"
+                result `shouldBe` CLMLIT (LInt 3)
+
+            it "let block sequential scoping: let { x = 1; y = x + 1 } in y = 2" $ do
+                result <- evalExpr st "let { x = 1; y = x + 1 } in y"
+                result `shouldBe` CLMLIT (LInt 2)
+
+            it "let block trailing semicolon: let { x = 10; } in x = 10" $ do
+                result <- evalExpr st "let { x = 10; } in x"
+                result `shouldBe` CLMLIT (LInt 10)
+
+            it "let block with explicit function keyword" $ do
+                result <- evalExpr st "let { function double(n:Int) : Int = n * 2 } in double(5)"
+                result `shouldBe` CLMLIT (LInt 10)
+
+            it "let block with bare function" $ do
+                result <- evalExpr st "let { double(n:Int) : Int = n * 2 } in double(5)"
+                result `shouldBe` CLMLIT (LInt 10)
+
+            it "let block mixed bindings and functions" $ do
+                result <- evalExpr st "let { x = 10; add_x(n:Int) : Int = n + x } in add_x(5)"
+                result `shouldBe` CLMLIT (LInt 15)
+
+            it "let block single binding" $ do
+                result <- evalExpr st "let { x = 42 } in x"
+                result `shouldBe` CLMLIT (LInt 42)
+
+            it "let block backward compat: comma form still works" $ do
+                result <- evalExpr st "let x = 1, y = 2 in x + y"
+                result `shouldBe` CLMLIT (LInt 3)
 
             -- Intrinsics (Int arithmetic)
             it "3 + 4 = 7" $ do
@@ -4230,6 +4267,48 @@ main = do
                 st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
                 result <- evalExpr st32 "t7()"
                 result `shouldBe` conTrue
+
+        describe "P32b: Handler Override Bracket Syntax" $ do
+            it "t8: positional bracket override — putStrLn [SilentConsole] suppresses" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t8()"
+                result `shouldBe` conTrue
+            it "t9: named bracket override — putStrLn [Console = SilentConsole] suppresses" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t9()"
+                result `shouldBe` conTrue
+            it "t10: bracket override on readLine [SilentConsole] returns empty" $ do
+                st32 <- loadTestProgram st "tests/programs/P32_EffectHandlers.tl"
+                result <- evalExpr st32 "t10()"
+                result `shouldBe` CLMLIT (LString "")
+
+        describe "P32c: Effect Infrastructure" $ do
+            it "effectOps maps putStrLn to Console" $ do
+                let env = currentEnvironment st
+                Map.lookup "putStrLn" (effectOps env) `shouldBe` Just "Console"
+            it "effectOps maps readFile to FileIO" $ do
+                let env = currentEnvironment st
+                Map.lookup "readFile" (effectOps env) `shouldBe` Just "FileIO"
+            it "effectOps maps get to State" $ do
+                let env = currentEnvironment st
+                Map.lookup "get" (effectOps env) `shouldBe` Just "State"
+            it "defaultHandlers maps Console to StdConsole" $ do
+                let env = currentEnvironment st
+                Map.lookup "Console" (defaultHandlers env) `shouldBe` Just "StdConsole"
+            it "defaultHandlers maps FileIO to StdFileIO" $ do
+                let env = currentEnvironment st
+                Map.lookup "FileIO" (defaultHandlers env) `shouldBe` Just "StdFileIO"
+            it "defaultHandlers maps Exception to DefaultException" $ do
+                let env = currentEnvironment st
+                Map.lookup "Exception" (defaultHandlers env) `shouldBe` Just "DefaultException"
+            it "Sequence has no default handler (special dispatch)" $ do
+                let env = currentEnvironment st
+                Map.lookup "Sequence" (defaultHandlers env) `shouldBe` Nothing
+            it "default handlers are installed on handlerStack" $ do
+                let stackSize = Prelude.length (handlerStack st)
+                let defCount = defaultHandlerCount st
+                defCount `shouldSatisfy` (> 0)
+                stackSize `shouldBe` defCount
 
         describe "P33: Operator Fixity and Precedence" $ do
             it "t1: 2 + 3 * 4 == 14 (mul binds tighter)" $ do

@@ -25,10 +25,17 @@ source-repository head
 
 library
   exposed-modules:
+      Backends.Bytecode.Builtins
+      Backends.Bytecode.Compile
+      Backends.Bytecode.Debug
+      Backends.Bytecode.Instruction
+      Backends.Bytecode.Module
+      Backends.Bytecode.Runner
+      Backends.Bytecode.Value
+      Backends.Bytecode.VM
       Backends.LLVM.CLMToLIR
       Backends.LLVM.LIR
       Backends.LLVM.LIRToLLVM
-      Backends.LLVM.Monomorphize
       Backends.LLVM.NativeCompile
       CaseOptimization
       CLM
@@ -41,6 +48,7 @@ library
       Logs
       MetadataResolver
       ModuleSystem
+      Monomorphize
       Parser
       Pipeline
       State
@@ -173,6 +181,7 @@ test-suite tulam-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      BytecodeSpec
       LLVMSpec
       Paths_tulam
   hs-source-dirs:

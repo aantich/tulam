@@ -157,14 +157,14 @@ desugarActionStmts [ActionExpr e] = e
 desugarActionStmts [ActionBind nm e] = e  -- last statement is bind — just return the expr
 desugarActionStmts [ActionLet nm e] = e   -- last statement is let — just return the expr
 desugarActionStmts (ActionBind nm e : rest) =
-    -- bind(expr, \name -> rest)
-    App (Id "bind") [e, Function (mkLambda "" [Var nm UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
+    -- effectBind(expr, \name -> rest)
+    App (Id "effectBind") [e, Function (mkLambda "" [Var nm UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
 desugarActionStmts (ActionLet nm e : rest) =
     -- let name = expr in rest
     App (Function (mkLambda "" [Var nm UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)) [e]
 desugarActionStmts (ActionExpr e : rest) =
-    -- seq(expr, rest) = bind(expr, \_ -> rest)
-    App (Id "seq") [e, Function (mkLambda "" [Var "_" UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
+    -- effectSeq(expr, \_ -> rest)
+    App (Id "effectSeq") [e, Function (mkLambda "" [Var "_" UNDEFINED UNDEFINED] (desugarActionStmts rest) UNDEFINED)]
 
 --------------------------------------------------------------------------------
 -- PASS 0.25: String literal desugaring
@@ -620,7 +620,9 @@ processBinding (EffectDecl effName effParams ops, si) env = do
     -- Register each operation as a top-level implicit-param function
     -- so they can be called like regular functions and resolved via CLMIAP
     let env2 = Prelude.foldl (registerEffectOp effName effParams) env1 ops
-    pure env2
+    -- Build reverse map: operation name -> effect name
+    let env3 = Prelude.foldl (\e op -> e { effectOps = Map.insert (lamName op) effName (effectOps e) }) env2 ops
+    pure env3
   where
     registerEffectOp eName eParams env0 op =
         let -- Effect type params become implicit params for CLMIAP routing.
@@ -634,14 +636,18 @@ processBinding (EffectDecl effName effParams ops, si) env = do
         in addNamedLambda wrapper env0
 
 -- Handler declaration: register handler implementations
-processBinding (HandlerDecl handlerName effName hParams impls, si) env = do
-    let env1 = env { effectHandlers = Map.insert handlerName (effName, hParams, impls) (effectHandlers env) }
+processBinding (HandlerDecl handlerName effName isDefault hParams impls, si) env = do
+    let env1 = env { effectHandlers = Map.insert handlerName (effName, isDefault, hParams, impls) (effectHandlers env) }
+    -- If this handler is marked as default, register it as the default for its effect
+    let env2 = if isDefault
+               then env1 { defaultHandlers = Map.insert effName handlerName (defaultHandlers env1) }
+               else env1
     -- For stateless handlers (no params), also register as instance lambdas
     -- so intrinsic dispatch can find them as fallback
-    env2 <- if Prelude.null hParams
-            then foldM (registerHandlerImpl effName) env1 [f | f@(Function _) <- impls]
-            else pure env1
-    pure env2
+    env3 <- if Prelude.null hParams
+            then foldM (registerHandlerImpl effName) env2 [f | f@(Function _) <- impls]
+            else pure env2
+    pure env3
   where
     registerHandlerImpl eName env0 (Function lam) = do
         let funcNm = lamName lam
@@ -674,7 +680,7 @@ processTargetDecl targetName si env (Instance structName typeArgs impls _reqs) =
     else do
         -- Store each function/value in the target-qualified instance map
         foldM (addTargetInstanceFunc targetName structName typeNames si) env impls
-processTargetDecl targetName _si env (HandlerDecl handlerName effectName hParams impls) = do
+processTargetDecl targetName _si env (HandlerDecl handlerName effectName _isDefault hParams impls) = do
     pure $ addTargetHandler targetName handlerName (effectName, hParams, impls) env
 processTargetDecl targetName _si env (ExternFunc funcName funcParams retType spec) = do
     pure $ addTargetExtern targetName funcName (funcParams, retType, spec) env
@@ -1383,7 +1389,7 @@ exprToCLM env e@(RecordUpdate _ _) = exprToCLM env (desugarRecordExpr env e)
 exprToCLM env e@(RecordPattern _ _) = exprToCLM env (desugarRecordExpr env e)
 -- Effect system nodes: erased at runtime
 exprToCLM _ (EffectDecl _ _ _) = CLMEMPTY
-exprToCLM _ (HandlerDecl _ _ _ _) = CLMEMPTY
+exprToCLM _ (HandlerDecl _ _ _ _ _) = CLMEMPTY
 exprToCLM env (HandleWith bodyExpr handlerExpr) =
     case resolveHandlerExpr env handlerExpr of
         Just (effName, lets, ops) ->
@@ -1392,6 +1398,14 @@ exprToCLM env (HandleWith bodyExpr handlerExpr) =
                 clmLets = [(lamName l, exprToCLM env (body l)) | Function l <- lets, body l /= UNDEFINED]
             in CLMHANDLE clmBody effName clmLets clmOps
         Nothing -> exprToCLM env bodyExpr  -- unknown handler, just run body
+-- Handler override at call site: func [SilentConsole, MockFileIO] (args)
+-- Desugars to nested CLMHANDLE wrapping the inner call
+exprToCLM env (OverrideApp func overrides args) =
+    let -- Resolve each override to a handler expression
+        handlerOverrides = resolveOverrides env overrides
+        -- Build the inner call as a normal App
+        innerCall = exprToCLM env (App func args)
+    in Prelude.foldr (wrapWithHandler env) innerCall handlerOverrides
 exprToCLM env (ActionBlock stmts) = exprToCLM env (desugarActionStmts stmts)  -- should be desugared by now
 exprToCLM _ (EffType _ _) = CLMEMPTY  -- type-level, erased at runtime
 exprToCLM _ (DeclBlock _) = CLMEMPTY  -- structure member list, should not reach CLM
@@ -1405,14 +1419,14 @@ exprToCLM _ e = CLMERR ("[CLM] cannot convert expr to CLM: " ++ show e) SourceIn
 resolveHandlerExpr :: Environment -> Expr -> Maybe (Name, [Expr], [Expr])
 resolveHandlerExpr env (Id handlerName) =
     case Map.lookup handlerName (effectHandlers env) of
-        Just (effName, _hParams, impls) ->
+        Just (effName, _isDef, _hParams, impls) ->
             let opNames = effectOpNames env effName
                 (ops, lets) = Data.List.partition (isEffectOp opNames) impls
             in Just (effName, lets, ops)
         Nothing -> Nothing
 resolveHandlerExpr env (App (Id handlerName) args) =
     case Map.lookup handlerName (effectHandlers env) of
-        Just (effName, hParams, impls) ->
+        Just (effName, _isDef, hParams, impls) ->
             -- Substitute handler params with provided args in all impl bodies
             let paramNames = Prelude.map Surface.name hParams
                 substPairs = Prelude.zip paramNames args
@@ -1444,6 +1458,32 @@ handlerOpToCLM _ lam | body lam == UNDEFINED = (lamName lam, CLMPRIMCALL)
 handlerOpToCLM env lam =
     let clmLam = lambdaToCLMLambda env lam
     in (lamName lam, CLMLAM clmLam)
+
+-- | Resolve bracket overrides to handler expressions.
+-- Named overrides (Just "Console", expr) are used directly.
+-- Positional overrides (Nothing, expr) are resolved by looking up the handler name.
+-- Returns list of handler expressions (each will be wrapped as CLMHANDLE).
+resolveOverrides :: Environment -> [(Maybe Name, Expr)] -> [Expr]
+resolveOverrides env = Prelude.concatMap resolve
+  where
+    resolve (Just _effName, handlerExpr) = [handlerExpr]  -- named: use directly
+    resolve (Nothing, Id "_") = []  -- wildcard: skip (type inference placeholder)
+    resolve (Nothing, handlerExpr) =
+        -- Check if it's a known handler
+        case handlerExpr of
+            Id nm | Map.member nm (effectHandlers env) -> [handlerExpr]
+            App (Id nm) _ | Map.member nm (effectHandlers env) -> [handlerExpr]
+            _ -> []  -- not a handler — assume it's a type arg, skip
+
+-- | Wrap a CLM expression in a CLMHANDLE for a handler override
+wrapWithHandler :: Environment -> Expr -> CLMExpr -> CLMExpr
+wrapWithHandler env handlerExpr clmBody =
+    case resolveHandlerExpr env handlerExpr of
+        Just (effName, lets, ops) ->
+            let clmOps = [handlerOpToCLM env l | Function l <- ops]
+                clmLets = [(lamName l, exprToCLM env (body l)) | Function l <- lets, body l /= UNDEFINED]
+            in CLMHANDLE clmBody effName clmLets clmOps
+        Nothing -> clmBody  -- couldn't resolve handler, just pass through
 
 -- | Substitute an Id name with a replacement expression
 substId :: Name -> Expr -> Expr -> Expr

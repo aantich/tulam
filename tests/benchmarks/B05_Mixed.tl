@@ -23,8 +23,7 @@ function headOrZero(xs:List(Int)) : Int = match
     | Cons(h, t) -> h;
 
 function benchSort() : Int =
-    let xs = mkDescList(50) in
-    let sorted = isort(xs) in
+    let { xs = mkDescList(50); sorted = isort(xs) } in
     headOrZero(sorted);
 
 // Binary tree operations

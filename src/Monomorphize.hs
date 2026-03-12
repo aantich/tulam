@@ -12,7 +12,7 @@
 --
 -- Design principle: monomorphize where types are available (Surface AST),
 -- not where they've been erased (CLM).
-module Backends.LLVM.Monomorphize
+module Monomorphize
     ( monomorphizeForTarget
     , monomorphizeLambdas
     , resolveImplicitCalls
@@ -21,8 +21,8 @@ module Backends.LLVM.Monomorphize
 
 import qualified Data.HashMap.Strict as Map
 import Data.HashMap.Strict (HashMap)
-import Data.Maybe (mapMaybe, fromMaybe)
-import Data.List (intercalate)
+import Data.Maybe (mapMaybe, fromMaybe, catMaybes)
+import Data.List (intercalate, foldl')
 
 import Surface
 import State
@@ -33,18 +33,19 @@ type TypeEnv = HashMap Name Name
 -- | Monomorphize all top-level and instance lambdas for a given target.
 -- Replaces implicit-param calls (like (+)(x,y)) with target instance bodies
 -- (like __add_i64(x,y)) wherever concrete types can be determined.
+-- Also resolves effect handler operations (putStrLn, readRef, etc.) to their
+-- target handler bodies.
 --
 -- This modifies topLambdas and instanceLambdas in the Environment.
 monomorphizeForTarget :: Name -> Environment -> Environment
 monomorphizeForTarget targetName env =
-    case Map.lookup targetName (targetInstances env) of
-        Nothing -> env  -- no target declarations loaded, nothing to resolve
-        Just tInstances ->
-            let -- Resolve in topLambdas
-                topLams' = Map.map (resolveInLambda env tInstances) (topLambdas env)
-                -- Resolve in instanceLambdas
-                instLams' = Map.map (resolveInLambda env tInstances) (instanceLambdas env)
-            in env { topLambdas = topLams', instanceLambdas = instLams' }
+    let tInstances = fromMaybe Map.empty (Map.lookup targetName (targetInstances env))
+        handlerOps = buildHandlerOpsMap targetName env
+        -- Resolve in topLambdas
+        topLams' = Map.map (resolveInLambda env tInstances handlerOps) (topLambdas env)
+        -- Resolve in instanceLambdas
+        instLams' = Map.map (resolveInLambda env tInstances handlerOps) (instanceLambdas env)
+    in env { topLambdas = topLams', instanceLambdas = instLams' }
 
 -- | Monomorphize specific sets of lambdas, using the full environment for lookups.
 -- This is for reachability-driven compilation: we only transform the reachable
@@ -55,21 +56,34 @@ monomorphizeLambdas :: Name                  -- ^ Target name
                     -> HashMap Name Lambda   -- ^ Instance lambdas to transform
                     -> (HashMap Name Lambda, HashMap Name Lambda)
 monomorphizeLambdas targetName env topLams instLams =
-    case Map.lookup targetName (targetInstances env) of
-        Nothing -> (topLams, instLams)
-        Just tInstances ->
-            ( Map.map (resolveInLambda env tInstances) topLams
-            , Map.map (resolveInLambda env tInstances) instLams
-            )
+    let tInstances = fromMaybe Map.empty (Map.lookup targetName (targetInstances env))
+        handlerOps = buildHandlerOpsMap targetName env
+    in ( Map.map (resolveInLambda env tInstances handlerOps) topLams
+       , Map.map (resolveInLambda env tInstances handlerOps) instLams
+       )
+
+-- | Build a map from effect operation name → handler Lambda body.
+-- Extracts function implementations from all target handlers.
+-- E.g., "putStrLn" → Lambda with body `action { __print_string(s); __print_newline() }`
+buildHandlerOpsMap :: Name -> Environment -> HashMap Name Lambda
+buildHandlerOpsMap targetName env =
+    case Map.lookup targetName (targetHandlers env) of
+        Nothing -> Map.empty
+        Just handlers ->
+            Map.fromList
+                [ (lamName lam, lam)
+                | (_handlerName, (_effectName, _params, impls)) <- Map.toList handlers
+                , Function lam <- impls
+                ]
 
 -- | Resolve implicit-param calls within a single Lambda.
 -- Builds a TypeEnv from the Lambda's parameters, then walks the body.
-resolveInLambda :: Environment -> NameMap Lambda -> Lambda -> Lambda
-resolveInLambda env tInstances lam =
+resolveInLambda :: Environment -> NameMap Lambda -> HashMap Name Lambda -> Lambda -> Lambda
+resolveInLambda env tInstances handlerOps lam =
     let -- Build type env from params: name → concrete type name
         typeEnv = buildTypeEnv (params lam)
         -- Resolve the body
-        body' = resolveImplicitCalls env tInstances typeEnv (body lam)
+        body' = resolveImplicitCalls env tInstances handlerOps typeEnv (body lam)
     in lam { body = body' }
 
 -- | Build a type environment from function parameters.
@@ -92,8 +106,9 @@ exprToTypeName _ = Nothing
 
 -- | Walk a Surface expression, resolving implicit-param function calls
 -- to their target instance bodies where possible.
-resolveImplicitCalls :: Environment -> NameMap Lambda -> TypeEnv -> Expr -> Expr
-resolveImplicitCalls env tInstances typeEnv = go
+-- Also resolves effect handler operations (putStrLn, readRef, etc.).
+resolveImplicitCalls :: Environment -> NameMap Lambda -> HashMap Name Lambda -> TypeEnv -> Expr -> Expr
+resolveImplicitCalls env tInstances handlerOps typeEnv = go
   where
     go expr = case expr of
         -- The key case: function application where funcName has implicit params
@@ -101,40 +116,60 @@ resolveImplicitCalls env tInstances typeEnv = go
             case lookupLambda funcName env of
                 Just fun | hasImplicit fun ->
                     let args' = map go args  -- resolve nested calls first
-                        argTypes = map (inferExprTypeName env typeEnv) args'
-                    in case sequence argTypes of
-                        Just types ->
-                            -- Try to resolve: first exact multi-param key, then single-param
-                            case resolveTargetInstanceMulti tInstances funcName types of
-                                Just resolvedBody ->
-                                    -- Substitute instance params with actual args
-                                    substituteInstanceBody resolvedBody args'
-                                Nothing ->
-                                    -- No target instance — leave as-is for interpreter/CLMIAP
-                                    App (Id funcName) args'
-                        Nothing ->
-                            -- Can't determine all types — leave as-is
-                            App (Id funcName) args'
+                    in  -- Try handler operation first (putStrLn, readRef, etc.)
+                        case Map.lookup funcName handlerOps of
+                            Just handlerLam ->
+                                -- Recursively resolve the substituted body
+                                go (substituteInstanceBody handlerLam args')
+                            Nothing ->
+                                -- Try target instance (algebra methods)
+                                let argTypes = map (inferExprTypeName env typeEnv) args'
+                                in case sequence argTypes of
+                                    Just types ->
+                                        case resolveTargetInstanceMulti tInstances funcName types of
+                                            Just resolvedBody ->
+                                                go (substituteInstanceBody resolvedBody args')
+                                            Nothing ->
+                                                App (Id funcName) args'
+                                    Nothing ->
+                                        -- Partial type dispatch: try with just the known types.
+                                        -- Handles cases like `v == 1` where v's type is unknown
+                                        -- but 1's type (Int) suffices for dispatch (algebra methods
+                                        -- have same type for all params).
+                                        let knownTypes = nub' (catMaybes argTypes)
+                                        in if null knownTypes
+                                            then App (Id funcName) args'
+                                            else case resolveTargetInstanceMulti tInstances funcName knownTypes of
+                                                Just resolvedBody ->
+                                                    go (substituteInstanceBody resolvedBody args')
+                                                Nothing ->
+                                                    App (Id funcName) args'
                 _ ->
                     -- Not an implicit-param function — just recurse into args
                     App (Id funcName) (map go args)
 
-        -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`)
+        -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`, `readLine`)
         Id funcName ->
             case lookupLambda funcName env of
-                Just fun | hasImplicit fun -> expr  -- can't resolve without type context
+                Just fun | hasImplicit fun ->
+                    -- Try handler operation (nullary like readLine())
+                    case Map.lookup funcName handlerOps of
+                        Just handlerLam -> substituteInstanceBody handlerLam []
+                        Nothing -> expr  -- can't resolve without type context
                 _ -> expr
 
         -- Recurse into all other expression forms
         App f args -> App (go f) (map go args)
         Function lam ->
             let innerTypeEnv = Map.union (buildTypeEnv (params lam)) typeEnv
-            in Function $ lam { body = resolveImplicitCalls env tInstances innerTypeEnv (body lam) }
+            in Function $ lam { body = resolveImplicitCalls env tInstances handlerOps innerTypeEnv (body lam) }
         LetIn binds bodyExpr ->
-            -- Extend type env with let bindings where possible
+            -- Extend type env with let bindings where possible.
+            -- First resolve RHS expressions, then infer types from resolved forms.
             let binds' = map (\(v, ex) -> (v, go ex)) binds
-                letTypeEnv = Map.union (buildTypeEnvFromLetPairs binds') typeEnv
-                bodyExpr' = resolveImplicitCalls env tInstances letTypeEnv bodyExpr
+                inferredEnv = buildTypeEnvFromLetPairs env typeEnv binds'
+                letTypeEnv = Map.union inferredEnv typeEnv
+                bodyExpr' = resolveImplicitCalls env tInstances handlerOps letTypeEnv bodyExpr
             in LetIn binds' bodyExpr'
         Typed e t -> Typed (go e) t
         ExpandedCase checks bodyExpr si ->
@@ -162,38 +197,76 @@ resolveImplicitCalls env tInstances typeEnv = go
     goActionStmt (ActionBind n e) = ActionBind n (go e)
     goActionStmt (ActionLet n e) = ActionLet n (go e)
 
--- | Try to build type env from let bindings (infer from Var types)
-buildTypeEnvFromLetPairs :: [(Var, Expr)] -> TypeEnv
-buildTypeEnvFromLetPairs = Map.fromList . mapMaybe inferFromBinding
+-- | Build type env from let bindings.
+-- First tries explicit Var type annotations, then infers from the RHS expression.
+-- Uses foldl' so later bindings can see types inferred from earlier ones.
+buildTypeEnvFromLetPairs :: Environment -> TypeEnv -> [(Var, Expr)] -> TypeEnv
+buildTypeEnvFromLetPairs env outerTypeEnv = foldl' addBinding Map.empty
   where
-    inferFromBinding (Var n t _, _) = case exprToTypeName t of
-        Just tn -> Just (n, tn)
-        Nothing -> Nothing
+    addBinding acc (Var n t _, rhs) =
+        case exprToTypeName t of
+            Just tn -> Map.insert n tn acc
+            Nothing ->
+                -- Try to infer from RHS expression using accumulated + outer env
+                let currentEnv = Map.union acc outerTypeEnv
+                in case inferExprTypeName env currentEnv rhs of
+                    Just tn -> Map.insert n tn acc
+                    Nothing -> acc
 
 -- | Infer the concrete type name of a Surface expression.
 -- Uses the type environment (param types), literal types, and constructor info.
 inferExprTypeName :: Environment -> TypeEnv -> Expr -> Maybe Name
--- Variables: look up in type env
-inferExprTypeName _ typeEnv (Id n) = Map.lookup n typeEnv
+-- Variables and constructors as Id
+inferExprTypeName env typeEnv (Id n) =
+    -- First try type env (for variables with known types)
+    case Map.lookup n typeEnv of
+        Just tn -> Just tn
+        Nothing ->
+            -- Try nullary constructor (True, False, Nothing, Unit, etc.)
+            if not (null n) && head n >= 'A' && head n <= 'Z'
+                then lookupTypeOfConstructor n env
+                else Nothing
 -- Literals: known types
 inferExprTypeName _ _ (Lit lit) = litTypeName lit
 -- Typed annotation: extract the type
 inferExprTypeName _ _ (Typed _ t) = exprToTypeName t
--- Constructor application: look up constructor's parent type
-inferExprTypeName env _ (App (Id cname) _) =
-    case lookupConstructor cname env of
+-- Application: could be constructor, function call, or extern call
+inferExprTypeName env _ (App (Id n) _) =
+    -- Try constructor first
+    case lookupConstructor n env of
         Just (lam, _) -> exprToTypeName (lamType lam)
-        Nothing -> Nothing
+        Nothing ->
+            -- Try function
+            case lookupLambda n env of
+                Just lam -> exprToTypeName (lamType lam)
+                Nothing ->
+                    -- Try target extern
+                    lookupExternRetType n env
 -- Nullary constructor: same
 inferExprTypeName env _ (ConTuple (ConsTag cname _) _) =
     lookupTypeOfConstructor cname env
--- Function call: return type of the function
-inferExprTypeName env _ (App (Id fname) _) =
-    case lookupLambda fname env of
-        Just lam -> exprToTypeName (lamType lam)
-        Nothing -> Nothing
+-- IfThenElse: infer from then branch
+inferExprTypeName env typeEnv (IfThenElse _ thenBr _) =
+    inferExprTypeName env typeEnv thenBr
+-- LetIn: infer from body (the result type)
+inferExprTypeName env typeEnv (LetIn binds bodyExpr) =
+    let inferredEnv = buildTypeEnvFromLetPairs env typeEnv binds
+        letTypeEnv = Map.union inferredEnv typeEnv
+    in inferExprTypeName env letTypeEnv bodyExpr
+-- ActionBlock: result type is Unit
+inferExprTypeName _ _ (ActionBlock _) = Just "Unit"
 -- Can't determine
 inferExprTypeName _ _ _ = Nothing
+
+-- | Look up the return type of a target extern function.
+-- Searches all targets (typically just "native").
+lookupExternRetType :: Name -> Environment -> Maybe Name
+lookupExternRetType fname env =
+    let allTargetExts = Map.elems (targetExterns env)
+    in firstJust [case Map.lookup fname te of
+            Just (_, retTy, _) -> exprToTypeName retTy
+            Nothing -> Nothing
+        | te <- allTargetExts]
 
 -- | Look up a target instance for a function + concrete types.
 -- Tries multi-param key first, then deduped, then single-param for each unique type.

@@ -28,8 +28,5 @@ function listLen(xs:List(a)) : Int = match
     | Cons(h, t) -> 1 + listLen(t);
 
 function benchDispatch() : Int =
-    let xs = mkRange(1, 100) in
-    let s = sumList(xs) in
-    let comps = compareAll(xs) in
-    let strs = showAll(xs) in
+    let { xs = mkRange(1, 100); s = sumList(xs); comps = compareAll(xs); strs = showAll(xs) } in
     s + listLen(comps) + listLen(strs);

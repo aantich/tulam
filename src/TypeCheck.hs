@@ -73,6 +73,7 @@ data TCError
 data Constraint
   = CStructure Name [Expr]         -- ^ e.g. CStructure "Eq" [Meta 3]
   | CRowLack Name Expr             -- ^ Field absence constraint for row unification
+  | CEffect Name                   -- ^ Effect requirement: this function needs effect E (e.g. CEffect "Console")
   deriving (Show)
 
 data TCState = TCState
@@ -294,8 +295,9 @@ normalizeTypeExpr (RecordConstruct _ _) = freshMeta
 normalizeTypeExpr (RecordUpdate _ _) = freshMeta
 normalizeTypeExpr (RecordPattern _ _) = freshMeta
 normalizeTypeExpr (EffectDecl _ _ _) = freshMeta
-normalizeTypeExpr (HandlerDecl _ _ _ _) = freshMeta
+normalizeTypeExpr (HandlerDecl _ _ _ _ _) = freshMeta
 normalizeTypeExpr (HandleWith _ _) = freshMeta
+normalizeTypeExpr (OverrideApp _ _ _) = freshMeta
 normalizeTypeExpr (FixityDecl _ _ _) = freshMeta
 normalizeTypeExpr (ERROR msg) =
   tcWarn (OtherError $ "Error node in type position: " ++ msg) `tcBind` \_ -> freshMeta
@@ -1002,6 +1004,8 @@ lookupFromCompilerEnv name cenv =
             (if hasImplicit lam
              then emitStructConstraint name lam
              else tcPure ()) `tcBind` \_ ->
+              -- Emit effect constraint if this function is an effect operation
+              emitEffectConstraint name cenv `tcBind` \_ ->
               -- Instantiate free type variables (standard HM polymorphism).
               -- After instantiate strips Pi-bound type vars, remaining lowercase
               -- Ids (like 'a', 'b' in structure method sigs) need fresh metas.
@@ -1012,6 +1016,14 @@ lookupFromCompilerEnv name cenv =
           case lookupType name cenv of
             Just _ -> tcPure (Just (U (LConst 0)))
             Nothing -> tcPure Nothing
+
+-- | Emit an effect constraint if the function is a known effect operation.
+-- Looks up the function name in the effectOps reverse map.
+emitEffectConstraint :: Name -> Environment -> TC ()
+emitEffectConstraint funcName cenv =
+  case Map.lookup funcName (effectOps cenv) of
+    Just effName -> tcModify (\st -> st { constraints = CEffect effName : constraints st })
+    Nothing -> tcPure ()
 
 -- | Emit a structure constraint for an implicit-param function
 emitStructConstraint :: Name -> Lambda -> TC ()
@@ -1349,13 +1361,15 @@ infer (TargetSwitch _) = tcPure (Id "Unit")
 
 -- Effect system nodes
 infer (EffectDecl _ _ _) = tcPure (Id "Unit")
-infer (HandlerDecl _ _ _ _) = tcPure (Id "Unit")
+infer (HandlerDecl _ _ _ _ _) = tcPure (Id "Unit")
 infer (HandleWith computation _handler) =
   infer computation `tcBind` \compTy ->
     applySubst compTy `tcBind` \compTy' ->
       case compTy' of
         EffType _row resTy -> tcPure resTy
         _ -> tcPure compTy'
+-- Handler override at call site: func [overrides] (args) — infer the inner call
+infer (OverrideApp func _overrides args) = infer (App func args)
 infer (ActionBlock stmts) =
   case stmts of
     [] -> tcPure (Id "Unit")
@@ -1626,6 +1640,7 @@ resolveConstraints = resolveLoop 10
         in if Prelude.any (== "") typeNames then tcPure ()
            else tcWarnOrFail (ConstraintUnsolved (CStructure structName resolvedArgs))
     warnOne _ (CRowLack _ _) = tcPure ()
+    warnOne _ (CEffect _) = tcPure ()  -- effect constraints are informational, not warnings
 
     resolveOnce =
       tcGet `tcBind` \st ->
@@ -1653,6 +1668,9 @@ resolveConstraints = resolveLoop 10
                  _ -> tcPure ()
     resolveOne _ (CRowLack n e) =
       tcModify (\s -> s { constraints = CRowLack n e : constraints s })
+    -- Effect constraints are satisfied by default handlers at runtime.
+    -- In the future, purity enforcement will make this stricter.
+    resolveOne _ (CEffect _effName) = tcPure ()
 
     instanceExists cenv funcName typeNames =
       case lookupInstanceLambda funcName typeNames cenv of
@@ -1750,7 +1768,7 @@ checkTopLevel (Instance structName targs impls _reqs) =
     isLowercaseFreeVar (c:_) = c >= 'a' && c <= 'z'
 
 checkTopLevel (EffectDecl _ _ _) = tcPure ()
-checkTopLevel (HandlerDecl _ _ _ _) = tcPure ()
+checkTopLevel (HandlerDecl _ _ _ _ _) = tcPure ()
 
 checkTopLevel (SumType lam) =
   tcWithContext ("type " ++ lamName lam) $

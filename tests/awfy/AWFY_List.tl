@@ -33,3 +33,8 @@ function benchList() : Int =
     listLength(result);
 
 function verifyList() : Bool = benchList() == 10;
+
+function main() : Unit =
+    let { result = benchList(); u = putStrLn("AWFY List: " ++ show(result)) } in
+    if verifyList() then putStrLn("PASS")
+    else putStrLn("FAIL: expected 10");

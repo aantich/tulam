@@ -3,6 +3,7 @@ module Main where
 
 import System.Console.Haskeline
 import System.Directory
+import System.FilePath (takeDirectory)
 import System.Exit
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
@@ -22,10 +23,12 @@ import CLM (pprSummary)
 import Interpreter
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
-import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses)
+import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses, extractDependencies, resolveModulePath)
 import Interface (cacheVersion, toCachePath, ensureCacheDir)
 import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 import Backends.LLVM.NativeCompile (compileNative, CompileResult(..), NativeConfig(..), defaultNativeConfig)
+import Backends.Bytecode.Runner (runBytecode, compileToBytecode, BytecodeResult(..))
+import Backends.Bytecode.Module (dumpModule)
 
 import Text.Pretty.Simple (pPrint, pShow)
 
@@ -411,6 +414,9 @@ processCommand (":set":s:xs) = processSet s xs
 processCommand (":compile":"native":args) = compileNativeCmd args False
 processCommand (":compile":"native-ir":args) = compileNativeCmd args True
 processCommand (":compile":_) = liftIO $ putStrLn "Usage: :compile native [funcName] | :compile native-ir [funcName]"
+processCommand (":bc":"run":args) = runBytecodeCmd args
+processCommand (":bc":"disasm":args) = disasmBytecodeCmd args
+processCommand (":bc":_) = liftIO $ putStrLn "Usage: :bc run <funcName> | :bc disasm <funcName>"
 processCommand (":inspect":name:_) = inspectName name
 processCommand (":inspect":_) = liftIO $ putStrLn "Usage: :inspect <name>"
 processCommand (":list":"types":"-d":_) = do
@@ -589,6 +595,29 @@ compileNativeCmd args emitIR = do
                 CompileIR ir   -> liftIO $ putStr ir
                 CompileError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Error: " ++ e
 
+-- | Run function(s) via bytecode VM.
+runBytecodeCmd :: [String] -> IntState ()
+runBytecodeCmd [] = liftIO $ putStrLn "Usage: :bc run <funcName> [funcName2 ...]"
+runBytecodeCmd args = do
+    st <- get
+    let env = currentEnvironment st
+    result <- liftIO $ runBytecode env st args
+    case result of
+        BCRunOK val    -> liftIO $ putStrLn $ TC.as [TC.bold, TC.green] "Result: " ++ show val
+        BCCompileError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Compile error: " ++ e
+        BCRuntimeError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Runtime error: " ++ e
+        BCDisassembly d  -> liftIO $ putStr d
+
+-- | Disassemble function(s) to bytecode.
+disasmBytecodeCmd :: [String] -> IntState ()
+disasmBytecodeCmd [] = liftIO $ putStrLn "Usage: :bc disasm <funcName> [funcName2 ...]"
+disasmBytecodeCmd args = do
+    st <- get
+    let env = currentEnvironment st
+    case compileToBytecode env st args of
+        Left err -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Error: " ++ err
+        Right bm -> liftIO $ putStr (dumpModule bm)
+
 -- various environment settings
 -- processSet :: String -> IntState ()
 processSet "strict" _ = do
@@ -643,6 +672,13 @@ processSet "coverage" ("on":_) = do
 processSet "coverage" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = False} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking off"
+
+processSet "purity" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkPurity = True} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "purity checking on" ++ " (effect ops outside action blocks will warn)"
+processSet "purity" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { checkPurity = False} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "purity checking off"
 
 processSet "stricttypes" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = True } })
@@ -720,20 +756,33 @@ setOptPass nm val = do
 loadFileNew :: String -> IntState ()
 loadFileNew nm = do
     liftIO $ putStrLn $ "Loading file: " ++ nm
+    -- Add the file's directory to search paths so imports resolve relative to it
+    let fileDir = takeDirectory nm
+    st0 <- get
+    when (fileDir /= "" && fileDir `notElem` libSearchPaths st0) $
+        modify (\s -> s { libSearchPaths = fileDir : libSearchPaths s })
     fileText <- liftIO (T.readFile nm)
     res <- parseWholeFile fileText nm
-    -- liftIO $ putStrLn $ T.unpack fileText
-    -- liftIO $ print res
     st <- get
-    -- liftIO $ print (newParsedModule st)
     let srcs = Map.insert nm fileText (loadedSources st)
     put $ st { currentSource = fileText, loadedSources = srcs }
     -- liftIO $ print st
     case res of
         Left err -> liftIO ( putStrLn $ "There were " ++ TC.as [TC.red] "parsing errors:") >> liftIO (putStrLn $ showSyntaxError fileText err)
-        -- desugaring on the first pass
         Right exprs -> do
-                -- liftIO (mapM_ (putStrLn . show) exprs) 
+                -- Resolve and load any imported modules this file needs
+                st1 <- get
+                let deps = extractDependencies exprs
+                when (not (Prelude.null deps)) $ do
+                    let searchPaths = libSearchPaths st1
+                    depFiles <- liftIO $ mapM (resolveModulePath searchPaths) deps
+                    let validDeps = [(d, fp) | (d, Just fp) <- zip deps depFiles]
+                    forM_ validDeps $ \(depPath, depFile) -> do
+                        let depKey = intercalate "." depPath
+                        loaded <- gets (loadedModules . currentModuleEnv)
+                        when (not (Map.member depKey loaded)) $ do
+                            liftIO $ putStrLn $ "  Loading dependency: " ++ depKey
+                            loadFileQuiet depFile
                 liftIO (putStrLn "... successfully loaded.")
                 liftIO (putStrLn $ "Received " ++ show (length (parsedModule st)) ++ " statements.")
                 liftIO (putStrLn $ "Executing pass 0: " ++ TC.as [TC.bold, TC.underlined] "after parser desugaring")
@@ -804,6 +853,7 @@ runInterpreter :: InputTState ()
 runInterpreter = do
     liftIO $ putStrLn "Loading standard library..."
     lift $ loadModuleTree baseModulePath
+    lift $ installDefaultHandlers
     liftIO $ putStrLn "Ready."
     loop
 

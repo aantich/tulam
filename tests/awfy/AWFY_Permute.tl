@@ -2,9 +2,7 @@
 // Generates all permutations of n elements, counting via a mutable counter.
 
 function swap(v:MutArray(Int), i:Int, j:Int) : Unit =
-    let a = mutRead(v, i) in
-    let b = mutRead(v, j) in
-    let u = mutWrite(v, i, b) in
+    let { a = mutRead(v, i); b = mutRead(v, j); u = mutWrite(v, i, b) } in
     mutWrite(v, j, a);
 
 function permuteInner(v:MutArray(Int), n:Int, count:Ref(Int)) : Unit =
@@ -14,17 +12,11 @@ function permuteInner(v:MutArray(Int), n:Int, count:Ref(Int)) : Unit =
 function permuteLoop(v:MutArray(Int), n:Int, i:Int, count:Ref(Int)) : Unit =
     if i < 0 then Unit
     else
-        let u1 = swap(v, n, i) in
-        let u2 = permuteInner(v, n - 1, count) in
-        let u3 = swap(v, n, i) in
+        let { u1 = swap(v, n, i); u2 = permuteInner(v, n - 1, count); u3 = swap(v, n, i) } in
         permuteLoop(v, n, i - 1, count);
 
 function benchPermute() : Int =
-    let n = 6 in
-    let v = newMutArray(n, 0) in
-    let count = newRef(0) in
-    let u = initPermuteArr(v, 0, n) in
-    let u2 = permuteInner(v, n - 1, count) in
+    let { n = 6; v = newMutArray(n, 0); count = newRef(0); u = initPermuteArr(v, 0, n); u2 = permuteInner(v, n - 1, count) } in
     readRef(count);
 
 function initPermuteArr(v:MutArray(Int), i:Int, n:Int) : Unit =
@@ -34,3 +26,8 @@ function initPermuteArr(v:MutArray(Int), i:Int, n:Int) : Unit =
         initPermuteArr(v, i + 1, n);
 
 function verifyPermute() : Bool = benchPermute() == 720;
+
+function main() : Unit =
+    let { result = benchPermute(); u = putStrLn("AWFY Permute: " ++ show(result)) } in
+    if verifyPermute() then putStrLn("PASS")
+    else putStrLn("FAIL: expected 720");

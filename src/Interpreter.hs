@@ -41,6 +41,35 @@ addBinding ex@(Binding _) = do
     put s'
 addBinding e = liftIO $ putStrLn $ "Cant add binding for expr " ++ ppr e
 
+-- | Install default handlers for all effects that have a default handler declared.
+-- Default handlers are appended to the BOTTOM of the handler stack so that
+-- explicit handle...with blocks (pushed on top) override them.
+installDefaultHandlers :: IntState ()
+installDefaultHandlers = do
+    s <- get
+    let env = currentEnvironment s
+    let defaults = Map.toList (defaultHandlers env)
+    newEntries <- catMaybes <$> mapM (buildDefaultEntry env) defaults
+    let stack = handlerStack s
+    put $ s { handlerStack = stack ++ newEntries
+            , defaultHandlerCount = Prelude.length newEntries }
+  where
+    buildDefaultEntry env (effName, handlerName) =
+        case Map.lookup handlerName (effectHandlers env) of
+            Just (_eff, _isDef, hParams, impls) | Prelude.null hParams -> do
+                -- Parameterless handler: build op map from implementations
+                let opNames = effectOpNames env effName
+                let ops = [(lamName l, opToCLM env l) | Function l <- impls, lamName l `elem` opNames]
+                -- Evaluate let bindings (for handlers like RefState — but default should be parameterless)
+                let lets = [(lamName l, exprToCLM env (body l)) | Function l <- impls, lamName l `notElem` opNames, body l /= UNDEFINED]
+                -- For now we skip let evaluation since default handlers should be simple
+                let opMap = Map.fromList ops
+                pure $ Just (effName, opMap)
+            _ -> pure Nothing  -- parameterized or not found — skip
+    opToCLM _env lam | body lam == Intrinsic = CLMPRIMCALL
+    opToCLM _env lam | body lam == UNDEFINED = CLMPRIMCALL
+    opToCLM env lam = CLMLAM (lambdaToCLMLambda env lam)
+
 processInteractive :: Expr -> IntState ()
 processInteractive ex0 = do
     s <- get
@@ -726,16 +755,19 @@ dispatchHandlerOp funcNm args = do
                 result' <- _contEval 1 impl result
                 pure (Just result')
 
--- When handler stack is non-empty, seq/bind need to work as simple sequencing
+-- When an explicit (non-default) handler is on the stack, seq/bind work as simple sequencing
 -- even when no Monad instance is available for the result type.
 -- seq(a, f) → f(a)   where f is a lambda
 -- bind(a, f) → f(a)  where f is a lambda
+-- NOTE: Only fires when there are explicit handlers above the default handlers.
+-- Default handlers alone (Console/FileIO/etc.) should NOT trigger this.
 dispatchEffectSequencing :: Name -> [CLMExpr] -> IntState (Maybe CLMExpr)
 dispatchEffectSequencing funcNm args = do
     s <- get
     let stack = handlerStack s
-    case (stack, funcNm, args) of
-        (_:_, nm, [a, CLMLAM lam]) | nm == "seq" || nm == "bind" -> do
+    let hasExplicitHandlers = Prelude.length stack > defaultHandlerCount s
+    case (hasExplicitHandlers, funcNm, args) of
+        (True, nm, [a, CLMLAM lam]) | nm `elem` ["effectSeq", "effectBind", "seq", "bind"] -> do
             result <- evalCLM 0 (applyCLMLam lam [a])
             result' <- _contEval 1 (applyCLMLam lam [a]) result
             pure (Just result')

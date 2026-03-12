@@ -31,7 +31,7 @@ import GHC.Generics (Generic)
 -- | Cache format version. Bump this when Environment/CLM/Surface types change
 -- to auto-invalidate stale caches.
 cacheVersion :: Int
-cacheVersion = 10  -- v10: Environment gains targetInstances/targetHandlers/targetExterns, ExternFunc AST node
+cacheVersion = 11  -- v11: HandlerDecl gains isDefault Bool, Environment gains effectOps/defaultHandlers
 
 -- | Cached module: an Environment slice + metadata for freshness checking.
 data ModuleCache = ModuleCache

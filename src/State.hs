@@ -93,6 +93,8 @@ sliceEnvironment keepNames env = env
     , reprMap = Map.filterWithKey (\k _ -> Set.member k keepNames) (reprMap env)
     , effectDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectDecls env)
     , effectHandlers = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectHandlers env)
+    , effectOps = Map.filterWithKey (\k _ -> Set.member k keepNames) (effectOps env)
+    , defaultHandlers = Map.filterWithKey (\k _ -> Set.member k keepNames) (defaultHandlers env)
     , classDecls = Map.filterWithKey (\k _ -> Set.member k keepNames) (classDecls env)
     -- classTagCounter, targetImports, outProgram, raw*, target* kept as-is
     }
@@ -125,6 +127,8 @@ mergeEnvironment base overlay = Environment
     , reprMap = Map.union (reprMap overlay) (reprMap base)
     , effectDecls = Map.union (effectDecls overlay) (effectDecls base)
     , effectHandlers = Map.union (effectHandlers overlay) (effectHandlers base)
+    , effectOps = Map.union (effectOps overlay) (effectOps base)
+    , defaultHandlers = Map.union (defaultHandlers overlay) (defaultHandlers base)
     , classDecls = Map.union (classDecls overlay) (classDecls base)
     , classTagCounter = max (classTagCounter overlay) (classTagCounter base)
     , targetImports = targetImports overlay ++ targetImports base
@@ -173,8 +177,12 @@ data Environment = Environment {
     reprMap :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)],
     -- effect declarations: effect name -> (params, operations)
     effectDecls :: NameMap ([Var], [Lambda]),
-    -- effect handlers: handler name -> (effect name, params, implementations)
-    effectHandlers :: NameMap (Name, [Var], [Expr]),
+    -- effect handlers: handler name -> (effect name, isDefault, params, implementations)
+    effectHandlers :: NameMap (Name, Bool, [Var], [Expr]),
+    -- Reverse map: operation name -> effect name (e.g., "putStrLn" -> "Console")
+    effectOps :: NameMap Name,
+    -- Default handler for each effect: effect name -> handler name
+    defaultHandlers :: NameMap Name,
     -- Class hierarchy
     classDecls :: NameMap ClassMeta,
     classTagCounter :: !Int,
@@ -246,6 +254,8 @@ instance Binary Environment where
         putHashMap (reprMap env)
         putHashMap (effectDecls env)
         putHashMap (effectHandlers env)
+        putHashMap (effectOps env)
+        putHashMap (defaultHandlers env)
         putHashMap (classDecls env)
         Bin.put (classTagCounter env)
         Bin.put (targetImports env)
@@ -259,6 +269,7 @@ instance Binary Environment where
     get = Environment <$> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap  -- effectOps, defaultHandlers
                       <*> getHashMap <*> Bin.get <*> Bin.get <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getNestedHashMap <*> getNestedHashMap <*> getNestedHashMap
@@ -276,6 +287,8 @@ initialEnvironment = Environment {
     reprMap = Map.empty,
     effectDecls = Map.empty,
     effectHandlers = Map.empty,
+    effectOps = Map.empty,
+    defaultHandlers = Map.empty,
     classDecls = Map.empty,
     classTagCounter = 1000,
     targetImports = [],
@@ -344,6 +357,9 @@ data InterpreterState = InterpreterState {
     -- Effect handler stack: [(effectName, opName → implementation)]
     -- Head of list = innermost handler (checked first)
     handlerStack   :: [(Name, HashMap Name CLMExpr)],
+    -- Number of default handlers installed at the bottom of the handler stack.
+    -- Used by dispatchEffectSequencing to know if explicit handlers are active.
+    defaultHandlerCount :: !Int,
     -- Type checker error count (per-module, reset before each typecheck pass)
     tcErrorCount   :: !Int,
     -- Accumulated TC error messages (across all modules, for diagnostics)
@@ -359,7 +375,7 @@ instance Show InterpreterState where
         ++ " }"
 
 emptyIntState = InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True False,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -372,6 +388,7 @@ emptyIntState = InterpreterState {
     mutArrayTable = Map.empty,
     nextMutArrayId = 0,
     handlerStack = [],
+    defaultHandlerCount = 0,
     tcErrorCount = 0,
     tcCollectedErrors = []
 }
@@ -400,6 +417,7 @@ data CurrentFlags = CurrentFlags {
   , checkPositivity   :: Bool -- positivity checking for inductive types
   , checkTermination  :: Bool -- termination checking for recursive functions
   , checkCoverage     :: Bool -- pattern match coverage checking
+  , checkPurity       :: Bool -- effect purity checking (warn when effect ops called outside action blocks)
 } deriving Show
 
 -- Safety limits for evaluation
@@ -411,7 +429,7 @@ maxEvalDepth = 1000
 
 initializeInterpreter :: IO InterpreterState
 initializeInterpreter = return $ InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True,
+    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True False,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -424,6 +442,7 @@ initializeInterpreter = return $ InterpreterState {
     mutArrayTable = Map.empty,
     nextMutArrayId = 0,
     handlerStack = [],
+    defaultHandlerCount = 0,
     tcErrorCount = 0,
     tcCollectedErrors = []
 }
@@ -497,7 +516,9 @@ traverseExprM f (RecordPattern nm fields) = RecordPattern nm <$> mapM (\(n,e) ->
 traverseExprM _ e@(FixityDecl _ _ _) = pure e
 -- Effect system nodes
 traverseExprM _ e@(EffectDecl _ _ _) = pure e
-traverseExprM _ e@(HandlerDecl _ _ _ _) = pure e
+traverseExprM _ e@(HandlerDecl _ _ _ _ _) = pure e
+traverseExprM f (OverrideApp func overrides args) =
+    OverrideApp <$> f func <*> mapM (\(mn, e) -> (,) mn <$> f e) overrides <*> mapM f args
 traverseExprM f (HandleWith e h) = HandleWith <$> f e <*> f h
 traverseExprM f (ActionBlock stmts) = ActionBlock <$> mapM (traverseActionStmtM f) stmts
 traverseExprM f (EffType row res) = EffType <$> f row <*> f res

@@ -17,8 +17,7 @@ function mulNat(a:Nat, b:Nat) : Nat = match
     | Succ(m), b -> addNat(b, mulNat(m, b));
 
 function benchPattern() : Int =
-    let n8 = intToNat(8) in
-    let n6 = intToNat(6) in
+    let { n8 = intToNat(8); n6 = intToNat(6) } in
     natToInt(mulNat(n8, n6));
 
 // List operations with heavy pattern matching
@@ -38,7 +37,5 @@ function mkList(n:Int) : List(Int) =
     if n <= 0 then Nil else Cons(n, mkList(n - 1));
 
 function benchListOps() : Int =
-    let xs = mkList(200) in
-    let doubled = listMap(fn(x) = x * 2, xs) in
-    let filtered = listFilter(fn(x) = x > 100, doubled) in
+    let { xs = mkList(200); doubled = listMap(fn(x) = x * 2, xs); filtered = listFilter(fn(x) = x > 100, doubled) } in
     listLength(filtered);

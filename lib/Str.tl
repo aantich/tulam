@@ -68,8 +68,7 @@ function isContinuation(b:Byte) : Bool =
 function decodeAt(bytes:Array(Byte), i:Int) : Maybe(Pair(Int, Int)) =
     if i >= size(bytes) then Nothing
     else
-        let b0 = byteToInt(index(bytes, i)) in
-        let seqLen = utf8SeqLen(intToByte(b0)) in
+        let { b0 = byteToInt(index(bytes, i)); seqLen = utf8SeqLen(intToByte(b0)) } in
         if seqLen == 0 then Nothing
         else if seqLen == 1 then Just(Pair(b0, i + 1))
         else if i + seqLen > size(bytes) then Nothing
@@ -80,17 +79,14 @@ function decodeAt(bytes:Array(Byte), i:Int) : Maybe(Pair(Int, Int)) =
                 let cp = shiftL(b0 .&. 0x1F, 6) .|. (b1 .&. 0x3F) in
                 Just(Pair(cp, i + 2))
         else if seqLen == 3 then
-            let b1 = byteToInt(index(bytes, i + 1)) in
-            let b2 = byteToInt(index(bytes, i + 2)) in
+            let { b1 = byteToInt(index(bytes, i + 1)); b2 = byteToInt(index(bytes, i + 2)) } in
             if (b1 .&. 0xC0) != 0x80 then Nothing
             else if (b2 .&. 0xC0) != 0x80 then Nothing
             else
                 let cp = shiftL(b0 .&. 0x0F, 12) .|. shiftL(b1 .&. 0x3F, 6) .|. (b2 .&. 0x3F) in
                 Just(Pair(cp, i + 3))
         else
-            let b1 = byteToInt(index(bytes, i + 1)) in
-            let b2 = byteToInt(index(bytes, i + 2)) in
-            let b3 = byteToInt(index(bytes, i + 3)) in
+            let { b1 = byteToInt(index(bytes, i + 1)); b2 = byteToInt(index(bytes, i + 2)); b3 = byteToInt(index(bytes, i + 3)) } in
             if (b1 .&. 0xC0) != 0x80 then Nothing
             else if (b2 .&. 0xC0) != 0x80 then Nothing
             else if (b3 .&. 0xC0) != 0x80 then Nothing
@@ -148,8 +144,7 @@ function eqBytes(a:Array(Byte), b:Array(Byte), i:Int, len:Int) : Bool =
 function compareBytes(a:Array(Byte), b:Array(Byte), i:Int, minLen:Int) : Ordering =
     if i >= minLen then compare(size(a), size(b))
     else
-        let ba = byteToInt(index(a, i)) in
-        let bb = byteToInt(index(b, i)) in
+        let { ba = byteToInt(index(a, i)); bb = byteToInt(index(b, i)) } in
         if ba < bb then LessThan
         else if ba > bb then GreaterThan
         else compareBytes(a, b, i + 1, minLen);

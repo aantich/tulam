@@ -12,14 +12,12 @@ function t2() : Bool = strIsEmpty("");
 
 // T3: String equality via literal
 function t3() : Bool =
-    let s1 = "Hi" in
-    let s2 = "Hi" in
+    let { s1 = "Hi"; s2 = "Hi" } in
     s1 == s2;
 
 // T4: String inequality via literal
 function t4() : Bool =
-    let s1 = "Hi" in
-    let s2 = "Ho" in
+    let { s1 = "Hi"; s2 = "Ho" } in
     s1 != s2;
 
 // T5: String concatenation via combine (Semigroup)

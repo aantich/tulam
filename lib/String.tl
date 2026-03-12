@@ -130,14 +130,12 @@ algebra StringLike(s:Type) = {
         else strSlice(str, 0, pLen) == prefix;
 
     function strEndsWith(str:s, suffix:s) : Bool =
-        let sLen = byteLength(suffix) in
-        let tLen = byteLength(str) in
+        let { sLen = byteLength(suffix); tLen = byteLength(str) } in
         if sLen > tLen then False
         else strSlice(str, tLen - sLen, tLen) == suffix;
 
     function strTrim(str:s) : s =
-        let startOff = trimLeading(str, 0) in
-        let endOff = trimTrailing(str, byteLength(str)) in
+        let { startOff = trimLeading(str, 0); endOff = trimTrailing(str, byteLength(str)) } in
         if startOff >= endOff then strSlice(str, 0, 0)
         else strSlice(str, startOff, endOff);
 
@@ -171,8 +169,7 @@ algebra StringLike(s:Type) = {
     function mapCharsStep(r:Maybe(Pair(Char, Int)), str:s, f:Char -> Char, byteOff:Int) : s = match
         | Nothing, str, f, byteOff -> strSlice(str, 0, 0)
         | Just(Pair(ch, nextOff)), str, f, byteOff ->
-            let mapped = strFromChar(f(ch)) in
-            let rest = mapChars(str, f, nextOff) in
+            let { mapped = strFromChar(f(ch)); rest = mapChars(str, f, nextOff) } in
             combine(mapped, rest);
 
     function strReplace(str:s, old:s, new:s) : s =
@@ -181,12 +178,10 @@ algebra StringLike(s:Type) = {
         else strReplaceFrom(str, old, new, oldLen, 0);
 
     function strReplaceFrom(str:s, old:s, new:s, oldLen:Int, start:Int) : s =
-        let remaining = strSlice(str, start, byteLength(str)) in
-        let pos = strIndexOf(remaining, old) in
+        let { remaining = strSlice(str, start, byteLength(str)); pos = strIndexOf(remaining, old) } in
         if pos < 0 then remaining
         else
-            let before = strSlice(remaining, 0, pos) in
-            let after = strReplaceFrom(str, old, new, oldLen, start + pos + oldLen) in
+            let { before = strSlice(remaining, 0, pos); after = strReplaceFrom(str, old, new, oldLen, start + pos + oldLen) } in
             combine(combine(before, new), after);
 
     function strSplit(str:s, delim:s) : List(s) =
@@ -195,12 +190,10 @@ algebra StringLike(s:Type) = {
         else strSplitFrom(str, delim, dLen, 0);
 
     function strSplitFrom(str:s, delim:s, dLen:Int, start:Int) : List(s) =
-        let remaining = strSlice(str, start, byteLength(str)) in
-        let pos = strIndexOf(remaining, delim) in
+        let { remaining = strSlice(str, start, byteLength(str)); pos = strIndexOf(remaining, delim) } in
         if pos < 0 then Cons(remaining, Nil)
         else
-            let before = strSlice(remaining, 0, pos) in
-            let rest = strSplitFrom(str, delim, dLen, start + pos + dLen) in
+            let { before = strSlice(remaining, 0, pos); rest = strSplitFrom(str, delim, dLen, start + pos + dLen) } in
             Cons(before, rest);
 
     function strJoin(parts:List(s), sep:s) : s = match

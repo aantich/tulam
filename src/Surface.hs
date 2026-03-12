@@ -297,7 +297,7 @@ data Expr =
   | RecordPattern Name [(Name, Expr)]   -- Named field pattern: Point { x = Z, y = _ }
   -- Effect system nodes
   | EffectDecl Name [Var] [(Lambda)]    -- effect Name(params) = { op1, op2, ... }
-  | HandlerDecl Name Name [Var] [Expr]  -- handler Name(params) : EffectName = { lets + impls }
+  | HandlerDecl Name Name Bool [Var] [Expr]  -- handler Name(params) : EffectName = [default] { lets + impls } (Bool = isDefault)
   | HandleWith Expr Expr                -- handle expr with handlerExpr
   | ActionBlock [ActionStmt]            -- action { stmt, stmt, ... } (desugared to bind chains)
   | EffType Expr Expr                   -- Eff { row } resultType (in type positions)
@@ -308,6 +308,12 @@ data Expr =
     -- ^ extern function name(params) : RetType [= inline "add" | = llvm "llvm.sqrt.f64"];
     -- Nothing = plain C function call (runtime). Just ("inline", "add") = inline instruction.
     -- Just ("llvm", "llvm.sqrt.f64") = LLVM intrinsic call.
+  -- Handler override at call site: func [Console = SilentConsole, FileIO = MockFileIO] (args)
+  | OverrideApp Expr [(Maybe Name, Expr)] [Expr]
+    -- OverrideApp func [(effectName?, handler)] args
+    -- Named: [Console = SilentConsole]  -> [(Just "Console", Id "SilentConsole")]
+    -- Positional: [SilentConsole]       -> [(Nothing, Id "SilentConsole")]
+    -- Wildcard: [_]                     -> [(Nothing, Id "_")]
   | ERROR String
 
 
@@ -448,7 +454,7 @@ traverseExpr f (RecordUpdate e fields) = RecordUpdate (f $ traverseExpr f e) (ma
 traverseExpr f (RecordPattern nm fields) = RecordPattern nm (map (\(n,e) -> (n, f $ traverseExpr f e)) fields)
 -- Effect system nodes
 traverseExpr f (EffectDecl nm ps ops) = EffectDecl nm ps (map (\l -> l { body = f $ traverseExpr f (body l) }) ops)
-traverseExpr f (HandlerDecl nm eff ps impls) = HandlerDecl nm eff ps (map (f . traverseExpr f) impls)
+traverseExpr f (HandlerDecl nm eff isDef ps impls) = HandlerDecl nm eff isDef ps (map (f . traverseExpr f) impls)
 traverseExpr f (HandleWith e h) = HandleWith (f $ traverseExpr f e) (f $ traverseExpr f h)
 traverseExpr f (ActionBlock stmts) = ActionBlock (map (traverseActionStmt f) stmts)
 traverseExpr f (EffType row res) = EffType (f $ traverseExpr f row) (f $ traverseExpr f res)
@@ -457,6 +463,11 @@ traverseExpr f (ClassDecl lam ci) = ClassDecl (lam { body = f $ traverseExpr f (
 -- Fixity declarations (leaf node)
 traverseExpr _ e@(FixityDecl _ _ _) = e
 traverseExpr _ e@(ExternFunc _ _ _ _) = e
+-- Handler override at call site
+traverseExpr f (OverrideApp func overrides args) =
+    OverrideApp (f $ traverseExpr f func)
+                (map (\(mn, e) -> (mn, f $ traverseExpr f e)) overrides)
+                (map (f . traverseExpr f) args)
 traverseExpr _ e@(ERROR _) = e
 traverseExpr f e = ERROR $ "Traverse not implemented for: " ++ ppr e
 
@@ -633,7 +644,7 @@ instance PrettyPrint Expr where
   ppr (RecordPattern nm fields) = nm ++ " {" ++ showListPlainSep (\(n,e) -> n ++ " = " ++ ppr e) ", " fields ++ "}"
   -- Effect system
   ppr (EffectDecl nm ps ops) = (as [bold,cyan] "effect ") ++ nm ++ showListRoBr ppr ps ++ " = {" ++ showListPlainSep ppr ", " (map Function ops) ++ "}"
-  ppr (HandlerDecl nm eff ps impls) = (as [bold,cyan] "handler ") ++ nm ++ (if null ps then "" else showListRoBr ppr ps) ++ " : " ++ eff ++ " = {" ++ showListPlainSep ppr ", " impls ++ "}"
+  ppr (HandlerDecl nm eff isDef ps impls) = (as [bold,cyan] "handler ") ++ nm ++ (if null ps then "" else showListRoBr ppr ps) ++ " : " ++ eff ++ " = " ++ (if isDef then "default " else "") ++ "{" ++ showListPlainSep ppr ", " impls ++ "}"
   ppr (HandleWith e h) = "handle " ++ ppr e ++ " with " ++ ppr h
   ppr (ActionBlock stmts) = "action {" ++ showListPlainSep pprActionStmt ", " stmts ++ "}"
   ppr (EffType row res) = "Eff " ++ ppr row ++ " " ++ ppr res
@@ -647,6 +658,9 @@ instance PrettyPrint Expr where
   ppr (FixityDecl assoc prec ops) = pprAssoc assoc ++ " " ++ show prec ++ " " ++ showListPlainSep (\o -> "(" ++ o ++ ")") ", " ops
   ppr (ExternFunc nm ps ret Nothing) = "extern function " ++ nm ++ "(" ++ showListPlainSep ppr ", " ps ++ ") : " ++ ppr ret
   ppr (ExternFunc nm ps ret (Just (kind, spec))) = "extern function " ++ nm ++ "(" ++ showListPlainSep ppr ", " ps ++ ") : " ++ ppr ret ++ " = " ++ kind ++ " \"" ++ spec ++ "\""
+  ppr (OverrideApp func overrides args) = ppr func ++ " [" ++ showListPlainSep pprOverride ", " overrides ++ "] (" ++ showListPlainSep ppr ", " args ++ ")"
+    where pprOverride (Nothing, e) = ppr e
+          pprOverride (Just n, e) = n ++ " = " ++ ppr e
   ppr (U (LConst 0)) = "Type"
   ppr (U (LConst n)) = "Type" ++ show n
   ppr (U l) = "Type(" ++ showLevel l ++ ")"

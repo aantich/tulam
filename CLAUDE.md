@@ -50,6 +50,7 @@ Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
 | `src/TypeCheck.hs` | Bidirectional type checker with row polymorphism. Internal types (`Ty`: TVar, TRigid, TCon, TApp, TPi, TSigma, TId, TForall, TRecord, TU), row types (REmpty, RExtend, RVar, RRigid), unification engine, structure constraint resolution. Permissive mode by default (errors are warnings). |
 | `src/Logs.hs` | Error handling with source location tracking. |
 | `src/MetadataResolver.hs` | Stub interface for codegen-time extern class metadata resolution (.NET/JS/native). No-op in interpreter. |
+| `src/Backends/Bytecode/` | Bytecode VM: `Value.hs` (tagged union values), `Instruction.hs` (opcode set + encode/decode), `Compile.hs` (CLM→bytecode compiler), `VM.hs` (register-based execution engine with TCO), `Module.hs` (bytecode module type), `Debug.hs` (disassembler + stack traces). |
 | `app/Main.hs` | REPL loop (Haskeline), file loading, interactive command dispatch. |
 
 ### Monad Stack
@@ -90,6 +91,7 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `doc/backends/LLVMBackendDesign.md` — LLVM native code backend: evaluation strategy, memory representation, Perceus RC, monomorphization, unboxing, defunctionalization, SIMD. 1700-line comprehensive design with comparison tables vs GHC/OCaml/MLton/Lean/Koka/Rust.
 - `doc/backends/LazinessAndThreadingDesign.md` — Laziness treatment (Lazy(a) type, ~syntax, demand analysis, corecursion detection) and multi-threading options (biased RC, STM, green threads, fork-join). Options exploration, no final decisions. Includes §18 phased strategy (single-threaded first → OS threads → full concurrency).
 - `doc/backends/PhaseA1_Design.md` — Detailed implementation design for Phase A.1 (LLVM backend foundation): LIR types, CLM→LIR lowering, LLVM IR emission, C runtime, memory representation, build pipeline, test strategy, implementation order.
+- `doc/backends/BytecodeVMDesign.md` — Register-based bytecode VM: NaN-boxing, flat closures, TCO, instruction set, CLM→bytecode compilation, dispatch strategy, effect handler support, debug info.
 
 ### Data Files
 
@@ -139,4 +141,5 @@ type LambdaLoggerMonad = LoggerMonadIO LogPayload          -- Logging layer
 - `class`, `abstract`, `sealed`, `implements`, `override`, `final`, `static`, `super` are reserved words.
 - `infixl N (op);` / `infixr N (op);` / `infix N (op);` = operator fixity declarations. N is precedence 0-9. Default for unknown ops is `infixl 9`. `infixl`, `infixr`, `infix` are reserved words.
 - `fn(x) = expr` = anonymous lambda (ML-style). Mirrors named function syntax: `fn(x:Int, y:Int) : Int = x + y`. Supports `fn(x) = match | pat -> body` for pattern matching. `fn` is a **reserved word**.
+- `let { x = 1; f(n:Int) : Int = n * 2; y = f(x) } in body` = multi-binding let block with semicolon-separated declarations. Supports simple bindings (`x = 1`), bare local functions (`f(n) = expr`), and explicit local functions (`function f(n) = expr`). Sequential scoping — later bindings see earlier ones. Desugars to nested `let...in`. Single-binding `let x = expr in body` unchanged.
 - Per-function `requires` constraints: `function fold(xs:c(a)) : a requires Monoid(a);` — constraints checked at call site by the type checker. Multiple constraints comma-separated: `requires Monoid(a), Ord(b)`. Stored in `Lambda.lamRequires`.

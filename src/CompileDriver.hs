@@ -28,7 +28,7 @@ import qualified Data.Set as Set
 
 import Surface
 import State
-import Backends.LLVM.Monomorphize (monomorphizeLambdas)
+import Monomorphize (monomorphizeLambdas)
 
 -- | A compilation plan: the minimal set of functions, instances, externs,
 -- and types needed to compile the given entry points.
@@ -98,6 +98,16 @@ computeReachableSet entryPoints targetName env =
         Just ti -> ti
         Nothing -> Map.empty
 
+    -- Handler operations: effect op name → Lambda body
+    handlerOpsMap = case Map.lookup targetName (targetHandlers env) of
+        Nothing -> Map.empty
+        Just handlers ->
+            Map.fromList
+                [ (lamName lam, lam)
+                | (_handlerName, (_effectName, _params, impls)) <- Map.toList handlers
+                , Function lam <- impls
+                ]
+
     go funcs insts cons typs [] = (funcs, insts, cons, typs)
     go funcs insts cons typs (name:rest)
         | HSet.member name funcs = go funcs insts cons typs rest
@@ -113,20 +123,20 @@ computeReachableSet entryPoints targetName env =
                     in go funcs' insts cons typs (newWork ++ rest)
 
                 Just _lam ->
-                    -- Implicit-param function (dispatch template like +, show, ==)
-                    -- For backend compilation, only include TARGET instances for this func.
-                    -- These are the ones monomorphization will resolve to.
-                    -- We DON'T add interpreter instances (Nat plus, etc.) — those won't
-                    -- be used after monomorphization resolves to __add_i64 etc.
-                    let targetInstKeys = findInstanceKeysForFunc name tInstMap
-                    -- But the target instance bodies may reference other functions,
-                    -- so walk them too
+                    -- Implicit-param function (dispatch template like +, show, ==, effectSeq)
+                    -- Check handler ops first (effectSeq, putStrLn, etc.)
+                    let handlerBodyRefs = case Map.lookup name handlerOpsMap of
+                            Just hLam -> collectSurfaceRefs env (body hLam)
+                            Nothing -> []
+                    -- Then check target instances (algebra methods like +, show)
+                        targetInstKeys = findInstanceKeysForFunc name tInstMap
                         targetBodyRefs = concatMap
                             (\k -> case Map.lookup k tInstMap of
                                 Just lam -> collectSurfaceRefs env (body lam)
                                 Nothing -> [])
                             targetInstKeys
-                        newWork = filter (notVisited funcs insts) targetBodyRefs
+                        newWork = filter (notVisited funcs insts)
+                                    (handlerBodyRefs ++ targetBodyRefs)
                     in go funcs insts cons typs (newWork ++ rest)
 
                 Nothing ->

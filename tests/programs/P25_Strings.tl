@@ -67,27 +67,22 @@ function t11() : Bool =
 
 // T12: Str equality (same strings)
 function t12() : Bool =
-    let s1 = Str([intToByte(0x48), intToByte(0x69)], 2) in
-    let s2 = Str([intToByte(0x48), intToByte(0x69)], 2) in
+    let { s1 = Str([intToByte(0x48), intToByte(0x69)], 2); s2 = Str([intToByte(0x48), intToByte(0x69)], 2) } in
     s1 == s2;
 
 // T13: Str inequality (different strings)
 function t13() : Bool =
-    let s1 = Str([intToByte(0x48), intToByte(0x69)], 2) in
-    let s2 = Str([intToByte(0x48), intToByte(0x6F)], 2) in
+    let { s1 = Str([intToByte(0x48), intToByte(0x69)], 2); s2 = Str([intToByte(0x48), intToByte(0x6F)], 2) } in
     s1 != s2;
 
 // T14: Str ordering (less than)
 function t14() : Ordering =
-    let s1 = Str([intToByte(0x41)], 1) in
-    let s2 = Str([intToByte(0x42)], 1) in
+    let { s1 = Str([intToByte(0x41)], 1); s2 = Str([intToByte(0x42)], 1) } in
     compare(s1, s2);
 
 // T15: Str concatenation via combine (Semigroup)
 function t15() : Int =
-    let s1 = Str([intToByte(0x48), intToByte(0x69)], 2) in
-    let s2 = Str([intToByte(0x21)], 1) in
-    let s3 = combine(s1, s2) in
+    let { s1 = Str([intToByte(0x48), intToByte(0x69)], 2); s2 = Str([intToByte(0x21)], 1); s3 = combine(s1, s2) } in
     s3.byteLen;
 
 // === StringLike Tests ===
@@ -99,8 +94,7 @@ function t16() : Int =
 
 // T17: strSlice
 function t17() : Bool =
-    let s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C), intToByte(0x6C), intToByte(0x6F)], 5) in
-    let sliced = strSlice(s, 0, 2) in
+    let { s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C), intToByte(0x6C), intToByte(0x6F)], 5); sliced = strSlice(s, 0, 2) } in
     sliced == Str([intToByte(0x48), intToByte(0x65)], 2);
 
 // T18: strDecodeAt returns correct char (A = 65)
@@ -110,14 +104,12 @@ function t18() : Int =
 
 // T19: strIndexOf found
 function t19() : Int =
-    let hay = Str([intToByte(0x41), intToByte(0x42), intToByte(0x43)], 3) in
-    let needle = Str([intToByte(0x42), intToByte(0x43)], 2) in
+    let { hay = Str([intToByte(0x41), intToByte(0x42), intToByte(0x43)], 3); needle = Str([intToByte(0x42), intToByte(0x43)], 2) } in
     strIndexOf(hay, needle);
 
 // T20: strIndexOf not found
 function t20() : Int =
-    let hay = Str([intToByte(0x41), intToByte(0x42)], 2) in
-    let needle = Str([intToByte(0x44)], 1) in
+    let { hay = Str([intToByte(0x41), intToByte(0x42)], 2); needle = Str([intToByte(0x44)], 1) } in
     strIndexOf(hay, needle);
 
 // === High-Level String Operations ===
@@ -134,20 +126,17 @@ function t22() : Int =
 
 // T23: strStartsWith true
 function t23() : Bool =
-    let s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C)], 3) in
-    let p = Str([intToByte(0x48), intToByte(0x65)], 2) in
+    let { s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C)], 3); p = Str([intToByte(0x48), intToByte(0x65)], 2) } in
     strStartsWith(s, p);
 
 // T24: strStartsWith false
 function t24() : Bool =
-    let s = Str([intToByte(0x48), intToByte(0x65)], 2) in
-    let p = Str([intToByte(0x65), intToByte(0x48)], 2) in
+    let { s = Str([intToByte(0x48), intToByte(0x65)], 2); p = Str([intToByte(0x65), intToByte(0x48)], 2) } in
     strStartsWith(s, p);
 
 // T25: strEndsWith true
 function t25() : Bool =
-    let s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C)], 3) in
-    let suf = Str([intToByte(0x65), intToByte(0x6C)], 2) in
+    let { s = Str([intToByte(0x48), intToByte(0x65), intToByte(0x6C)], 3); suf = Str([intToByte(0x65), intToByte(0x6C)], 2) } in
     strEndsWith(s, suf);
 
 // T26: strSplit count — "A,B,C" split by "," gives 3 parts
@@ -155,21 +144,15 @@ function t26len(parts:List(Str)) : Int = match
     | Nil -> 0
     | Cons(h, t) -> 1 + t26len(t);
 function t26() : Int =
-    let s = Str([intToByte(0x41), intToByte(0x2C), intToByte(0x42), intToByte(0x2C), intToByte(0x43)], 5) in
-    let delim = Str([intToByte(0x2C)], 1) in
+    let { s = Str([intToByte(0x41), intToByte(0x2C), intToByte(0x42), intToByte(0x2C), intToByte(0x43)], 5); delim = Str([intToByte(0x2C)], 1) } in
     t26len(strSplit(s, delim));
 
 // T27: strJoin "A" and "B" with "-"
 function t27() : Bool =
-    let a = Str([intToByte(0x41)], 1) in
-    let b = Str([intToByte(0x42)], 1) in
-    let sep = Str([intToByte(0x2D)], 1) in
-    let joined = strJoin(Cons(a, Cons(b, Nil)), sep) in
+    let { a = Str([intToByte(0x41)], 1); b = Str([intToByte(0x42)], 1); sep = Str([intToByte(0x2D)], 1); joined = strJoin(Cons(a, Cons(b, Nil)), sep) } in
     joined == Str([intToByte(0x41), intToByte(0x2D), intToByte(0x42)], 3);
 
 // T28: strReplace
 function t28() : Bool =
-    let s = Str([intToByte(0x41), intToByte(0x42), intToByte(0x43)], 3) in
-    let old = Str([intToByte(0x42)], 1) in
-    let new = Str([intToByte(0x58)], 1) in
+    let { s = Str([intToByte(0x41), intToByte(0x42), intToByte(0x43)], 3); old = Str([intToByte(0x42)], 1); new = Str([intToByte(0x58)], 1) } in
     strReplace(s, old, new) == Str([intToByte(0x41), intToByte(0x58), intToByte(0x43)], 3);
