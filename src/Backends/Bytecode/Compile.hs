@@ -17,7 +17,7 @@ import qualified Data.Text as T
 import Data.Text (Text)
 import Data.Word
 import Data.IORef
-import Data.List (foldl')
+import Data.List (foldl', sortOn)
 
 import Surface (Name, ConsTag(..), Literal(..), Level(..))
 import CLM
@@ -139,7 +139,7 @@ compileCLMModule modName clmFuncs =
         -- Build the module — encode instructions to Word32
         allCode = V.fromList (map encodeInstr (reverse (csAllCode cs1)))
         constants = V.fromList (reverse (csConstants cs1))
-        functions = V.fromList (reverse (csCompiledFuncs cs1))
+        functions = V.fromList (sortOn fiFuncIdx (csCompiledFuncs cs1))
         jumpTables = V.fromList (reverse (csJumpTables cs1))
         consNames = V.fromList (csConsNames cs1)
 
@@ -154,7 +154,13 @@ compileCLMModule modName clmFuncs =
 
 -- | Compile a single function into the module.
 compileFunction :: Name -> CLMLam -> CompState -> (Int, CompState)
-compileFunction name lam cs0 =
+compileFunction = compileFunctionWithCaptures []
+
+-- | Compile a function with captured variables.
+-- Captures occupy registers 0..k-1, parameters occupy k..k+n-1.
+-- This matches the VM's CALLCLS convention (upvalues first, then args).
+compileFunctionWithCaptures :: [Name] -> Name -> CLMLam -> CompState -> (Int, CompState)
+compileFunctionWithCaptures captures name lam cs0 =
     let funcIdx = case Map.lookup name (csFuncMap cs0) of
             Just idx -> idx
             Nothing  -> csNextFunc cs0
@@ -163,29 +169,39 @@ compileFunction name lam cs0 =
                    , csFuncMap = Map.insert name funcIdx (csFuncMap cs0)
                    , csNextFunc = max (csNextFunc cs0) (funcIdx + 1)
                    , csInstrCount = 0 }
-        entryOffset = length (csAllCode cs1)
+        -- Allocate registers for captures first (r0..r(k-1))
+        (cs1', _capRegs) = foldl' (\(s, regs) capName ->
+            let (r, s') = allocReg s
+                s'' = bindName capName r s'
+            in (s'', regs ++ [r])
+            ) (cs1, []) captures
     in case lam of
         CLMLam vars body ->
-            let -- Bind parameters to registers
+            let -- Bind parameters to registers (after captures)
                 (cs2, _paramRegs) = foldl' (\(s, regs) (nm, _ty) ->
                     let (r, s') = allocReg s
                         s'' = bindName nm r s'
                     in (s'', regs ++ [r])
-                    ) (cs1, []) vars
-                -- Compile the body
+                    ) (cs1', []) vars
+                -- Compile the body (may compile nested functions into csAllCode)
                 (resultReg, cs3) = compileCLMExpr body cs2
                 -- Emit return (if not already a tail call)
                 cs4 = if lastIsTailCall (csCode cs3)
                        then cs3
                        else emit (IRet resultReg) cs3
                 codeLen = length (csCode cs4)
+                -- Entry offset is calculated AFTER body compilation, so nested
+                -- functions' code (already in csAllCode) comes before this function.
+                entryOffset = length (csAllCode cs4)
+                nCaps = length captures
                 fi = FuncInfo
                     { fiName       = T.pack name
+                    , fiFuncIdx    = funcIdx
                     , fiArity      = length vars
                     , fiNumRegs    = csMaxReg cs4
                     , fiEntry      = entryOffset
                     , fiCodeLen    = codeLen
-                    , fiUpvalCount = 0
+                    , fiUpvalCount = nCaps
                     , fiDebug      = DebugInfo V.empty ""
                     }
                 cs5 = cs4 { csCompiledFuncs = fi : csCompiledFuncs cs4
@@ -193,25 +209,28 @@ compileFunction name lam cs0 =
             in (funcIdx, cs5)
 
         CLMLamCases vars cases ->
-            let -- Bind parameters to registers
+            let -- Bind parameters to registers (after captures)
                 (cs2, _paramRegs) = foldl' (\(s, regs) (nm, _ty) ->
                     let (r, s') = allocReg s
                         s'' = bindName nm r s'
                     in (s'', regs ++ [r])
-                    ) (cs1, []) vars
-                -- Compile the case chain
+                    ) (cs1', []) vars
+                -- Compile the case chain (may compile nested functions)
                 cs3 = compileCaseChain cases cs2
                 -- Add error fallback
                 (errIdx, cs4) = addConstant (KString "Pattern match failure") cs3
                 cs5 = emit (IError errIdx) cs4
                 codeLen = length (csCode cs5)
+                entryOffset = length (csAllCode cs5)
+                nCaps = length captures
                 fi = FuncInfo
                     { fiName       = T.pack name
+                    , fiFuncIdx    = funcIdx
                     , fiArity      = length vars
                     , fiNumRegs    = csMaxReg cs5
                     , fiEntry      = entryOffset
                     , fiCodeLen    = codeLen
-                    , fiUpvalCount = 0
+                    , fiUpvalCount = nCaps
                     , fiDebug      = DebugInfo V.empty ""
                     }
                 cs6 = cs5 { csCompiledFuncs = fi : csCompiledFuncs cs5
@@ -227,11 +246,16 @@ compileFunction name lam cs0 =
 compileCaseChain :: [CLMExpr] -> CompState -> CompState
 compileCaseChain [] cs = cs
 compileCaseChain (CLMCASE checks body : rest) cs =
-    let -- Step 1: Compile pattern checks with JMPF placeholders (offset=0).
+    let -- Save csEnv before compiling the arm body. Nested case chains in the
+        -- body may shadow the scrutinee parameter binding; we must restore env
+        -- so the next arm's check sees the correct scrutinee register.
+        savedEnv = csEnv cs
+        savedNextReg = csNextReg cs
+        -- Step 1: Compile pattern checks with JMPF placeholders (offset=0).
         -- Record the absolute instruction position of each JMPF.
         (cs1, jmpfPositions) = compilePatternChecks checks cs
-        -- Step 2: Compile the body.
-        (resultReg, cs2) = compileCLMExpr body cs1
+        -- Step 2: Compile the body in tail position (each arm returns).
+        (resultReg, cs2) = compileCLMExpr body (inTailPos True cs1)
         cs3 = if lastIsTailCall (csCode cs2)
                then cs2
                else emit (IRet resultReg) cs2
@@ -239,11 +263,11 @@ compileCaseChain (CLMCASE checks body : rest) cs =
         -- targetPos is the absolute position of the next instruction to be emitted.
         targetPos = csInstrCount cs3
         -- Step 4: Patch each JMPF instruction in csCode.
-        -- For a JMPF at absolute position P, we need offset = targetPos - P
-        -- so that: PC_after_fetch + offset - 1 = (P+1) + offset - 1 = P + offset = targetPos.
         cs4 = patchJmpFs cs3 jmpfPositions targetPos
+        -- Restore env and nextReg for next arm (keep code, constants, etc.)
+        cs5 = cs4 { csEnv = savedEnv, csNextReg = savedNextReg }
         -- Continue with remaining cases
-    in compileCaseChain rest cs4
+    in compileCaseChain rest cs5
 compileCaseChain (_:rest) cs = compileCaseChain rest cs
 
 -- | Patch JMPF instructions in csCode (reversed instruction list).
@@ -279,11 +303,15 @@ compileInlineCaseChain [] cs =
     in (r, emit (IError errIdx) cs2)
 compileInlineCaseChain cases cs =
     let (dstReg, cs1) = allocReg cs
-        -- Compile all arms, collecting JMP-to-merge positions
+        -- Compile all arms, collecting JMP-to-merge positions.
+        -- Save/restore csEnv between arms to prevent inner match bindings
+        -- from shadowing the scrutinee parameter in subsequent arms.
         (cs2, jmpToMerge) = foldl' (\(s, mergeJmps) caseExpr ->
             case caseExpr of
                 CLMCASE checks body ->
-                    let -- Compile checks, get JMPF positions
+                    let savedEnv = csEnv s
+                        savedNextReg = csNextReg s
+                        -- Compile checks, get JMPF positions
                         (s1, jmpfPositions) = compilePatternChecks checks s
                         -- Compile body
                         (resultReg, s2) = compileCLMExpr body (inTailPos False s1)
@@ -297,7 +325,9 @@ compileInlineCaseChain cases cs =
                         -- Patch JMPFs to jump past this arm
                         targetPos = csInstrCount s4
                         s5 = patchJmpFs s4 jmpfPositions targetPos
-                    in (s5, jmpPos : mergeJmps)
+                        -- Restore env for next arm
+                        s6 = s5 { csEnv = savedEnv, csNextReg = savedNextReg }
+                    in (s6, jmpPos : mergeJmps)
                 _ ->
                     -- Default body (no checks)
                     let (resultReg, s1) = compileCLMExpr caseExpr (inTailPos False s)
@@ -468,19 +498,35 @@ compileCLMExpr expr cs = case expr of
                     ) (cs, []) args
                 -- Bind parameters to argument registers
                 cs2 = foldl' (\s ((nm, _ty), r) -> bindName nm r s) cs1 (zip vars argRegs)
-            in compileInlineCaseChain cases cs2
-        -- For simple CLMLam: compile as let-binding (sequential evaluation).
-        -- We must NOT beta-reduce because it would lose side effects
-        -- (e.g., `let u = mutWrite(r, 42) in readRef(r)` would drop the write).
+            in if csTailPos cs
+               then -- In tail position: use case chain with RETs (enables tail calls in arms)
+                    let cs3 = compileCaseChain cases cs2
+                        (errIdx, cs4) = addConstant (KString "Pattern match failure") cs3
+                        cs5 = emit (IError errIdx) cs4
+                    in (0, cs5)  -- register doesn't matter, all arms RET
+               else compileInlineCaseChain cases cs2
+        -- For simple CLMLam: compile as sequential let-binding.
+        -- Each arg is compiled and its param bound BEFORE compiling the next arg,
+        -- because later args may reference earlier params (desugared let-blocks).
+        -- e.g., `let { x = 1; y = x + 1 } in y` → args[1] references params[0].
         CLMLam vars body ->
-            let -- Compile arguments
-                (cs1, argRegs) = foldl' (\(s, regs) arg ->
+            let parentTailPos = csTailPos cs
+                -- Compile args sequentially, binding each param as we go.
+                -- After each binding, reclaim dead temp registers by resetting
+                -- csNextReg to one past the highest live register. This prevents
+                -- register overflow (8-bit register fields = max 256) in functions
+                -- with many sequential let bindings (e.g., createBodies with 30+ bodySet calls).
+                cs1 = foldl' (\s ((nm, _ty), arg) ->
                     let (r, s') = compileCLMExpr arg (inTailPos False s)
-                    in (s', regs ++ [r])
-                    ) (cs, []) args
-                -- Bind parameters to argument registers
-                cs2 = foldl' (\s ((nm, _ty), r) -> bindName nm r s) cs1 (zip vars argRegs)
-            in compileCLMExpr body cs2
+                        s'' = bindName nm r s'
+                        -- Reclaim dead temps: set csNextReg to max live register + 1
+                        maxLive = if Map.null (csEnv s'') then 0
+                                  else maximum (Map.elems (csEnv s''))
+                        s''' = s'' { csNextReg = maxLive + 1 }
+                    in s'''
+                    ) cs (zip vars args)
+                -- Restore parent's tail position for body compilation
+            in compileCLMExpr body (inTailPos parentTailPos cs1)
 
     CLMAPP func args ->
         -- General application: compile func, then call as closure
@@ -546,11 +592,27 @@ compileCLMExpr expr cs = case expr of
             funcIdx = csNextFunc cs
             cs1 = cs { csNextFunc = funcIdx + 1
                      , csFuncMap = Map.insert funcName funcIdx (csFuncMap cs) }
-            -- Compile the sub-function (deferred)
-            (fidx, cs2) = compileFunction funcName lam cs1
+            -- Save parent's compilation state before compiling nested function.
+            -- compileFunction resets csCode/csEnv/csNextReg/etc., so we must preserve
+            -- the parent's partial code and register state.
+            savedCode = csCode cs1
+            savedEnv = csEnv cs1
+            savedNextReg = csNextReg cs1
+            savedMaxReg = csMaxReg cs1
+            savedTailPos = csTailPos cs1
+            savedInstrCount = csInstrCount cs1
+            -- Compile the sub-function (with captures bound to initial registers)
+            (fidx, cs2) = compileFunctionWithCaptures captures funcName lam cs1
+            -- Restore parent's state
+            cs2' = cs2 { csCode = savedCode
+                       , csEnv = savedEnv
+                       , csNextReg = savedNextReg
+                       , csMaxReg = savedMaxReg
+                       , csTailPos = savedTailPos
+                       , csInstrCount = savedInstrCount }
             -- Emit CLOSURE instruction
             nCaptures = length captures
-            (baseReg, cs3) = allocRegs (nCaptures + 1) cs2
+            (baseReg, cs3) = allocRegs (nCaptures + 1) cs2'
             dstReg = baseReg
             -- Copy captures into consecutive registers
             cs4 = foldl' (\s (i, capName) ->
@@ -563,8 +625,13 @@ compileCLMExpr expr cs = case expr of
 
     -- Implicit-param application (should be monomorphized away; fallback to dispatch)
     CLMIAP (CLMID funcName) args ->
-        -- Try as a direct call first (monomorphized case)
-        compileCall funcName args cs
+        -- If name is a local variable with 0 args, just read the register.
+        -- This handles cases like `CLMIAP (CLMID "count") []` where "count"
+        -- is a local variable that got wrapped in CLMIAP by the monomorphizer
+        -- because a global function with the same name has implicit params.
+        case (null args, lookupName funcName cs) of
+            (True, Just r) -> (r, cs)
+            _ -> compileCall funcName args cs
 
     CLMIAP func args ->
         -- General dispatch

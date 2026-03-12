@@ -5,12 +5,11 @@
 type StorageTree = SLeaf * sz:Int + SBranch * children:List(StorageTree);
 
 function buildTreeDepth(depth:Int, seed:Ref(Int), count:Ref(Int)) : StorageTree =
-    let u = modifyRef(count, fn(c) = c + 1) in
     if depth == 0 then
         let r = randomNext(seed) in
         SLeaf(r)
     else
-        let kids = buildChildren(4, depth - 1, seed, count, Nil) in
+        let { u = modifyRef(count, fn(c) = c + 1); kids = buildChildren(4, depth - 1, seed, count, Nil) } in
         SBranch(kids);
 
 function buildChildren(n:Int, depth:Int, seed:Ref(Int), count:Ref(Int), acc:List(StorageTree)) : List(StorageTree) =

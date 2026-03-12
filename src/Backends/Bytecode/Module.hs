@@ -59,6 +59,7 @@ data DebugInfo = DebugInfo
 -- | Function info in the function table.
 data FuncInfo = FuncInfo
     { fiName       :: !Text        -- function name (for debug/dispatch)
+    , fiFuncIdx    :: !Int         -- assigned function index (for vector ordering)
     , fiArity      :: !Int         -- number of parameters
     , fiNumRegs    :: !Int         -- registers needed (from compiler)
     , fiEntry      :: !Int         -- entry point (bytecode offset)

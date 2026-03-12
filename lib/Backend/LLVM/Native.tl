@@ -273,6 +273,7 @@ target native {
 
     instance StringOps(String) = {
         function concat(x, y) = __string_concat(x, y);
+        function (++)(x, y) = __string_concat(x, y);
         function length(s) = __string_length(s)
     };
 

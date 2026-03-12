@@ -25,7 +25,7 @@ function isShorterThan(x:List(Int), y:List(Int)) : Bool =
 
 function tailFn(x:List(Int), y:List(Int), z:List(Int)) : List(Int) =
     if isShorterThan(y, x) then
-        tailFn(tailFn(listTail(x), y, z), tailFn(y, z, x), tailFn(z, x, y))
+        tailFn(tailFn(listTail(x), y, z), tailFn(listTail(y), z, x), tailFn(listTail(z), x, y))
     else z;
 
 function benchList() : Int =

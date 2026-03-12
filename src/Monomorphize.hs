@@ -23,6 +23,7 @@ import qualified Data.HashMap.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import Data.Maybe (mapMaybe, fromMaybe, catMaybes)
 import Data.List (intercalate, foldl')
+-- import qualified Debug.Trace as DT
 
 import Surface
 import State
@@ -113,8 +114,14 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
     go expr = case expr of
         -- The key case: function application where funcName has implicit params
         App (Id funcName) args ->
-            case lookupLambda funcName env of
-                Just fun | hasImplicit fun ->
+            let isImplicit = case lookupLambda funcName env of
+                    Just fun | hasImplicit fun -> True
+                    _ -> False
+                -- Also try resolution for intrinsic functions with target instances
+                -- (like ++ which is an intrinsic but not an algebra method in topLambdas)
+                hasTargetInstance = hasAnyTargetInstance funcName tInstances
+            in if isImplicit || hasTargetInstance
+                then
                     let args' = map go args  -- resolve nested calls first
                     in  -- Try handler operation first (putStrLn, readRef, etc.)
                         case Map.lookup funcName handlerOps of
@@ -144,8 +151,8 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
                                                     go (substituteInstanceBody resolvedBody args')
                                                 Nothing ->
                                                     App (Id funcName) args'
-                _ ->
-                    -- Not an implicit-param function — just recurse into args
+                else
+                    -- Not an implicit-param function and no target instance — just recurse
                     App (Id funcName) (map go args)
 
         -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`, `readLine`)
@@ -157,6 +164,24 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
                         Just handlerLam -> substituteInstanceBody handlerLam []
                         Nothing -> expr  -- can't resolve without type context
                 _ -> expr
+
+        -- Desugared let-in: App (Function λ(x). body) [val]
+        -- Infer param types from the actual arguments to extend typeEnv in the body.
+        App (Function lam) args ->
+            let args' = map go args
+                -- Build type env from explicit param annotations
+                paramTypeEnv = buildTypeEnv (params lam)
+                -- Also infer param types from the actual args (for untyped let-bindings)
+                inferredParamTypes = Map.fromList
+                    [ (name v, tn)
+                    | (v, arg) <- zip (params lam) args'
+                    , Nothing <- [exprToTypeName (typ v)]  -- only when param has no annotation
+                    , Just tn <- [inferExprTypeName env typeEnv arg]
+                    ]
+                innerTypeEnv = Map.unions [inferredParamTypes, paramTypeEnv, typeEnv]
+                body' = resolveImplicitCalls env tInstances handlerOps innerTypeEnv (body lam)
+                lam' = lam { body = body' }
+            in App (Function lam') args'
 
         -- Recurse into all other expression forms
         App f args -> App (go f) (map go args)
@@ -289,6 +314,13 @@ resolveTargetInstanceMulti tInstances funcName types =
 nub' :: Eq a => [a] -> [a]
 nub' [] = []
 nub' (x:xs) = x : nub' (filter (/= x) xs)
+
+-- | Check if there's any target instance for a function name.
+-- Instance keys are "funcName\0type1\0type2" or just "funcName".
+hasAnyTargetInstance :: Name -> HashMap Name a -> Bool
+hasAnyTargetInstance funcName m =
+    let prefix = funcName ++ "\0"
+    in any (\k -> k == funcName || take (length prefix) k == prefix) (Map.keys m)
 
 -- | Return the first Just from a list of Maybes
 firstJust :: [Maybe a] -> Maybe a

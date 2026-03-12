@@ -44,6 +44,7 @@ data Frame = Frame
     { frRetPC    :: !Int    -- return program counter
     , frRetReg   :: !Int    -- destination register in caller's frame
     , frBaseFP   :: !Int    -- caller's frame pointer (register base)
+    , frFrameSize :: !Int   -- caller's frame size (for restoring on return)
     , frFuncIdx  :: !Int    -- function index (for debug)
     } deriving (Show, Eq)
 
@@ -53,14 +54,15 @@ maxCallDepth = 100000
 
 -- | Register file size (grows as needed).
 initialRegFileSize :: Int
-initialRegFileSize = 4096
+initialRegFileSize = 65536  -- initial; grows dynamically
 
 -- | VM state. All mutable fields are IORef/MVector for O(1) access.
 data VMState = VMState
     { vmModule     :: !BytecodeModule       -- loaded module
-    , vmRegisters  :: !(MV.IOVector Val)    -- register file
+    , vmRegisters  :: !(IORef (MV.IOVector Val))  -- growable register file
     , vmPC         :: !(IORef Int)          -- program counter
     , vmFP         :: !(IORef Int)          -- frame pointer (register base offset)
+    , vmFrameSize  :: !(IORef Int)          -- current frame size (caller's maxRegs)
     , vmCallStack  :: !(IORef [Frame])      -- call stack (LIFO)
     , vmCallDepth  :: !(IORef Int)          -- current call depth
     }
@@ -68,18 +70,19 @@ data VMState = VMState
 -- | Initialize a VM from a bytecode module.
 initVM :: BytecodeModule -> IO VMState
 initVM bm = do
-    regs <- MV.new initialRegFileSize
-    -- Initialize all registers to VUnit
-    forM_ [0..initialRegFileSize-1] $ \i -> MV.write regs i VUnit
+    regs <- MV.replicate initialRegFileSize VEmpty
+    regsRef <- newIORef regs
     pc <- newIORef 0
     fp <- newIORef 0
+    frameSize <- newIORef 256  -- default; set properly by runFunction
     stack <- newIORef []
     depth <- newIORef 0
     return VMState
         { vmModule    = bm
-        , vmRegisters = regs
+        , vmRegisters = regsRef
         , vmPC        = pc
         , vmFP        = fp
+        , vmFrameSize = frameSize
         , vmCallStack = stack
         , vmCallDepth = depth
         }
@@ -88,9 +91,10 @@ initVM bm = do
 readReg :: VMState -> Int -> IO Val
 readReg vm r = do
     fp <- readIORef (vmFP vm)
+    regs <- readIORef (vmRegisters vm)
     let idx = fp + r
-    if idx < MV.length (vmRegisters vm)
-        then MV.read (vmRegisters vm) idx
+    if idx < MV.length regs
+        then MV.read regs idx
         else return VEmpty
 
 -- | Write a register.
@@ -99,15 +103,23 @@ writeReg vm r v = do
     fp <- readIORef (vmFP vm)
     let idx = fp + r
     ensureRegSize vm (idx + 1)
-    MV.write (vmRegisters vm) idx v
+    regs <- readIORef (vmRegisters vm)
+    MV.write regs idx v
 
 -- | Ensure register file is at least the given size.
+-- Grows by doubling when needed (amortized O(1)).
 ensureRegSize :: VMState -> Int -> IO ()
 ensureRegSize vm needed = do
-    let regs = vmRegisters vm
-    when (needed > MV.length regs) $ do
-        -- In a real impl we'd grow the vector; for now we trust the limit
-        return ()
+    regs <- readIORef (vmRegisters vm)
+    let currentSize = MV.length regs
+    when (needed > currentSize) $ do
+        let newSize = max needed (currentSize * 2)
+        newRegs <- MV.replicate newSize VEmpty
+        -- Copy old data
+        forM_ [0..currentSize-1] $ \i -> do
+            v <- MV.read regs i
+            MV.write newRegs i v
+        writeIORef (vmRegisters vm) newRegs
 
 -- | Run a function by index with the given arguments.
 runFunction :: VMState -> Int -> [Val] -> IO (Either VMError Val)
@@ -119,6 +131,7 @@ runFunction vm funcIdx args = do
             -- Set up initial frame
             writeIORef (vmPC vm) (fiEntry fi)
             writeIORef (vmFP vm) 0
+            writeIORef (vmFrameSize vm) (csMaxRegs fi)
             writeIORef (vmCallStack vm) []
             writeIORef (vmCallDepth vm) 0
             -- Write arguments to parameter registers
@@ -281,6 +294,7 @@ dispatch vm 0x1B a b c _ _ _ = do
     vb <- readReg vm c
     case (va, vb) of
         (VFloat x, VFloat y) | y /= 0.0 -> do writeReg vm a (VFloat (x / y)); execLoop vm
+        (VFloat _, VFloat _) -> return $ Left VMDivisionByZero
         _ -> return $ Left VMDivisionByZero
 
 -- NEGF
@@ -296,6 +310,22 @@ dispatch vm 0x16 a b _ _ _ _ = do
     va <- readReg vm b
     case va of
         VInt x -> writeReg vm a (VInt (abs x))
+        _ -> writeReg vm a VEmpty
+    execLoop vm
+
+-- SQRTF
+dispatch vm 0x1D a b _ _ _ _ = do
+    va <- readReg vm b
+    case va of
+        VFloat x -> writeReg vm a (VFloat (sqrt x))
+        _ -> writeReg vm a VEmpty
+    execLoop vm
+
+-- ABSF
+dispatch vm 0x1E a b _ _ _ _ = do
+    va <- readReg vm b
+    case va of
+        VFloat x -> writeReg vm a (VFloat (abs x))
         _ -> writeReg vm a VEmpty
     execLoop vm
 
@@ -515,10 +545,11 @@ dispatch vm 0x3C a _ _ _ _ _ = do
     stack <- readIORef (vmCallStack vm)
     case stack of
         [] -> return $ Right val  -- top-level return
-        (Frame retPC retReg baseFP _funcIdx : rest) -> do
+        (Frame retPC retReg baseFP callerFS _funcIdx : rest) -> do
             writeIORef (vmCallStack vm) rest
             writeIORef (vmPC vm) retPC
             writeIORef (vmFP vm) baseFP
+            writeIORef (vmFrameSize vm) callerFS
             depth <- readIORef (vmCallDepth vm)
             writeIORef (vmCallDepth vm) (depth - 1)
             writeReg vm retReg val
@@ -539,12 +570,14 @@ dispatch vm 0x40 a b c _ _ _ = do
             -- Save return info
             pc <- readIORef (vmPC vm)
             fp <- readIORef (vmFP vm)
-            let frame = Frame pc dstReg fp funcIdx
+            callerFrameSize <- readIORef (vmFrameSize vm)
+            let frame = Frame pc dstReg fp callerFrameSize funcIdx
             modifyIORef' (vmCallStack vm) (frame :)
             writeIORef (vmCallDepth vm) (depth + 1)
-            -- Copy args to new frame
-            let newFP = fp + (csMaxRegs fi)
+            -- New frame starts AFTER caller's register space
+            let newFP = fp + callerFrameSize
             writeIORef (vmFP vm) newFP
+            writeIORef (vmFrameSize vm) (csMaxRegs fi)
             forM_ [0..nargs-1] $ \i -> do
                 v <- readRegAbs vm (fp + dstReg + 1 + i)
                 writeRegAbs vm (newFP + i) v
@@ -569,6 +602,7 @@ dispatch vm 0x41 _ b c _ _ _ = do
             args <- mapM (\i -> readReg vm i) [0..nargs-1]
             forM_ (zip [0..] args) $ \(i, v) ->
                 writeRegAbs vm (fp + i) v
+            writeIORef (vmFrameSize vm) (csMaxRegs fi)
             writeIORef (vmPC vm) (fiEntry fi)
             execLoop vm
 
@@ -586,12 +620,14 @@ dispatch vm 0x42 a b c _ _ _ = do
                     depth <- readIORef (vmCallDepth vm)
                     pc <- readIORef (vmPC vm)
                     fp <- readIORef (vmFP vm)
-                    let frame = Frame pc dstReg fp funcIdx
+                    callerFS <- readIORef (vmFrameSize vm)
+                    let frame = Frame pc dstReg fp callerFS funcIdx
                     modifyIORef' (vmCallStack vm) (frame :)
                     writeIORef (vmCallDepth vm) (depth + 1)
                     -- Set up new frame: upvalues first, then args
-                    let newFP = fp + csMaxRegs fi
+                    let newFP = fp + callerFS
                     writeIORef (vmFP vm) newFP
+                    writeIORef (vmFrameSize vm) (csMaxRegs fi)
                     -- Write upvalues
                     forM_ [0..V.length upvals - 1] $ \i ->
                         writeRegAbs vm (newFP + i) (upvals V.! i)
@@ -615,12 +651,14 @@ dispatch vm 0x42 a b c _ _ _ = do
                         Just fi -> do
                             pc <- readIORef (vmPC vm)
                             fp <- readIORef (vmFP vm)
+                            callerFS <- readIORef (vmFrameSize vm)
                             depth <- readIORef (vmCallDepth vm)
-                            let frame = Frame pc dstReg fp funcIdx
+                            let frame = Frame pc dstReg fp callerFS funcIdx
                             modifyIORef' (vmCallStack vm) (frame :)
                             writeIORef (vmCallDepth vm) (depth + 1)
-                            let newFP = fp + csMaxRegs fi
+                            let newFP = fp + callerFS
                             writeIORef (vmFP vm) newFP
+                            writeIORef (vmFrameSize vm) (csMaxRegs fi)
                             forM_ (zip [0..] allArgs) $ \(i, v) ->
                                 writeRegAbs vm (newFP + i) v
                             writeIORef (vmPC vm) (fiEntry fi)
@@ -651,6 +689,7 @@ dispatch vm 0x43 _ b c _ _ _ = do
                     let argBase = V.length upvals
                     forM_ (zip [0..] args) $ \(i, v) ->
                         writeRegAbs vm (fp + argBase + i) v
+                    writeIORef (vmFrameSize vm) (csMaxRegs fi)
                     writeIORef (vmPC vm) (fiEntry fi)
                     execLoop vm
         _ -> return $ Left (VMRuntimeError "TAILCALLCLS: not a closure")
@@ -866,21 +905,24 @@ dispatch _vm 0xFF _ _ _ _ _ _ = return $ Right VUnit
 -- Unknown opcode
 dispatch _vm op _ _ _ _ _ _ = return $ Left (VMInvalidOpcode op)
 
--- Helper: max registers hint for a function (use fiNumRegs)
+-- Helper: max registers hint for a function (use fiNumRegs + small padding)
 csMaxRegs :: FuncInfo -> Int
-csMaxRegs fi = max 256 (fiNumRegs fi)  -- conservative: at least 256 regs per frame
+csMaxRegs fi = fiNumRegs fi + 4  -- small padding for safety
 
 -- Helper: read register at absolute position
 readRegAbs :: VMState -> Int -> IO Val
-readRegAbs vm idx
-    | idx < MV.length (vmRegisters vm) = MV.read (vmRegisters vm) idx
-    | otherwise = return VEmpty
+readRegAbs vm idx = do
+    regs <- readIORef (vmRegisters vm)
+    if idx < MV.length regs
+        then MV.read regs idx
+        else return VEmpty
 
 -- Helper: write register at absolute position
 writeRegAbs :: VMState -> Int -> Val -> IO ()
 writeRegAbs vm idx v = do
     ensureRegSize vm (idx + 1)
-    MV.write (vmRegisters vm) idx v
+    regs <- readIORef (vmRegisters vm)
+    MV.write regs idx v
 
 -- Helper: convert constant to Val
 constToVal :: Constant -> Val
@@ -921,12 +963,42 @@ dispatchBuiltin vm "modifyRef" [VObj (HRef ref), closureVal'] =
     dispatchModifyRef vm ref closureVal'
 dispatchBuiltin vm "__modifyref" [VObj (HRef ref), closureVal'] =
     dispatchModifyRef vm ref closureVal'
+-- == fallback for Bool (constructors)
+dispatchBuiltin _vm "==" [VBool a, VBool b] =
+    return $ Right (VBool (a == b))
+dispatchBuiltin _vm "==" [VObj (HCon t1 _ _), VObj (HCon t2 _ _)] =
+    return $ Right (VBool (t1 == t2))
+-- show fallback for types that don't have __show_* extern mappings
+dispatchBuiltin _vm "show" [VBool True] =
+    return $ Right (VString "True")
+dispatchBuiltin _vm "show" [VBool False] =
+    return $ Right (VString "False")
+dispatchBuiltin _vm "show" [VInt n] =
+    return $ Right (VString (T.pack (show n)))
+dispatchBuiltin _vm "show" [VFloat d] =
+    return $ Right (VString (T.pack (show d)))
+dispatchBuiltin _vm "show" [VString s] =
+    return $ Right (VString ("\"" <> s <> "\""))
+dispatchBuiltin _vm "show" [VUnit] =
+    return $ Right (VString "()")
+dispatchBuiltin _vm "show" [VObj (HCon tag _ fields)] =
+    let showFields = T.intercalate ", " [T.pack (show (fields V.! i)) | i <- [0..V.length fields - 1]]
+    in return $ Right (VString ("Con(" <> T.pack (show tag) <> if V.null fields then ")" else ", " <> showFields <> ")"))
 dispatchBuiltin _vm "__string_concat" [VString a, VString b] =
     return $ Right (VString (a <> b))
 dispatchBuiltin _vm "__string_length" [VString s] =
     return $ Right (VInt (fromIntegral (T.length s)))
-dispatchBuiltin _vm name _ =
-    return $ Left (VMRuntimeError ("Unknown dispatch: " <> name))
+dispatchBuiltin _vm name args =
+    return $ Left (VMRuntimeError ("Unknown dispatch: " <> name <> " with " <> T.pack (show (length args)) <> " args: " <> T.pack (show (map valTag args))))
+  where
+    valTag (VInt _) = "VInt"
+    valTag (VFloat _) = "VFloat"
+    valTag (VBool _) = "VBool"
+    valTag (VChar _) = "VChar"
+    valTag (VString _) = "VString"
+    valTag VUnit = "VUnit"
+    valTag (VObj _) = "VObj"
+    valTag VEmpty = "VEmpty"
 
 -- | Helper for modifyRef dispatch (shared between "modifyRef" and "__modifyref")
 dispatchModifyRef :: VMState -> IORef Val -> Val -> IO (Either VMError Val)
@@ -952,11 +1024,13 @@ callClosureSync vm closureVal' args = do
                     -- Save current state
                     savedPC    <- readIORef (vmPC vm)
                     savedFP    <- readIORef (vmFP vm)
+                    savedFS    <- readIORef (vmFrameSize vm)
                     savedStack <- readIORef (vmCallStack vm)
                     savedDepth <- readIORef (vmCallDepth vm)
-                    -- Set up a new frame at a safe offset
-                    let newFP = savedFP + csMaxRegs fi
+                    -- Set up a new frame at a safe offset (after caller's frame)
+                    let newFP = savedFP + savedFS
                     writeIORef (vmFP vm) newFP
+                    writeIORef (vmFrameSize vm) (csMaxRegs fi)
                     writeIORef (vmCallStack vm) []
                     writeIORef (vmCallDepth vm) 0
                     -- Write upvalues
@@ -973,6 +1047,7 @@ callClosureSync vm closureVal' args = do
                     -- Restore saved state
                     writeIORef (vmPC vm) savedPC
                     writeIORef (vmFP vm) savedFP
+                    writeIORef (vmFrameSize vm) savedFS
                     writeIORef (vmCallStack vm) savedStack
                     writeIORef (vmCallDepth vm) savedDepth
                     return result

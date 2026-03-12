@@ -19,8 +19,6 @@ module Backends.Bytecode.Runner
 
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as T
-import Data.Text (Text)
-import Debug.Trace (trace)
 
 import Surface (Name, Lambda(..), hasImplicit)
 import State (Environment(..), InterpreterState(..))
@@ -57,10 +55,7 @@ compileToBytecode env state funcNames =
             if Map.null compilable
                 then Left
                     "No compilable functions found. Check that the function exists and has concrete types."
-                else trace ("[BC] Compilable functions: " ++ show (Map.keys compilable)
-                           ++ "\n[BC] First body: " ++ case Map.elems compilable of
-                                (lam:_) -> take 200 (show (body lam))
-                                _ -> "<none>") $ do
+                else do
                     -- Step 2: Convert plan functions to CLM
                     -- Include both top-level functions and instance functions
                     let clmFuncs = Map.map (lambdaToCLMLambda env) compilable
