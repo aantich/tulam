@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-6L53Q2T647"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-6L53Q2T647');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tulam — Type-Theory Functional Language</title>
+  <meta name="description" content="tulam is a type-theory based functional language built on two primitives: tuples and lambdas. Everything else is derived.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ---- Nav ---- -->
+<nav>
+  <div class="inner">
+    <a href="#" class="logo"><span>(</span>tulam<span>)</span></a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#examples">Examples</a>
+      <a href="#benchmarks">Performance</a>
+      <a href="#getting-started">Get Started</a>
+      <a href="https://github.com/aantich/tulam" class="gh">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ---- Hero ---- -->
+<section class="hero">
+  <h1><span>(</span>tulam<span>)</span></h1>
+  <p class="tagline">The most expressive type system.<br>Every backend. Native performance.</p>
+  <p class="tagline-sub">Dependent types, algebraic effects, and a compiler targeting JS, .NET, and LLVM &mdash; faster than C++ on real benchmarks.</p>
+  <div class="cta">
+    <a href="#getting-started" class="btn btn-primary">Get Started</a>
+    <a href="#examples" class="btn btn-secondary">See Examples</a>
+  </div>
+
+  <div class="hero-code">
+    <div class="code-block">
+      <div class="bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="filename">hello.tl</span>
+      </div>
+<pre><span class="cm">// Sum types with pattern matching</span>
+<span class="kw">type</span> <span class="ty">Maybe</span>(a:<span class="ty">Type</span>) = <span class="ct">Nothing</span> + <span class="ct">Just</span> * val:a;
+
+<span class="cm">// Algebraic structures (typeclasses)</span>
+<span class="kw">algebra</span> <span class="ty">Monoid</span>(a:<span class="ty">Type</span>) <span class="kw">extends</span> <span class="ty">Semigroup</span>(a) = {
+    <span class="kw">value</span> empty : a;
+};
+
+<span class="cm">// Functions with dependent types</span>
+<span class="kw">function</span> <span class="fn">map</span>(f: a <span class="op">-></span> b, xs: <span class="ty">List</span>(a)) : <span class="ty">List</span>(b) = <span class="kw">match</span> xs
+    | <span class="ct">Nil</span>         <span class="op">-></span> <span class="ct">Nil</span>
+    | <span class="ct">Cons</span>(h, t)  <span class="op">-></span> <span class="ct">Cons</span>(<span class="fn">f</span>(h), <span class="fn">map</span>(f, t));</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ---- Features ---- -->
+<section id="features">
+  <div class="inner">
+    <h2 class="section-title">Why tulam?</h2>
+    <p class="section-sub">A language designed from first principles, where the type system is the language.</p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="icon">&#x03BB;</div>
+        <h3>Two Primitives</h3>
+        <p>The entire type system &mdash; sum types, records, classes, effects &mdash; derives from tuples and lambdas. No hidden machinery. Every abstraction compiles down cleanly.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x2234;</div>
+        <h3>Categorical Vocabulary</h3>
+        <p><code>algebra</code> equips one type. <code>morphism</code> relates two or more. <code>extends</code> builds hierarchies. Laws are compiler-verified propositions, not comments. The compiler derives compositions automatically.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x03A3;</div>
+        <h3>Sigma Types</h3>
+        <p>Full dependent pairs and existentials with flat runtime layout. O(1) field access, zero pointer chasing &mdash; maps directly to .NET objects, JS objects, and C structs.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x03A0;</div>
+        <h3>Pi Types &amp; Universes</h3>
+        <p>Dependent functions <code>(x:A) &rarr; B(x)</code>, a cumulative universe hierarchy, and type-level computation that reuses the same evaluator as values. One language, not two.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x2261;</div>
+        <h3>Laws as Code</h3>
+        <p>Algebras declare equational laws with <code>===</code>. Not comments &mdash; the compiler carries them forward for rewrite-rule optimization and property test generation.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x2699;</div>
+        <h3>Composable Effects</h3>
+        <p>Effects are row-polymorphic: no monad transformers, no <code>lift</code>. Swap handlers per call-site &mdash; mock IO for tests, change concurrency backends, sandbox modules.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x21CB;</div>
+        <h3>Repr System</h3>
+        <p>Bidirectional representation mappings between user types and machine types. <code>expr as Type</code> inserts conversions automatically &mdash; direction resolved from the repr map.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x25C7;</div>
+        <h3>First-Class Classes</h3>
+        <p>OOP classes with 1-1 codegen mapping. <code>class</code> compiles to an actual class on every target &mdash; .NET, JS, C++. Single inheritance, abstract, sealed, override, final.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="icon">&#x27A1;</div>
+        <h3>Multi-Target Interop</h3>
+        <p>Compile to JS, .NET, or native via LLVM. Algebra-based interop: write a pure contract, provide <code>target</code>-qualified instances. The compiler selects and inlines per build target.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ---- Examples ---- -->
+<section id="examples">
+  <div class="inner">
+    <h2 class="section-title">By Example</h2>
+    <p class="section-sub">tulam combines the elegance of ML with the rigor of type theory.</p>
+
+    <div class="examples">
+
+      <!-- Example 1: Algebras & Morphisms -->
+      <div class="example-row">
+        <div class="example-text">
+          <h3>Algebras &amp; Morphisms</h3>
+          <p>An <code>algebra</code> equips one type with operations. A <code>morphism</code> relates two types directionally. Laws use <code>===</code> &mdash; they're not comments, they're compiler-verified propositions used for optimization and testing.</p>
+        </div>
+        <div class="code-block">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="filename">categorical.tl</span>
+          </div>
+<pre><span class="kw">algebra</span> <span class="ty">Monoid</span>(a:<span class="ty">Type</span>) <span class="kw">extends</span> <span class="ty">Semigroup</span>(a) = {
+    <span class="kw">value</span> empty : a;
+    <span class="kw">law</span> left_identity(x:a) =
+        <span class="fn">combine</span>(empty, x) <span class="op">===</span> x;
+};
+
+<span class="cm">// Morphisms relate two types</span>
+<span class="kw">morphism</span> <span class="ty">Iso</span>(a:<span class="ty">Type</span>, b:<span class="ty">Type</span>)
+    <span class="kw">extends</span> <span class="ty">Convertible</span>(a, b) = {
+    <span class="kw">function</span> <span class="fn">unconvert</span>(x:b) : a;
+    <span class="kw">law</span> roundtrip(x:a) =
+        <span class="fn">unconvert</span>(<span class="fn">convert</span>(x)) <span class="op">===</span> x;
+};</pre>
+        </div>
+      </div>
+
+      <!-- Example 2: Sigma Types & Existentials -->
+      <div class="example-row">
+        <div class="example-text">
+          <h3>Sigma Types &amp; Existentials</h3>
+          <p>Full dependent pairs where later fields depend on earlier values. Existentials hide concrete types behind interfaces. Flat runtime layout &mdash; O(1) field access, no nested pairs.</p>
+        </div>
+        <div class="code-block">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="filename">sigma.tl</span>
+          </div>
+<pre><span class="cm">// Existential: hide the type, keep the interface</span>
+<span class="kw">type</span> <span class="ty">Showable</span> = <span class="kw">exists</span> (a:<span class="ty">Type</span>).
+    val:a <span class="op">*</span> show:a <span class="op">-></span> <span class="ty">String</span>;
+
+<span class="cm">// Pi types — return type depends on value</span>
+<span class="kw">function</span> <span class="fn">replicate</span>(n:<span class="ty">Nat</span>, x:a) : <span class="ty">Vec</span>(a, n) =
+    <span class="kw">match</span> n
+    | <span class="ct">Z</span>       <span class="op">-></span> <span class="ct">VNil</span>
+    | <span class="ct">Succ</span>(k) <span class="op">-></span> <span class="ct">VCons</span>(x, <span class="fn">replicate</span>(k, x));
+
+<span class="cm">// Unpack existentials</span>
+<span class="kw">unpack</span> showable <span class="kw">as</span> (a, s) <span class="kw">in</span> s.show(s.val);</pre>
+        </div>
+      </div>
+
+      <!-- Example 3: Effects -->
+      <div class="example-row">
+        <div class="example-text">
+          <h3>Composable Effect Handlers</h3>
+          <p>Effects compose via row polymorphism &mdash; no monad transformer stacks, no <code>lift</code>. Swap handlers at the call site to mock IO, change backends, or sandbox modules. The same code runs pure or effectful.</p>
+        </div>
+        <div class="code-block">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="filename">effects.tl</span>
+          </div>
+<pre><span class="kw">effect</span> <span class="ty">Console</span> = {
+    <span class="kw">function</span> <span class="fn">print</span>(s:<span class="ty">String</span>) : <span class="ty">Unit</span>;
+    <span class="kw">function</span> <span class="fn">readLine</span>() : <span class="ty">String</span>;
+};
+
+<span class="kw">handler</span> <span class="fn">StdConsole</span> : <span class="ty">Console</span> = <span class="kw">default</span> {
+    <span class="kw">function</span> <span class="fn">print</span>(s) = putStrLn#(s);
+    <span class="kw">function</span> <span class="fn">readLine</span>() = readLine#();
+};
+
+<span class="cm">// Swap the handler — no code changes needed</span>
+<span class="fn">greet</span> [<span class="ty">Console</span> = <span class="fn">TestConsole</span>] (<span class="str">"world"</span>);</pre>
+        </div>
+      </div>
+
+      <!-- Example 4: Repr + Interop -->
+      <div class="example-row">
+        <div class="example-text">
+          <h3>Repr System &amp; Target Interop</h3>
+          <p>Bidirectional representation mappings between user types and machine types. <code>expr as Type</code> auto-inserts conversions. Target-qualified instances let the compiler select platform-native implementations per build target.</p>
+        </div>
+        <div class="code-block">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="filename">interop.tl</span>
+          </div>
+<pre><span class="cm">// Map user types to machine types</span>
+<span class="kw">repr</span> <span class="ty">Nat</span> <span class="kw">as</span> <span class="ty">Int</span> <span class="kw">default</span> <span class="kw">where</span> {
+    <span class="kw">function</span> <span class="fn">toRepr</span>(n:<span class="ty">Nat</span>) : <span class="ty">Int</span> = <span class="kw">match</span> n
+        | <span class="ct">Z</span>       <span class="op">-></span> <span class="num">0</span>
+        | <span class="ct">Succ</span>(m) <span class="op">-></span> <span class="num">1</span> <span class="op">+</span> <span class="fn">toRepr</span>(m);
+};
+
+<span class="cm">// Target-qualified instances</span>
+<span class="kw">target</span> dotnet {
+    <span class="kw">instance</span> <span class="ty">Show</span>(<span class="ty">Int</span>) =
+        <span class="fn">System.Int32.ToString</span>;
+};</pre>
+        </div>
+      </div>
+
+      <!-- Example 5: Classes -->
+      <div class="example-row">
+        <div class="example-text">
+          <h3>First-Class OOP</h3>
+          <p>Not an encoding &mdash; <code>class</code> compiles to a real class on every target. Single inheritance, abstract, sealed, override, final. Extend .NET/JS/C++ classes transparently from tulam source.</p>
+        </div>
+        <div class="code-block">
+          <div class="bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="filename">classes.tl</span>
+          </div>
+<pre><span class="kw">abstract class</span> <span class="ty">Shape</span>(color:<span class="ty">String</span>) = {
+    <span class="kw">function</span> <span class="fn">area</span>(self:<span class="ty">Shape</span>) : <span class="ty">Float64</span>;
+    <span class="kw">function</span> <span class="fn">describe</span>(self:<span class="ty">Shape</span>) : <span class="ty">String</span>
+        = <span class="str">"A "</span> <span class="op">++</span> self.color <span class="op">++</span> <span class="str">" shape"</span>;
+};
+
+<span class="kw">class</span> <span class="ty">Circle</span>(radius:<span class="ty">Float64</span>)
+    <span class="kw">extends</span> <span class="ty">Shape</span> = {
+    <span class="kw">override function</span> <span class="fn">area</span>(self:<span class="ty">Circle</span>)
+        : <span class="ty">Float64</span> =
+        <span class="num">3.14159</span> <span class="op">*</span> self.radius <span class="op">*</span> self.radius;
+};</pre>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ---- Benchmarks ---- -->
+<section id="benchmarks">
+  <div class="inner">
+    <h2 class="section-title">Performance</h2>
+    <p class="section-sub">
+      <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a> benchmarks &mdash; tulam native vs C++, Haskell (GHC), and JavaScript (Node).
+    </p>
+
+    <div class="bench-table-wrap">
+      <table class="bench-table">
+        <thead>
+          <tr>
+            <th>Benchmark</th>
+            <th>C++</th>
+            <th>Haskell</th>
+            <th>Node.js</th>
+            <th class="col-tulam">tulam native</th>
+            <th class="col-ratio">vs C++</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>List</td>
+            <td>8 &micro;s</td>
+            <td>6 &micro;s</td>
+            <td>50 &micro;s</td>
+            <td class="col-tulam">22 &micro;s</td>
+            <td class="col-ratio">2.7x</td>
+          </tr>
+          <tr>
+            <td>Queens</td>
+            <td>7 &micro;s</td>
+            <td>3 &micro;s</td>
+            <td>70 &micro;s</td>
+            <td class="col-tulam">43 &micro;s</td>
+            <td class="col-ratio">6.1x</td>
+          </tr>
+          <tr class="bench-win">
+            <td>Permute</td>
+            <td>11 &micro;s</td>
+            <td>35 &micro;s</td>
+            <td>82 &micro;s</td>
+            <td class="col-tulam">7 &micro;s</td>
+            <td class="col-ratio">0.6x</td>
+          </tr>
+          <tr>
+            <td>Sieve</td>
+            <td>6 &micro;s</td>
+            <td>26 &micro;s</td>
+            <td>96 &micro;s</td>
+            <td class="col-tulam">49 &micro;s</td>
+            <td class="col-ratio">8.1x</td>
+          </tr>
+          <tr>
+            <td>Towers</td>
+            <td>16 &micro;s</td>
+            <td>48 &micro;s</td>
+            <td>100 &micro;s</td>
+            <td class="col-tulam">105 &micro;s</td>
+            <td class="col-ratio">6.5x</td>
+          </tr>
+          <tr>
+            <td>NBody</td>
+            <td>8.8 ms</td>
+            <td>23.5 ms</td>
+            <td>11.8 ms</td>
+            <td class="col-tulam">41.3 ms</td>
+            <td class="col-ratio">4.6x</td>
+          </tr>
+          <tr>
+            <td>Bounce</td>
+            <td>5 &micro;s</td>
+            <td>18 &micro;s</td>
+            <td>145 &micro;s</td>
+            <td class="col-tulam">31 &micro;s</td>
+            <td class="col-ratio">6.2x</td>
+          </tr>
+          <tr class="bench-win">
+            <td>Storage</td>
+            <td>226 &micro;s</td>
+            <td>85 &micro;s</td>
+            <td>193 &micro;s</td>
+            <td class="col-tulam">206 &micro;s</td>
+            <td class="col-ratio">0.9x</td>
+          </tr>
+          <tr class="bench-win">
+            <td>Mandelbrot</td>
+            <td>19.5 ms</td>
+            <td>8.4 ms</td>
+            <td>18.6 ms</td>
+            <td class="col-tulam">11.8 ms</td>
+            <td class="col-ratio">0.6x</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td>Geometric mean</td>
+            <td>1.0x</td>
+            <td>2.0x</td>
+            <td>8.6x</td>
+            <td class="col-tulam">4.0x</td>
+            <td class="col-ratio">&mdash;</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <p class="bench-note">
+      <span class="bench-win-dot"></span> Faster than C++ &nbsp;&mdash;&nbsp;
+      Lower is better. Ratios show time relative to C++. Benchmarks from
+      <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a>
+      (objects, closures, arrays &mdash; no micro-tricks).
+    </p>
+  </div>
+</section>
+
+<!-- ---- Status ---- -->
+<section id="status">
+  <div class="inner">
+    <h2 class="section-title">Current Status</h2>
+    <p class="section-sub">tulam is under active development. Here's where things stand.</p>
+
+    <div class="status-grid">
+      <div class="status-card">
+        <h3>Language</h3>
+        <ul class="status-list">
+          <li class="done">Surface syntax finalized</li>
+          <li class="done">Parser complete</li>
+          <li class="done">Bidirectional type checker</li>
+          <li class="done">Module system with caching</li>
+          <li class="done">Standard library (13 modules)</li>
+          <li class="done">1050+ tests passing</li>
+        </ul>
+      </div>
+      <div class="status-card">
+        <h3>Backends</h3>
+        <ul class="status-list">
+          <li class="done">Bytecode interpreter</li>
+          <li class="done">LLVM native compilation</li>
+          <li class="wip">JavaScript codegen</li>
+          <li class="wip">.NET codegen</li>
+        </ul>
+      </div>
+      <div class="status-card">
+        <h3>Coming Next</h3>
+        <ul class="status-list">
+          <li class="planned">Full HKT support</li>
+          <li class="planned">Effect handler codegen</li>
+          <li class="planned">JS &amp; .NET targets</li>
+          <li class="planned">Package manager</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ---- Getting Started ---- -->
+<section id="getting-started">
+  <div class="inner">
+    <h2 class="section-title">Get Started</h2>
+    <p class="section-sub">tulam is built with Haskell Stack. Clone, build, and start the REPL in under a minute.</p>
+
+    <div class="code-block" style="max-width: 680px;">
+      <div class="bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="filename">terminal</span>
+      </div>
+<pre><span class="cm"># Clone the repository</span>
+$ git clone https://github.com/aantich/tulam.git
+$ cd tulam
+
+<span class="cm"># Build with Stack</span>
+$ stack build
+
+<span class="cm"># Start the REPL (loads standard library automatically)</span>
+$ stack exec tulam
+
+<span class="fn">tulam></span> <span class="num">1</span> <span class="op">+</span> <span class="num">2</span>
+<span class="num">3</span>
+
+<span class="fn">tulam></span> <span class="fn">map</span>(<span class="kw">fn</span>(x) = x <span class="op">*</span> <span class="num">2</span>, <span class="ct">Cons</span>(<span class="num">1</span>, <span class="ct">Cons</span>(<span class="num">2</span>, <span class="ct">Cons</span>(<span class="num">3</span>, <span class="ct">Nil</span>))))
+<span class="ct">Cons</span>(<span class="num">2</span>, <span class="ct">Cons</span>(<span class="num">4</span>, <span class="ct">Cons</span>(<span class="num">6</span>, <span class="ct">Nil</span>)))</pre>
+    </div>
+
+  </div>
+</section>
+
+<!-- ---- Footer ---- -->
+<footer>
+  <p><strong>tulam</strong> &mdash; tuples and lambdas, all the way down.</p>
+  <p style="margin-top: 0.5rem;">
+    <a href="https://github.com/aantich/tulam">GitHub</a>
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/aantich/tulam/blob/main/doc/LanguageReference.md">Language Reference</a>
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/aantich/tulam/blob/main/doc/ImplementationPlan.md">Roadmap</a>
+  </p>
+</footer>
+
+</body>
+</html>
