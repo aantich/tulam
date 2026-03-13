@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e0e18"/>
+      <stop offset="100%" stop-color="#13131f"/>
+    </linearGradient>
+  </defs>
+  <!-- Background -->
+  <rect width="512" height="512" rx="80" fill="url(#bg)"/>
+  <!-- Parentheses in accent purple -->
+  <text x="-55" y="410" font-family="JetBrains Mono, monospace" font-weight="800" font-size="380" fill="#7c6ff7">(</text>
+  <text x="315" y="410" font-family="JetBrains Mono, monospace" font-weight="800" font-size="380" fill="#7c6ff7">)</text>
+  <!-- 2 in white -->
+  <text x="75" y="390" font-family="JetBrains Mono, monospace" font-weight="700" font-size="270" fill="#ffffff">2</text>
+  <!-- Lambda in white -->
+  <text x="240" y="390" font-family="JetBrains Mono, monospace" font-weight="700" font-size="270" fill="#ffffff">&#x03BB;</text>
+</svg>
