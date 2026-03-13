@@ -7,6 +7,12 @@ extern "C" {
 
 // ---- Allocation ----
 tlm::Object* tlm_alloc(int32_t tag, int32_t num_fields);
+tlm::Object* tlm_alloc_slow(int32_t tag, int32_t num_fields);
+void tlm_free(tlm::Object* obj);
+
+// ---- Arena globals (for inline bump allocation from LLVM IR) ----
+extern char* tlm_arena_ptr;
+extern char* tlm_arena_end;
 
 // ---- Field access ----
 uint64_t tlm_get_field(tlm::Object* obj, int32_t index);

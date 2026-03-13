@@ -8,6 +8,9 @@
 -- Shared infrastructure: uses the SAME extern function names as the LLVM native
 -- backend (from lib/Backend/LLVM/Native.tl). The difference is that the native
 -- backend maps these to LLVM instructions while we map them to bytecode opcodes.
+--
+-- IMPORTANT: Every builtin MUST compile to proper bytecode instructions.
+-- No runtime dispatch fallback — everything is resolved at compile time.
 module Backends.Bytecode.Builtins
     ( BuiltinOp(..)
     , resolveBuiltin
@@ -20,38 +23,54 @@ import Data.HashMap.Strict (HashMap)
 import Backends.Bytecode.Instruction
 
 -- | How a builtin function maps to bytecode.
+-- Every variant MUST produce proper bytecode — no runtime fallback.
 data BuiltinOp
     = BInline1 (Int -> Int -> Instruction)
-      -- ^ Unary inline: takes (dst, src) → instruction
+      -- ^ Unary inline: takes (dst, src) -> instruction
     | BInline2 (Int -> Int -> Int -> Instruction)
-      -- ^ Binary inline: takes (dst, src1, src2) → instruction
+      -- ^ Binary inline: takes (dst, src1, src2) -> instruction
     | BNewRef
-      -- ^ newRef(val) → NEWREF dst, val
+      -- ^ newRef(val) -> NEWREF dst, val
     | BReadRef
-      -- ^ readRef(ref) → READREF dst, ref
+      -- ^ readRef(ref) -> READREF dst, ref
     | BWriteRef
-      -- ^ writeRef(ref, val) → WRITEREF ref, val
+      -- ^ writeRef(ref, val) -> WRITEREF ref, val
+    | BModifyRef
+      -- ^ modifyRef(ref, closure) -> MODREF dst, ref, closure
     | BNewMutArr
-      -- ^ newMutArray(len, default) → NEWMUTARR dst, len, default
+      -- ^ newMutArray(len, default) -> NEWMUTARR dst, len, default
     | BMutRead
-      -- ^ mutRead(arr, idx) → MUTREAD dst, arr, idx
+      -- ^ mutRead(arr, idx) -> MUTREAD dst, arr, idx
     | BMutWrite
-      -- ^ mutWrite(arr, idx, val) → MUTWRITE arr, idx, val
+      -- ^ mutWrite(arr, idx, val) -> MUTWRITE arr, idx, val
+    | BMutLen
+      -- ^ mutLength(arr) -> MUTLEN dst, arr
     | BPrint
-      -- ^ __print_string(s) → PRINT s
+      -- ^ __print_string(s) -> PRINT s
     | BPrintLn
-      -- ^ putStrLn(s) → PRINTLN s (convenience for handler-less path)
+      -- ^ putStrLn(s) -> PRINTLN s
     | BPrintNewline
-      -- ^ __print_newline() → special (emit newline)
+      -- ^ __print_newline() -> PRINTNL
     | BReadLine
-      -- ^ __read_line() / readLine() → READLINE dst
+      -- ^ __read_line() -> READLINE dst
     | BStrCat
-      -- ^ __string_concat(a, b) → STRCAT dst, a, b (also used for ++)
+      -- ^ __string_concat(a, b) -> STRCAT dst, a, b
     | BStrLen
-      -- ^ __string_length(s) → STRLEN dst, s
-    | BDispatch
-      -- ^ Fall through to VM DISPATCH instruction (for complex builtins
-      --   like __show_i64, modifyRef, etc. that need runtime logic)
+      -- ^ __string_length(s) -> STRLEN dst, s
+    | BShowI
+      -- ^ __show_i64(n) -> SHOWI dst, n (int -> string)
+    | BShowF
+      -- ^ __show_f64(x) -> SHOWF dst, x (float -> string)
+    | BShowC
+      -- ^ __show_char(c) -> SHOWC dst, c (char -> string)
+    | BShowS
+      -- ^ __string_show(s) -> SHOWS dst, s (string -> quoted)
+    | BError
+      -- ^ __error(msg) -> ERROR msgIdx
+    | BConstInt Int
+      -- ^ Compile-time constant integer (e.g. minBound, maxBound)
+    | BClockNanos
+      -- ^ clockNanos() -> CLOCK dst (monotonic nanoseconds)
 
 -- | Resolve a function name to its bytecode emission strategy.
 -- Returns Nothing if the function is not a known builtin.
@@ -127,14 +146,28 @@ builtinTable = Map.fromList $
     -- ====================================================================
     -- Type conversion
     -- ====================================================================
-    , ("__itof",     BInline1 IItoF)
-    , ("toFloat",    BInline1 IItoF)   -- user-facing name
+    , ("__itof",        BInline1 IItoF)
+    , ("__sitofp_i64",  BInline1 IItoF)   -- LLVM name for int->float
+    , ("__fptosi_f64",  BInline1 IFtoI)   -- LLVM name for float->int
+    , ("__fpext_f32",   BInline1 IMov)    -- f32->f64 identity in bytecode
+    , ("__fptrunc_f64", BInline1 IMov)    -- f64->f32 identity in bytecode
+    , ("toFloat",       BInline1 IItoF)   -- user-facing name
 
     -- ====================================================================
     -- String operations
     -- ====================================================================
     , ("__string_concat", BStrCat)
     , ("__string_length", BStrLen)
+    , ("__string_eq",     BInline2 IEqP)
+
+    -- ====================================================================
+    -- Show (value -> string conversion)
+    -- ====================================================================
+    , ("__show_i64",    BShowI)
+    , ("__show_f64",    BShowF)
+    , ("__show_f32",    BShowF)   -- f32 uses same float show in bytecode
+    , ("__show_char",   BShowC)
+    , ("__string_show", BShowS)
 
     -- ====================================================================
     -- IO / Console
@@ -142,73 +175,63 @@ builtinTable = Map.fromList $
     , ("__print_string",  BPrint)
     , ("__print_newline", BPrintNewline)
     , ("__read_line",     BReadLine)
-    , ("putStrLn",        BPrintLn)    -- direct call fallback
-    , ("putStr",          BPrint)      -- direct call fallback
+    , ("putStrLn",        BPrintLn)
+    , ("putStr",          BPrint)
 
     -- ====================================================================
-    -- Mutable references — primitive ops (from Native.tl handler resolution)
+    -- Mutable references
     -- ====================================================================
     , ("__newref",    BNewRef)
     , ("__readref",   BReadRef)
     , ("__writeref",  BWriteRef)
-    , ("__modifyref", BDispatch)  -- complex: needs closure call, handled by VM DISPATCH
-
-    -- Legacy direct names (fallback if handler resolution didn't run)
-    , ("newRef",    BNewRef)
-    , ("readRef",   BReadRef)
-    , ("writeRef",  BWriteRef)
-    , ("modifyRef", BDispatch)
+    , ("__modifyref", BModifyRef)
+    , ("newRef",      BNewRef)
+    , ("readRef",     BReadRef)
+    , ("writeRef",    BWriteRef)
+    , ("modifyRef",   BModifyRef)
 
     -- ====================================================================
-    -- Mutable arrays — primitive ops (from Native.tl handler resolution)
+    -- Mutable arrays
     -- ====================================================================
     , ("__newmutarray", BNewMutArr)
     , ("__mutread",     BMutRead)
     , ("__mutwrite",    BMutWrite)
-    , ("__mutlength",   BDispatch)
-    , ("__freeze",      BDispatch)
-    , ("__thaw",        BDispatch)
-    , ("__mutpush",     BDispatch)
-
-    -- Legacy direct names (fallback if handler resolution didn't run)
-    , ("newMutArray", BNewMutArr)
-    , ("mutRead",    BMutRead)
-    , ("mutWrite",   BMutWrite)
-
-    -- ====================================================================
-    -- Show / display (complex: needs runtime type dispatch)
-    -- ====================================================================
-    , ("__show_i64", BDispatch)
-    , ("__show_f64", BDispatch)
-    , ("__show_f32", BDispatch)
-    , ("__show_char", BDispatch)
-    , ("__string_show", BDispatch)
+    , ("__mutlength",   BMutLen)
+    , ("newMutArray",   BNewMutArr)
+    , ("mutRead",       BMutRead)
+    , ("mutWrite",      BMutWrite)
 
     -- ====================================================================
     -- Bounded / Enum
     -- ====================================================================
-    , ("__int_min_i64", BDispatch)
-    , ("__int_max_i64", BDispatch)
+    , ("__int_min_i64", BConstInt minBound)
+    , ("__int_max_i64", BConstInt maxBound)
+
+    -- ====================================================================
+    -- Clock
+    -- ====================================================================
+    , ("clockNanos",    BClockNanos)
+    , ("__clock_nanos", BClockNanos)
 
     -- ====================================================================
     -- Error handling
     -- ====================================================================
-    , ("__error", BDispatch)
+    , ("__error", BError)
 
     -- ====================================================================
     -- Char operations
     -- ====================================================================
-    , ("__eq_i32",   BInline2 IEqI)   -- Char is Int internally
-    , ("__neq_i32",  BInline2 INeqI)
-    , ("__lt_i32",   BInline2 ILtI)
-    , ("__le_i32",   BInline2 ILeI)
-    , ("__gt_i32",   BInline2 IGtI)
-    , ("__ge_i32",   BInline2 IGeI)
-    , ("__char_to_int", BInline1 IMov)  -- identity (Char is Int in bytecode)
-    , ("__int_to_char", BInline1 IMov)  -- identity
+    , ("__eq_i32",      BInline2 IEqI)   -- Char is Int internally
+    , ("__neq_i32",     BInline2 INeqI)
+    , ("__lt_i32",      BInline2 ILtI)
+    , ("__le_i32",      BInline2 ILeI)
+    , ("__gt_i32",      BInline2 IGtI)
+    , ("__ge_i32",      BInline2 IGeI)
+    , ("__char_to_int", BInline1 IMov)
+    , ("__int_to_char", BInline1 IMov)
 
     -- ====================================================================
-    -- Float32 arithmetic (mapped to Float64 in bytecode VM for simplicity)
+    -- Float32 arithmetic (mapped to Float64 in bytecode VM)
     -- ====================================================================
     , ("__add_f32",  BInline2 IAddF)
     , ("__sub_f32",  BInline2 ISubF)

@@ -1203,6 +1203,76 @@ ConsoleHandler_putStrLn("hello", \() ->
 // LLVM: standard function calls with continuation closures
 ```
 
+### 14.3 Region-Based Local State (ST Monad Equivalent)
+
+tulam's effect system provides a natural encoding of Haskell's `ST` monad — scoped
+mutable state that is guaranteed pure from the outside. Rather than a special monad,
+tulam uses a **Region effect** with a phantom type parameter to prevent refs from escaping.
+
+```
+// Region effect — phantom-tagged to prevent escape
+effect Region(r:Type) {
+    newRef(init:a) : Ref(r, a);
+    read(ref:Ref(r, a)) : a;
+    write(ref:Ref(r, a), val:a) : Unit;
+    newArray(size:Int, init:a) : MutArray(r, a);
+    arrayRead(arr:MutArray(r, a), idx:Int) : a;
+    arrayWrite(arr:MutArray(r, a), idx:Int, val:a) : Unit;
+}
+
+// runRegion : (forall r. Region(r) => a) -> a
+// The rank-2 forall r prevents refs from escaping the body.
+function runRegion(body: forall r. () -> a requires Region(r)) : a = ...;
+```
+
+**Usage example (Bounce-style):**
+```
+function bounceBall(balls:MutArray(r, Int), idx:Int) : Int requires Region(r) =
+    let {
+        x = arrayRead(balls, idx * 4);
+        y = arrayRead(balls, idx * 4 + 1);
+        // ... pure computation, no heap-allocated Ref needed ...
+    } in bounced;
+
+function benchBounce() : Int =
+    runRegion(fn() =
+        let { balls = newArray(400, 0); seed = newRef(74755) } in
+        // ... all refs are stack-local inside the region
+        simulate(balls, 0, 50, 100)
+    );
+```
+
+**Native backend compilation of `runRegion`:**
+
+| Operation | Compilation |
+|-----------|------------|
+| `runRegion(body)` | Inline body; all region ops become direct memory ops |
+| `newRef(init)` | `alloca` + store initial value (stack allocation) |
+| `read(ref)` | Single `load` instruction |
+| `write(ref, val)` | Single `store` instruction |
+| `newArray(n, init)` | `alloca` for small arrays, arena bump for large |
+| `arrayRead(arr, i)` | `getelementptr` + `load` |
+| `arrayWrite(arr, i, v)` | `getelementptr` + `store` |
+
+The key optimization: the compiler recognizes `Region` handlers as *static* — no
+dynamic dispatch, no CPS. The handler is fully inlined and all effect operations
+become direct LLVM instructions. This gives performance equivalent to C local
+variables and Haskell's `ST` monad (which GHC compiles to the same thing).
+
+**Escape prevention:** The phantom type `r` is existentially bound by `runRegion`.
+A `Ref(r, Int)` cannot appear in the return type of the body because `r` is not
+in scope outside. The type checker rejects programs that try to return a ref:
+
+```
+// Type error: r escapes its scope
+let leaked = runRegion(fn() = newRef(42));  // ERROR
+```
+
+**Interaction with Perceus RC:** Region-local refs are stack-allocated and never
+reference-counted. The region's lifetime is lexically scoped — everything is freed
+when the stack frame pops. This is the fastest path: zero RC overhead, zero GC,
+zero heap allocation.
+
 ---
 
 ## 15. SIMD & Numeric Fast Paths

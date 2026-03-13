@@ -125,8 +125,8 @@ vmTests = describe "VM execution" $ do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
                 case result of
-                    Right (VObj (HCon 0 0 _)) -> return ()
-                    other -> expectationFailure $ "Expected True constructor, got: " ++ show other
+                    Right (VBool True) -> return ()
+                    other -> expectationFailure $ "Expected VBool True, got: " ++ show other
 
     it "constructs and accesses fields" $ do
         -- function f() = let p = Pair(10, 20) in p.0

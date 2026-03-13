@@ -22,6 +22,7 @@ import Control.Monad (filterM, foldM)
 import Data.Foldable (foldrM)
 import Intrinsics (lookupIntrinsic, boolToCLM)
 import System.Directory (doesFileExist)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.IORef
 import Data.Char (chr)
 import Data.Word (Word8)
@@ -808,6 +809,11 @@ dispatchIOIntrinsic "appendFile" [arg1, arg2] = do
 dispatchIOIntrinsic "fileExists" [arg] = do
     exists <- liftIO $ doesFileExist (clmExprToString arg)
     pure $ Just $ boolToCLM exists
+-- Clock effect: monotonic nanosecond clock
+dispatchIOIntrinsic "clockNanos" [] = do
+    t <- liftIO getPOSIXTime
+    let nanos = floor (t * 1e9) :: Int
+    pure $ Just $ CLMLIT (LInt nanos)
 -- Note: bind, seq, pure are NOT intercepted here — they go through normal
 -- CLMIAP instance dispatch (Maybe.bind, List.bind, etc.). Effect-specific
 -- bind/seq will be handled via effect handler instances when registered.

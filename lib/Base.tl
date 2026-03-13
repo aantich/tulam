@@ -41,3 +41,4 @@ export Math.Stats;
 export Math.Transform;
 export Math.Optimize;
 export Math.Random;
+export System.Time;

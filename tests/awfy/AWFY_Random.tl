@@ -1,3 +1,5 @@
+module AWFY_Random;
+
 // AWFY Random — LCG pseudo-random number generator
 // Used by Bounce and Storage benchmarks.
 // Linear congruential generator: (seed * 1309 + 13849) .&. 65535

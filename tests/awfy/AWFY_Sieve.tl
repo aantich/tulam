@@ -1,3 +1,6 @@
+module AWFY_Sieve;
+import Harness;
+
 // AWFY Sieve — Sieve of Eratosthenes
 // Finds prime numbers up to 5000 using a mutable boolean array.
 
@@ -24,7 +27,24 @@ function benchSieve() : Int = sieve(5000);
 
 function verifySieve() : Bool = benchSieve() == 669;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchSieve();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == 669;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchSieve(); u = putStrLn("AWFY Sieve: " ++ show(result)) } in
-    if verifySieve() then putStrLn("PASS")
-    else putStrLn("FAIL: expected 669");
+    let {
+        u1 = putStrLn("Starting Sieve benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Sieve", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("Sieve", t, 10);

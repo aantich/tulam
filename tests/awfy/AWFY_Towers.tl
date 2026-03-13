@@ -1,3 +1,6 @@
+module AWFY_Towers;
+import Harness;
+
 // AWFY Towers — Tower of Hanoi
 // Recursive disk moves between 3 pegs using linked-list stacks.
 
@@ -43,7 +46,24 @@ function benchTowers() : Int =
 
 function verifyTowers() : Bool = benchTowers() == 8191;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchTowers();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == 8191;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchTowers(); u = putStrLn("AWFY Towers: " ++ show(result)) } in
-    if verifyTowers() then putStrLn("PASS")
-    else putStrLn("FAIL: expected 8191");
+    let {
+        u1 = putStrLn("Starting Towers benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Towers", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("Towers", t, 10);

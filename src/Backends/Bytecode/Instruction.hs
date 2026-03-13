@@ -113,11 +113,25 @@ data OpCode
     -- Strings
     | OP_STRCAT      -- 0x78  A: r = a ++ b
     | OP_STRLEN      -- 0x79  A: r = length(a)
-    -- Dispatch (REPL fallback)
-    | OP_DISPATCH    -- 0x80  special: runtime dispatch
+    -- Show (value → string conversion)
+    | OP_SHOWI       -- 0x7A  A: r = show(int)
+    | OP_SHOWF       -- 0x7B  A: r = show(float)
+    | OP_SHOWC       -- 0x7C  A: r = show(char)
+    | OP_SHOWS       -- 0x7D  A: r = show(string) (quoted)
+    -- Print newline
+    | OP_PRINTNL     -- 0x7E  D: print newline to stdout
+    -- Clock
+    | OP_CLOCK       -- 0x73  B: r = monotonic clock (nanoseconds)
+    -- Method call (OOP dynamic dispatch)
+    | OP_MCALL       -- 0x80  special: r = obj.method(args)
+    -- ModifyRef (higher-order: reads ref, calls closure, writes result)
+    | OP_MODREF      -- 0x7F  A: modifyRef(refReg, closureReg) result in dst
+    -- FtoI (float→int truncation, complementing ITOF)
+    -- (OP_FTOI already exists at 0x25)
     -- Debug
     | OP_DEBUGLOC    -- 0xF0  B: set source location
-    | OP_ERROR       -- 0xF1  B: raise error
+    | OP_ERROR       -- 0xF1  B: raise error (constant message)
+    | OP_ERRORREG   -- 0xF2  B: raise error (register message)
     | OP_NOP         -- 0xFE  D: no-op
     | OP_HALT        -- 0xFF  D: stop
     deriving (Show, Eq, Ord, Enum, Bounded)
@@ -198,11 +212,19 @@ opToByte OP_PERFORM     = 0x6A
 opToByte OP_PRINT       = 0x70
 opToByte OP_PRINTLN     = 0x71
 opToByte OP_READLINE    = 0x72
+opToByte OP_CLOCK       = 0x73
 opToByte OP_STRCAT      = 0x78
 opToByte OP_STRLEN      = 0x79
-opToByte OP_DISPATCH    = 0x80
+opToByte OP_SHOWI       = 0x7A
+opToByte OP_SHOWF       = 0x7B
+opToByte OP_SHOWC       = 0x7C
+opToByte OP_SHOWS       = 0x7D
+opToByte OP_PRINTNL     = 0x7E
+opToByte OP_MODREF      = 0x7F
+opToByte OP_MCALL       = 0x80
 opToByte OP_DEBUGLOC    = 0xF0
 opToByte OP_ERROR       = 0xF1
+opToByte OP_ERRORREG   = 0xF2
 opToByte OP_NOP         = 0xFE
 opToByte OP_HALT        = 0xFF
 
@@ -282,11 +304,19 @@ byteToOp 0x6A = Just OP_PERFORM
 byteToOp 0x70 = Just OP_PRINT
 byteToOp 0x71 = Just OP_PRINTLN
 byteToOp 0x72 = Just OP_READLINE
+byteToOp 0x73 = Just OP_CLOCK
 byteToOp 0x78 = Just OP_STRCAT
 byteToOp 0x79 = Just OP_STRLEN
-byteToOp 0x80 = Just OP_DISPATCH
+byteToOp 0x7A = Just OP_SHOWI
+byteToOp 0x7B = Just OP_SHOWF
+byteToOp 0x7C = Just OP_SHOWC
+byteToOp 0x7D = Just OP_SHOWS
+byteToOp 0x7E = Just OP_PRINTNL
+byteToOp 0x7F = Just OP_MODREF
+byteToOp 0x80 = Just OP_MCALL
 byteToOp 0xF0 = Just OP_DEBUGLOC
 byteToOp 0xF1 = Just OP_ERROR
+byteToOp 0xF2 = Just OP_ERRORREG
 byteToOp 0xFE = Just OP_NOP
 byteToOp 0xFF = Just OP_HALT
 byteToOp _    = Nothing
@@ -381,14 +411,26 @@ data Instruction
     | IPrint     !Int             -- src
     | IPrintLn   !Int             -- src
     | IReadLine  !Int             -- dst
+    -- Clock
+    | IClock     !Int             -- dst (monotonic nanos)
     -- Strings
     | IStrCat    !Int !Int !Int   -- dst, src1, src2
     | IStrLen    !Int !Int        -- dst, src
-    -- Dispatch
-    | IDispatch  !Int !Int !Int   -- dst, nameIdx, nargs
+    -- Show (value->string)
+    | IShowI     !Int !Int        -- dst, src (int->string)
+    | IShowF     !Int !Int        -- dst, src (float->string)
+    | IShowC     !Int !Int        -- dst, src (char->string)
+    | IShowS     !Int !Int        -- dst, src (string->quoted)
+    -- Print newline
+    | IPrintNl                    -- print newline
+    -- ModifyRef
+    | IModRef    !Int !Int !Int   -- dst, refReg, closureReg
+    -- Method call (OOP)
+    | IMCall     !Int !Int !Int   -- dst, nameIdx, nargs (obj+args in dst+1..dst+nargs)
     -- Debug
     | IDebugLoc  !Int             -- srcIdx
-    | IError     !Int             -- msgIdx
+    | IError     !Int             -- msgIdx (constant pool)
+    | IErrorReg  !Int             -- srcReg (runtime string)
     | INop
     | IHalt
     deriving (Show, Eq)
@@ -470,11 +512,19 @@ encodeInstr instr = case instr of
     IPrint s        -> mkB OP_PRINT s 0
     IPrintLn s      -> mkB OP_PRINTLN s 0
     IReadLine d     -> mkB OP_READLINE d 0
+    IClock d        -> mkB OP_CLOCK d 0
     IStrCat d a b   -> mkA OP_STRCAT d a b
     IStrLen d a     -> mkA OP_STRLEN d a 0
-    IDispatch d n a -> mkA OP_DISPATCH d n a
+    IShowI d a      -> mkA OP_SHOWI d a 0
+    IShowF d a      -> mkA OP_SHOWF d a 0
+    IShowC d a      -> mkA OP_SHOWC d a 0
+    IShowS d a      -> mkA OP_SHOWS d a 0
+    IPrintNl        -> mkD OP_PRINTNL 0
+    IModRef d r c   -> mkA OP_MODREF d r c
+    IMCall d n a    -> mkA OP_MCALL d n a
     IDebugLoc s     -> mkB OP_DEBUGLOC 0 s
     IError m        -> mkB OP_ERROR 0 m
+    IErrorReg r     -> mkB OP_ERRORREG r 0
     INop            -> mkD OP_NOP 0
     IHalt           -> mkD OP_HALT 0
 
@@ -583,11 +633,19 @@ decodeInstr w =
         Just OP_PRINT       -> Just $ IPrint a
         Just OP_PRINTLN     -> Just $ IPrintLn a
         Just OP_READLINE    -> Just $ IReadLine a
+        Just OP_CLOCK       -> Just $ IClock a
         Just OP_STRCAT      -> Just $ IStrCat a b c
         Just OP_STRLEN      -> Just $ IStrLen a b
-        Just OP_DISPATCH    -> Just $ IDispatch a b c
+        Just OP_SHOWI       -> Just $ IShowI a b
+        Just OP_SHOWF       -> Just $ IShowF a b
+        Just OP_SHOWC       -> Just $ IShowC a b
+        Just OP_SHOWS       -> Just $ IShowS a b
+        Just OP_PRINTNL     -> Just IPrintNl
+        Just OP_MODREF      -> Just $ IModRef a b c
+        Just OP_MCALL       -> Just $ IMCall a b c
         Just OP_DEBUGLOC    -> Just $ IDebugLoc imm16
         Just OP_ERROR       -> Just $ IError imm16
+        Just OP_ERRORREG   -> Just $ IErrorReg a
         Just OP_NOP         -> Just INop
         Just OP_HALT        -> Just IHalt
         Nothing             -> Nothing
@@ -669,11 +727,19 @@ disassembleOne pc instr = padRight 6 (show pc) ++ "  " ++ case instr of
     IPrint s        -> "PRINT     r" ++ show s
     IPrintLn s      -> "PRINTLN   r" ++ show s
     IReadLine d     -> "READLINE  r" ++ show d
+    IClock d        -> "CLOCK     r" ++ show d
     IStrCat d a b   -> "STRCAT    r" ++ show d ++ ", r" ++ show a ++ ", r" ++ show b
     IStrLen d a     -> "STRLEN    r" ++ show d ++ ", r" ++ show a
-    IDispatch d n a -> "DISPATCH  r" ++ show d ++ ", name" ++ show n ++ ", " ++ show a
+    IShowI d a      -> "SHOWI     r" ++ show d ++ ", r" ++ show a
+    IShowF d a      -> "SHOWF     r" ++ show d ++ ", r" ++ show a
+    IShowC d a      -> "SHOWC     r" ++ show d ++ ", r" ++ show a
+    IShowS d a      -> "SHOWS     r" ++ show d ++ ", r" ++ show a
+    IPrintNl        -> "PRINTNL"
+    IModRef d r c   -> "MODREF    r" ++ show d ++ ", r" ++ show r ++ ", r" ++ show c
+    IMCall d n a    -> "MCALL     r" ++ show d ++ ", name" ++ show n ++ ", " ++ show a
     IDebugLoc s     -> "DEBUGLOC  " ++ show s
     IError m        -> "ERROR     msg" ++ show m
+    IErrorReg r     -> "ERRORREG  r" ++ show r
     INop            -> "NOP"
     IHalt           -> "HALT"
   where

@@ -17,6 +17,7 @@ module Backends.LLVM.NativeCompile
 import qualified Data.HashMap.Strict as Map
 import qualified Data.HashSet as HSet
 import Data.Maybe (fromMaybe)
+import Data.List (nubBy)
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
 import System.Directory (doesFileExist)
@@ -26,10 +27,12 @@ import State (Environment(..), InterpreterState(..), lookupLambda)
 import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import Backends.LLVM.LIR
+import qualified Data.HashSet as HSet
 import Backends.LLVM.CLMToLIR (lowerFunction, buildExternMap,
                                 surfaceTypeToLType, surfaceRetTypeToLType,
                                 ExternMap, externDeclarations,
-                                sanitizeName, LowerError(..))
+                                sanitizeName, LowerError(..),
+                                detectNullaryAsNull)
 import Backends.LLVM.LIRToLLVM (emitModule, addRuntimeExterns)
 
 -- | Compilation result.
@@ -50,7 +53,7 @@ data NativeConfig = NativeConfig
 
 defaultNativeConfig :: NativeConfig
 defaultNativeConfig = NativeConfig
-    { ncOptLevel = 1
+    { ncOptLevel = 3
     , ncEmitIR = False
     , ncEntryPoint = Nothing
     , ncOutputPath = "/tmp/tulam_native"
@@ -88,9 +91,12 @@ compileNative env state config funcNames = do
                                  , surfaceRetTypeToLType (lamType lam)
                                  )) | (n, lam) <- Map.toList compilable]
 
+                    -- Detect nullary-as-null tags globally (Phase 2)
+                    let globalNullary = mconcat [detectNullaryAsNull clm | (_, clm) <- Map.toList clmFuncs]
+
                     -- Step 5: Lower CLM → LIR (with per-function error reporting)
                     results <- mapM (\(n, clm) -> do
-                        r <- lowerFunction n clm funcTypeMap extMap
+                        r <- lowerFunction n clm funcTypeMap extMap globalNullary
                         case r of
                             Left (LowerError err) -> return $ Left $ LowerError $
                                 "in function '" ++ n ++ "': " ++ err
@@ -101,15 +107,19 @@ compileNative env state config funcNames = do
                         Left (LowerError err) -> return $ CompileError $
                             "LIR lowering error: " ++ err
                         Right funcsAndGlobals -> do
-                            let (lirFuncs, globalss) = unzip funcsAndGlobals
+                            let (lirFuncLists, globalss) = unzip funcsAndGlobals
+                                lirFuncs = concat lirFuncLists
                                 -- Generate main() if entry point specified
                                 mainFunc = case ncEntryPoint config of
                                     Just ep -> [generateMain ep funcTypeMap]
                                     Nothing -> []
                                 -- Only declare externs that are actually used
                                 extDecls = externDeclarations extMap
+                                -- Deduplicate globals by name
+                                allGlobals = nubBy (\a b -> globalName a == globalName b)
+                                                   (concat globalss)
                                 lmod = addRuntimeExterns $ LModule "tulam_native"
-                                    (concat globalss)
+                                    allGlobals
                                     (lirFuncs ++ mainFunc)
                                     extDecls
 
@@ -131,7 +141,7 @@ compileWithClang config llvmIR = do
         else do
             let optFlag = "-O" ++ show (ncOptLevel config)
             (exitCode, _, stderr) <- readProcessWithExitCode "clang++"
-                [ "-std=c++17", optFlag
+                [ "-std=c++17", optFlag, "-flto", "-march=native"
                 , llFile, ncRuntimePath config
                 , "-o", ncOutputPath config
                 , "-lm"
@@ -151,6 +161,12 @@ generateMain entryName funcTypeMap =
         instrs = case retTy of
             LTVoid ->
                 [ ("_call", LCall llvmName [] LTVoid) ]
+            LTBool ->
+                [ ("result", LCall llvmName [] LTBool)
+                , ("result_i32", LZext (LVar "result" LTBool) LTInt32)
+                , ("_p", LCall "tlm_print_bool" [LVar "result_i32" LTInt32] LTVoid)
+                , ("_n", LCall "tlm_print_newline" [] LTVoid)
+                ]
             _ ->
                 [ ("result", LCall llvmName [] retTy)
                 , printResult retTy
@@ -158,7 +174,7 @@ generateMain entryName funcTypeMap =
                 ]
     in LFunction "main" [] LTInt32
         [ LBlock "entry" instrs (LRet (LLitInt 0 LTInt32))
-        ] False
+        ] False []
   where
     printResult LTInt64   = ("_p", LCall "tlm_print_int" [LVar "result" LTInt64] LTVoid)
     printResult LTFloat64 = ("_p", LCall "tlm_print_float" [LVar "result" LTFloat64] LTVoid)

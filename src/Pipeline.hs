@@ -28,6 +28,7 @@ import Text.Pretty.Simple (pPrint, pShow)
 
 import Data.HashMap.Strict as Map
 import qualified Data.HashSet as Set
+import qualified Debug.Trace
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 
 -- | Wrap a pass with wall-clock timing when verbose is on
@@ -1255,163 +1256,202 @@ wrapClmBody (CLMLam vs bdy@(CLMIAP _ _)) retTy = CLMLam vs (CLMTYPED bdy retTy)
 wrapClmBody clm _ = clm
     
 
-varToCLMVar e v = (name v, exprToCLM e (val v))
+varToCLMVar e scope v = (name v, exprToCLM' e scope (val v))
 
-varsToCLMVars e vs = Prelude.map (varToCLMVar e) vs
+varsToCLMVars e scope vs = Prelude.map (varToCLMVar e scope) vs
 
-patternCheckToCLM :: Environment -> Expr -> CLMPatternCheck
-patternCheckToCLM e (PatternGuard (PCheckTag ct) ex) = CLMCheckTag ct (exprToCLM e ex)
-patternCheckToCLM e (PatternGuard (PCheckLit lit) ex) = CLMCheckLit lit (exprToCLM e ex)
-patternCheckToCLM e ex = CLMCheckTag (ConsTag "ERROR" (-1)) (CLMERR ("Invalid pattern check: " ++ show ex) SourceInteractive)
+patternCheckToCLM :: Environment -> Set.HashSet Name -> Expr -> CLMPatternCheck
+patternCheckToCLM e scope (PatternGuard (PCheckTag ct) ex) = CLMCheckTag ct (exprToCLM' e scope ex)
+patternCheckToCLM e scope (PatternGuard (PCheckLit lit) ex) = CLMCheckLit lit (exprToCLM' e scope ex)
+patternCheckToCLM e _ ex = CLMCheckTag (ConsTag "ERROR" (-1)) (CLMERR ("Invalid pattern check: " ++ show ex) SourceInteractive)
 
+-- | Convert a CaseOf Var (raw pattern match variable) to CLM pattern checks.
+-- CaseOf [Var nm _ (Id consName)] body → check nm has tag consName
+-- CaseOf [Var nm _ (Lit lit)] body → check nm equals lit
+-- CaseOf [Var nm _ (App (Id cons) fields)] body → check tag + bind fields
+varToCLMChecks :: Environment -> Set.HashSet Name -> Var -> [CLMPatternCheck]
+varToCLMChecks env scope (Var nm _ val) = case val of
+    -- Constructor match: case nm of ConsName
+    Id consName -> case lookupConstructor consName env of
+        Just (_cons, tagIdx) -> [CLMCheckTag (ConsTag consName tagIdx) (CLMID nm)]
+        Nothing -> []  -- variable binding, no check needed
+    -- Constructor with fields: case nm of Cons(a, b)
+    App (Id consName) _fields -> case lookupConstructor consName env of
+        Just (_cons, tagIdx) -> [CLMCheckTag (ConsTag consName tagIdx) (CLMID nm)]
+        Nothing -> []
+    -- Literal match: case nm of 42
+    Lit lit -> [CLMCheckLit lit (CLMID nm)]
+    -- Wildcard/variable binding: no check
+    _ -> []
+
+-- | Public API: convert Surface Expr to CLM with empty local scope.
+-- Used by Interpreter.hs and other callers that don't track scope.
 exprToCLM :: Environment -> Expr -> CLMExpr
-exprToCLM _ UNDEFINED = CLMEMPTY
-exprToCLM env (Binding v) = CLMBIND (name v) (exprToCLM env $ val v)
-exprToCLM env (Statements exs) = CLMPROG (Prelude.map (exprToCLM env) exs)
+exprToCLM env = exprToCLM' env Set.empty
+
+-- | Check if a name shadows a global implicit-param function.
+-- Returns the shadowed global name for warning purposes.
+checkShadowing :: Environment -> Name -> Maybe Name
+checkShadowing env n = case lookupLambda n env of
+    Just fun | hasImplicit fun -> Just n
+    _ -> Nothing
+
+-- | Emit a shadowing warning via trace (pure context).
+warnShadow :: Name -> Name -> a -> a
+warnShadow localCtx n = Debug.Trace.trace $
+    "[CLM] Warning: local variable '" ++ n ++ "' shadows global implicit-param function '" ++ n ++ "' (in " ++ localCtx ++ ")"
+
+-- | Collect param names and emit shadowing warnings.
+scopeFromParams :: Environment -> Name -> [Var] -> Set.HashSet Name
+scopeFromParams env ctx ps =
+    let names = [name v | v <- ps, not (isImplicitVar v)]
+        addName acc n = case checkShadowing env n of
+            Just _  -> warnShadow ctx n (Set.insert n acc)
+            Nothing -> Set.insert n acc
+    in Prelude.foldl addName Set.empty names
+
+-- | Core CLM conversion with local scope tracking.
+-- The scope set contains locally-bound names (params, let-bindings, pattern vars).
+-- When a name is in local scope, it is treated as a local variable reference (CLMID),
+-- never as a global implicit-param dispatch (CLMIAP).
+exprToCLM' :: Environment -> Set.HashSet Name -> Expr -> CLMExpr
+exprToCLM' _ _ UNDEFINED = CLMEMPTY
+exprToCLM' env scope (Binding v) = CLMBIND (name v) (exprToCLM' env scope $ val v)
+exprToCLM' env scope (Statements exs) = CLMPROG (Prelude.map (exprToCLM' env scope) exs)
 -- Class system: ClassName.new(args) → CLMNEW
-exprToCLM env (App (RecFieldAccess ("new", _) (Id className)) args)
+exprToCLM' env scope (App (RecFieldAccess ("new", _) (Id className)) args)
     | Map.member className (classDecls env) =
-        CLMNEW className (Prelude.map (exprToCLM env) args)
+        CLMNEW className (Prelude.map (exprToCLM' env scope) args)
 -- Class system: super.method(args) → CLMSCALL
-exprToCLM env (App (RecFieldAccess (methodName, _) (Id "super")) args) =
-    CLMSCALL (CLMID "self") methodName (Prelude.map (exprToCLM env) args)
+exprToCLM' env scope (App (RecFieldAccess (methodName, _) (Id "super")) args) =
+    CLMSCALL (CLMID "self") methodName (Prelude.map (exprToCLM' env scope) args)
 -- Class system: obj.method(args) → CLMMCALL when obj is known class type
--- We check if the receiver is an Id whose type is a class, or try field access lookup
-exprToCLM env (App (RecFieldAccess (memberName, _) objExpr) args)
+exprToCLM' env scope (App (RecFieldAccess (memberName, _) objExpr) args)
     | Just className <- inferClassFromExpr env objExpr
     , Just cm <- lookupClass className env
     , Map.member memberName (cmMethods cm) =
-        CLMMCALL (exprToCLM env objExpr) memberName (Prelude.map (exprToCLM env) args)
+        CLMMCALL (exprToCLM' env scope objExpr) memberName (Prelude.map (exprToCLM' env scope) args)
     | Just className <- inferClassFromExpr env objExpr
     , Just cm <- lookupClass className env
     , Map.member memberName (cmStaticMethods cm) =
-        CLMAPP (CLMID (className ++ "$" ++ memberName)) (Prelude.map (exprToCLM env) args)
+        CLMAPP (CLMID (className ++ "$" ++ memberName)) (Prelude.map (exprToCLM' env scope) args)
 -- Named field access: resolve name to index at compile time if possible
-exprToCLM env (RecFieldAccess (nm, -1) e) | nm /= "" =
-    let clmE = exprToCLM env e
-    in  -- Class field access: resolve from class field indices
-        case inferClassFromExpr env e of
+exprToCLM' env scope (RecFieldAccess (nm, -1) e) | nm /= "" =
+    let clmE = exprToCLM' env scope e
+    in  case inferClassFromExpr env e of
             Just className | Just cm <- lookupClass className env
                            , Just idx <- Map.lookup nm (cmFieldIndices cm)
                 -> CLMFieldAccess (nm, idx) clmE
             _ -> case resolveFieldIndex env nm of
                     Just (_, idx) -> CLMFieldAccess (nm, idx) clmE
-                    Nothing       -> CLMFieldAccess (nm, -1) clmE  -- defer to interpreter
-exprToCLM env (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLM env e)
-exprToCLM env (ExpandedCase cases ex si) = CLMCASE (Prelude.map (patternCheckToCLM env) cases) (exprToCLM env ex)
-exprToCLM env Intrinsic = CLMPRIMCALL
-exprToCLM env Derive = CLMPRIMCALL
-exprToCLM env (ConTuple cs exs) = CLMCON cs (Prelude.map (exprToCLM env) exs)
--- have to check for a case when Id in fact refers to an 0-arg constructor call
--- since we need to change it for a corresponding tuple
--- also check for nullary implicit-param functions (e.g., value declarations)
-exprToCLM env (Id n) =
-    case (lookupConstructor n env) of
-        Just (cons, i) ->
-            if ((params cons) == [] )
-            then CLMCON (ConsTag n i) []
-            else CLMID n
-        Nothing -> case lookupLambda n env of
-            Just fun | hasImplicit fun -> CLMIAP (CLMID n) []
-            _ -> CLMID n
--- application of func or cons to an expression: doing a bunch of checks
--- while converting
-exprToCLM env e@(App (Id nm) exs) = 
-    let newArgs = Prelude.map (exprToCLM env) exs
-        mcons = lookupConstructor nm env
-    in  case mcons of
-            Just (cons, i) -> 
-                  if (Prelude.length (params cons) /= (Prelude.length newArgs) )
-                  then CLMERR ("[CLM] wrong number of arguments in constructor application: " ++ show e) SourceInteractive
-                  else CLMCON (ConsTag nm i) newArgs
-            Nothing -> 
-                let mfun = lookupLambda nm env
-                in  case mfun of
-                        Just fun -> 
-                            if (hasImplicit fun)
-                            then CLMIAP (CLMID nm) newArgs
-                            else
-                                if (Prelude.length (params fun) > (Prelude.length newArgs) )
-                                then CLMPAP (CLMID nm) newArgs
-                                else if (Prelude.length (params fun) == (Prelude.length newArgs) )
-                                    then CLMAPP (CLMID nm) newArgs
-                                    else CLMERR ("[CLM] function is given more arguments than it can handle: " ++ show e) SourceInteractive
-                        Nothing -> CLMAPP (CLMID nm) newArgs
-            
-    
-exprToCLM env (App ex exs) = CLMAPP (exprToCLM env ex) (Prelude.map (exprToCLM env) exs)
-exprToCLM env (Function lam) = CLMLAM $ lambdaToCLMLambda env lam
-exprToCLM env (Lit l) = CLMLIT l
-exprToCLM _ (U l) = CLMU l
+                    Nothing       -> CLMFieldAccess (nm, -1) clmE
+exprToCLM' env scope (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLM' env scope e)
+exprToCLM' env scope (ExpandedCase cases ex si) = CLMCASE (Prelude.map (patternCheckToCLM env scope) cases) (exprToCLM' env scope ex)
+exprToCLM' _ _ Intrinsic = CLMPRIMCALL
+exprToCLM' _ _ Derive = CLMPRIMCALL
+exprToCLM' env scope (ConTuple cs exs) = CLMCON cs (Prelude.map (exprToCLM' env scope) exs)
+-- Id: check local scope FIRST, then constructors, then global env
+exprToCLM' env scope (Id n)
+    | Set.member n scope = CLMID n  -- local variable, never CLMIAP
+    | otherwise =
+        case (lookupConstructor n env) of
+            Just (cons, i) ->
+                if ((params cons) == [] )
+                then CLMCON (ConsTag n i) []
+                else CLMID n
+            Nothing -> case lookupLambda n env of
+                Just fun | hasImplicit fun -> CLMIAP (CLMID n) []
+                _ -> CLMID n
+-- App (Id nm): check local scope FIRST for the function name
+exprToCLM' env scope e@(App (Id nm) exs)
+    | Set.member nm scope =
+        -- Local variable used as a function — direct call, never CLMIAP
+        let newArgs = Prelude.map (exprToCLM' env scope) exs
+        in CLMAPP (CLMID nm) newArgs
+    | otherwise =
+        let newArgs = Prelude.map (exprToCLM' env scope) exs
+            mcons = lookupConstructor nm env
+        in  case mcons of
+                Just (cons, i) ->
+                      if (Prelude.length (params cons) /= (Prelude.length newArgs) )
+                      then CLMERR ("[CLM] wrong number of arguments in constructor application: " ++ show e) SourceInteractive
+                      else CLMCON (ConsTag nm i) newArgs
+                Nothing ->
+                    let mfun = lookupLambda nm env
+                    in  case mfun of
+                            Just fun ->
+                                if (hasImplicit fun)
+                                then CLMIAP (CLMID nm) newArgs
+                                else
+                                    if (Prelude.length (params fun) > (Prelude.length newArgs) )
+                                    then CLMPAP (CLMID nm) newArgs
+                                    else if (Prelude.length (params fun) == (Prelude.length newArgs) )
+                                        then CLMAPP (CLMID nm) newArgs
+                                        else CLMERR ("[CLM] function is given more arguments than it can handle: " ++ show e) SourceInteractive
+                            Nothing -> CLMAPP (CLMID nm) newArgs
+exprToCLM' env scope (App ex exs) = CLMAPP (exprToCLM' env scope ex) (Prelude.map (exprToCLM' env scope) exs)
+-- Function: extend scope with lambda params
+exprToCLM' env scope (Function lam) = CLMLAM $ lambdaToCLMLambda' env scope lam
+exprToCLM' _ _ (Lit l) = CLMLIT l
+exprToCLM' _ _ (U l) = CLMU l
 -- ReprCast: resolve direction based on repr map
--- If targetType is a user type (key in reprMap) → use fromRepr
--- If targetType is a repr type (value in reprMap) → use toRepr
--- Uses mkReprKey for parameterized type support (e.g., Array(Byte) as PackedBytes)
-exprToCLM env (ReprCast e tp) =
+exprToCLM' env scope (ReprCast e tp) =
     let reprKey = mkReprKey tp
         simpleName = case tp of { Id nm -> nm; App (Id nm) _ -> nm; _ -> "" }
-        clmE = exprToCLM env e
+        clmE = exprToCLM' env scope e
     in if Map.member reprKey (reprMap env)
-       then CLMIAP (CLMID "fromRepr") [clmE]  -- target is user type, convert from repr
+       then CLMIAP (CLMID "fromRepr") [clmE]
        else if isReprTarget reprKey env || isReprTarget simpleName env
-            then CLMIAP (CLMID "toRepr") [clmE]  -- target is repr type, convert to repr
+            then CLMIAP (CLMID "toRepr") [clmE]
             else if not (Prelude.null simpleName) && Map.member simpleName (classDecls env)
                  then CLMIAP (CLMID "__downcast") [CLMLIT (LString simpleName), clmE]
-                 -- fallback: try simple name in reprMap (backward compat)
                  else if Map.member simpleName (reprMap env)
                       then CLMIAP (CLMID "fromRepr") [clmE]
                       else CLMERR ("[CLM] no repr or class found for cast to " ++ show tp) SourceInteractive
-exprToCLM env (Typed e _) = exprToCLM env e  -- type annotation, erased at runtime
-exprToCLM _ (Pi _ _ _) = CLMEMPTY  -- type-level Pi, erased at runtime
-exprToCLM _ (Implicit _) = CLMEMPTY     -- type-level wrapper, erased at runtime
--- NTuple: unified tuple/record literal. Convert to CLMCON at CLM level.
--- Named tuples (records) get "__Record" tag; positional tuples get "__Tuple" tag.
-exprToCLM env (NTuple fields) =
-    let values = Prelude.map (\(_mn, e) -> exprToCLM env e) fields
+exprToCLM' env scope (Typed e _) = exprToCLM' env scope e
+exprToCLM' _ _ (Pi _ _ _) = CLMEMPTY
+exprToCLM' _ _ (Implicit _) = CLMEMPTY
+exprToCLM' env scope (NTuple fields) =
+    let values = Prelude.map (\(_mn, e) -> exprToCLM' env scope e) fields
         tag = if hasNamedFields fields then ConsTag "__Record" 0 else ConsTag "__Tuple" 0
     in CLMCON tag values
--- Record type: type-level, erased at runtime
-exprToCLM _ (RecordType _ _) = CLMEMPTY
--- Module system nodes: erased at runtime
-exprToCLM _ (ModuleDecl _) = CLMEMPTY
-exprToCLM _ (Import _ _ _) = CLMEMPTY
-exprToCLM _ (Open _) = CLMEMPTY
-exprToCLM _ (Export _ _) = CLMEMPTY
-exprToCLM env (PrivateDecl e) = exprToCLM env e
-exprToCLM _ (OpaqueTy _ _) = CLMEMPTY
-exprToCLM _ (TargetBlock _ _) = CLMEMPTY
-exprToCLM _ (TargetSwitch _) = CLMEMPTY
--- Array literal
-exprToCLM env (ArrayLit exs) = CLMARRAY (Prelude.map (exprToCLM env) exs)
--- Record system nodes: desugar inline if they reach CLM conversion
-exprToCLM env e@(RecordConstruct _ _) = exprToCLM env (desugarRecordExpr env e)
-exprToCLM env e@(RecordUpdate _ _) = exprToCLM env (desugarRecordExpr env e)
-exprToCLM env e@(RecordPattern _ _) = exprToCLM env (desugarRecordExpr env e)
--- Effect system nodes: erased at runtime
-exprToCLM _ (EffectDecl _ _ _) = CLMEMPTY
-exprToCLM _ (HandlerDecl _ _ _ _ _) = CLMEMPTY
-exprToCLM env (HandleWith bodyExpr handlerExpr) =
+exprToCLM' _ _ (RecordType _ _) = CLMEMPTY
+exprToCLM' _ _ (ModuleDecl _) = CLMEMPTY
+exprToCLM' _ _ (Import _ _ _) = CLMEMPTY
+exprToCLM' _ _ (Open _) = CLMEMPTY
+exprToCLM' _ _ (Export _ _) = CLMEMPTY
+exprToCLM' env scope (PrivateDecl e) = exprToCLM' env scope e
+exprToCLM' _ _ (OpaqueTy _ _) = CLMEMPTY
+exprToCLM' _ _ (TargetBlock _ _) = CLMEMPTY
+exprToCLM' _ _ (TargetSwitch _) = CLMEMPTY
+exprToCLM' env scope (ArrayLit exs) = CLMARRAY (Prelude.map (exprToCLM' env scope) exs)
+exprToCLM' env scope e@(RecordConstruct _ _) = exprToCLM' env scope (desugarRecordExpr env e)
+exprToCLM' env scope e@(RecordUpdate _ _) = exprToCLM' env scope (desugarRecordExpr env e)
+exprToCLM' env scope e@(RecordPattern _ _) = exprToCLM' env scope (desugarRecordExpr env e)
+exprToCLM' _ _ (EffectDecl _ _ _) = CLMEMPTY
+exprToCLM' _ _ (HandlerDecl _ _ _ _ _) = CLMEMPTY
+exprToCLM' env scope (HandleWith bodyExpr handlerExpr) =
     case resolveHandlerExpr env handlerExpr of
         Just (effName, lets, ops) ->
-            let clmBody = exprToCLM env bodyExpr
-                clmOps = [handlerOpToCLM env l | Function l <- ops]
-                clmLets = [(lamName l, exprToCLM env (body l)) | Function l <- lets, body l /= UNDEFINED]
+            let clmBody = exprToCLM' env scope bodyExpr
+                clmOps = [handlerOpToCLM' env scope l | Function l <- ops]
+                clmLets = [(lamName l, exprToCLM' env scope (body l)) | Function l <- lets, body l /= UNDEFINED]
             in CLMHANDLE clmBody effName clmLets clmOps
-        Nothing -> exprToCLM env bodyExpr  -- unknown handler, just run body
--- Handler override at call site: func [SilentConsole, MockFileIO] (args)
--- Desugars to nested CLMHANDLE wrapping the inner call
-exprToCLM env (OverrideApp func overrides args) =
-    let -- Resolve each override to a handler expression
-        handlerOverrides = resolveOverrides env overrides
-        -- Build the inner call as a normal App
-        innerCall = exprToCLM env (App func args)
-    in Prelude.foldr (wrapWithHandler env) innerCall handlerOverrides
-exprToCLM env (ActionBlock stmts) = exprToCLM env (desugarActionStmts stmts)  -- should be desugared by now
-exprToCLM _ (EffType _ _) = CLMEMPTY  -- type-level, erased at runtime
-exprToCLM _ (DeclBlock _) = CLMEMPTY  -- structure member list, should not reach CLM
--- Class system: ClassDecl is processed in Pass 1, erased at CLM level
-exprToCLM _ (ClassDecl _ _) = CLMEMPTY
-exprToCLM _ e = CLMERR ("[CLM] cannot convert expr to CLM: " ++ show e) SourceInteractive
+        Nothing -> exprToCLM' env scope bodyExpr
+exprToCLM' env scope (OverrideApp func overrides args) =
+    let handlerOverrides = resolveOverrides env overrides
+        innerCall = exprToCLM' env scope (App func args)
+    in Prelude.foldr (wrapWithHandler' env scope) innerCall handlerOverrides
+exprToCLM' env scope (ActionBlock stmts) = exprToCLM' env scope (desugarActionStmts stmts)
+exprToCLM' _ _ (EffType _ _) = CLMEMPTY
+exprToCLM' _ _ (DeclBlock _) = CLMEMPTY
+exprToCLM' _ _ (ClassDecl _ _) = CLMEMPTY
+-- CaseOf: raw pattern case from monomorphized instance bodies (not yet case-optimized).
+-- Convert Var checks to CLMPatternCheck list, like ExpandedCase.
+exprToCLM' env scope (CaseOf vars body si) =
+    let checks = Prelude.concatMap (varToCLMChecks env scope) vars
+    in CLMCASE checks (exprToCLM' env scope body)
+exprToCLM' _ _ e = CLMERR ("[CLM] cannot convert expr to CLM: " ++ show e) SourceInteractive
 
 -- | Resolve a handler expression to (effectName, letBindings, functionImpls)
 -- Uses the effect declaration to distinguish ops from let bindings:
@@ -1453,10 +1493,13 @@ isEffectOp _ _ = False
 -- | Convert a handler op lambda to CLM. Intrinsic ops become CLMPRIMCALL (passthrough).
 -- Non-intrinsic ops become full CLMLAMs.
 handlerOpToCLM :: Environment -> Lambda -> (Name, CLMExpr)
-handlerOpToCLM _ lam | body lam == Intrinsic = (lamName lam, CLMPRIMCALL)
-handlerOpToCLM _ lam | body lam == UNDEFINED = (lamName lam, CLMPRIMCALL)
-handlerOpToCLM env lam =
-    let clmLam = lambdaToCLMLambda env lam
+handlerOpToCLM env lam = handlerOpToCLM' env Set.empty lam
+
+handlerOpToCLM' :: Environment -> Set.HashSet Name -> Lambda -> (Name, CLMExpr)
+handlerOpToCLM' _ _ lam | body lam == Intrinsic = (lamName lam, CLMPRIMCALL)
+handlerOpToCLM' _ _ lam | body lam == UNDEFINED = (lamName lam, CLMPRIMCALL)
+handlerOpToCLM' env scope lam =
+    let clmLam = lambdaToCLMLambda' env scope lam
     in (lamName lam, CLMLAM clmLam)
 
 -- | Resolve bracket overrides to handler expressions.
@@ -1477,13 +1520,16 @@ resolveOverrides env = Prelude.concatMap resolve
 
 -- | Wrap a CLM expression in a CLMHANDLE for a handler override
 wrapWithHandler :: Environment -> Expr -> CLMExpr -> CLMExpr
-wrapWithHandler env handlerExpr clmBody =
+wrapWithHandler env = wrapWithHandler' env Set.empty
+
+wrapWithHandler' :: Environment -> Set.HashSet Name -> Expr -> CLMExpr -> CLMExpr
+wrapWithHandler' env scope handlerExpr clmBody =
     case resolveHandlerExpr env handlerExpr of
         Just (effName, lets, ops) ->
-            let clmOps = [handlerOpToCLM env l | Function l <- ops]
-                clmLets = [(lamName l, exprToCLM env (body l)) | Function l <- lets, body l /= UNDEFINED]
+            let clmOps = [handlerOpToCLM' env scope l | Function l <- ops]
+                clmLets = [(lamName l, exprToCLM' env scope (body l)) | Function l <- lets, body l /= UNDEFINED]
             in CLMHANDLE clmBody effName clmLets clmOps
-        Nothing -> clmBody  -- couldn't resolve handler, just pass through
+        Nothing -> clmBody
 
 -- | Substitute an Id name with a replacement expression
 substId :: Name -> Expr -> Expr -> Expr
@@ -1504,14 +1550,23 @@ inferClassFromExpr env (App (Id nm) _)
 inferClassFromExpr _ _ = Nothing
 
 lambdaToCLMLambda :: Environment -> Lambda -> CLMLam
-lambdaToCLMLambda env (Lambda nm params Intrinsic tp _ _) =
+lambdaToCLMLambda env = lambdaToCLMLambda' env Set.empty
+
+-- | Scope-aware lambda-to-CLM conversion.
+-- outerScope contains names bound in enclosing scopes (for nested lambdas).
+lambdaToCLMLambda' :: Environment -> Set.HashSet Name -> Lambda -> CLMLam
+lambdaToCLMLambda' _env _scope (Lambda _nm _params Intrinsic _tp _ _) =
     CLMLam [] CLMPRIMCALL
-lambdaToCLMLambda env (Lambda nm params Derive tp _ _) =
+lambdaToCLMLambda' _env _scope (Lambda _nm _params Derive _tp _ _) =
     CLMLam [] CLMPRIMCALL
-lambdaToCLMLambda env (Lambda nm params (PatternMatches exs) tp _ _) =
-    CLMLamCases (varsToCLMVars env params) (Prelude.map (exprToCLM env) exs)
-lambdaToCLMLambda env (Lambda nm params body tp _ _) =
-    CLMLam (varsToCLMVars env params) (exprToCLM env body)
+lambdaToCLMLambda' env outerScope (Lambda nm params (PatternMatches exs) tp _ _) =
+    let paramScope = scopeFromParams env nm params
+        scope = Set.union outerScope paramScope
+    in CLMLamCases (varsToCLMVars env scope params) (Prelude.map (exprToCLM' env scope) exs)
+lambdaToCLMLambda' env outerScope (Lambda nm params body tp _ _) =
+    let paramScope = scopeFromParams env nm params
+        scope = Set.union outerScope paramScope
+    in CLMLam (varsToCLMVars env scope params) (exprToCLM' env scope body)
 
 --------------------------------------------------------------------------------
 -- PASS 6: Compilation - JS

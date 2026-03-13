@@ -1,3 +1,6 @@
+module AWFY_NBody;
+import Harness;
+
 // AWFY NBody — N-Body Gravitational Simulation
 // 5-body solar system simulation (Sun + Jupiter + Saturn + Uranus + Neptune).
 // Uses flat MutArray(Float64): 7 fields per body (x, y, z, vx, vy, vz, mass).
@@ -163,16 +166,32 @@ function advanceN(bodies:MutArray(Float64), dt:Float64, n:Int, steps:Int, step:I
         advanceN(bodies, dt, n, steps, step + 1);
 
 function benchNBody() : Float64 =
-    let { bodies = createBodies(); n = 5; u = advanceN(bodies, 0.01, n, 1, 0) } in
+    let { bodies = createBodies(); n = 5; u = advanceN(bodies, 0.01, n, 250000, 0) } in
     energy(bodies, n);
 
 function verifyNBody() : Bool =
     let e = benchNBody() in
-    // Energy should be close to -0.16907...
-    // Just check it's negative and in the right ballpark
+    // Energy should be close to -0.1690859889909308
     e < 0.0 - 0.1;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchNBody();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result < 0.0 - 0.1;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchNBody(); u = putStrLn("AWFY NBody energy: " ++ show(result)) } in
-    if verifyNBody() then putStrLn("PASS")
-    else putStrLn("FAIL: expected < -0.1");
+    let {
+        u1 = putStrLn("Starting NBody benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("NBody", 3, 0, total);
+        t = readRef(total)
+    } in benchSummary("NBody", t, 3);

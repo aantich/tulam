@@ -23,6 +23,7 @@ import Data.Bits
 import Data.IORef
 import Control.Monad (when, forM_)
 import System.IO (hFlush, stdout)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 
 import Backends.Bytecode.Value
 import Backends.Bytecode.Instruction
@@ -873,28 +874,91 @@ dispatch vm 0x49 a _ _ imm16 _ _ = do
     writeReg vm a val
     execLoop vm
 
--- DISPATCH: r = dispatch(name, args in r+1..r+nargs)
-dispatch vm 0x80 a b c _ _ _ = do
-    let nameIdx = b
-        nargs = c
-        dstReg = a
-    let k = bmConstants (vmModule vm) V.! nameIdx
-        name = constToText k
-    args <- mapM (\i -> readReg vm (dstReg + 1 + i)) [0..nargs-1]
-    result <- dispatchBuiltin vm name args
-    case result of
-        Left err -> return $ Left err
-        Right val -> do
-            writeReg vm dstReg val
-            execLoop vm
+-- SHOWI: r = show(int)
+dispatch vm 0x7A a b _ _ _ _ = do
+    val <- readReg vm b
+    let str = case val of
+            VInt n  -> T.pack (show n)
+            _       -> T.pack (show val)
+    writeReg vm a (VString str)
+    execLoop vm
+
+-- SHOWF: r = show(float)
+dispatch vm 0x7B a b _ _ _ _ = do
+    val <- readReg vm b
+    let str = case val of
+            VFloat d -> T.pack (show d)
+            _        -> T.pack (show val)
+    writeReg vm a (VString str)
+    execLoop vm
+
+-- SHOWC: r = show(char)
+dispatch vm 0x7C a b _ _ _ _ = do
+    val <- readReg vm b
+    let str = case val of
+            VChar c  -> T.singleton c
+            _        -> T.pack (show val)
+    writeReg vm a (VString str)
+    execLoop vm
+
+-- SHOWS: r = show(string) — quoted
+dispatch vm 0x7D a b _ _ _ _ = do
+    val <- readReg vm b
+    let str = case val of
+            VString s -> "\"" <> s <> "\""
+            _         -> T.pack (show val)
+    writeReg vm a (VString str)
+    execLoop vm
+
+-- CLOCK: r = monotonic nanoseconds
+dispatch vm 0x73 a _ _ _ _ _ = do
+    t <- getPOSIXTime
+    let nanos = floor (t * 1e9) :: Int
+    writeReg vm a (VInt nanos)
+    execLoop vm
+
+-- PRINTNL: print newline to stdout
+dispatch vm 0x7E _ _ _ _ _ _ = do
+    TIO.putStr "\n"
+    hFlush stdout
+    execLoop vm
+
+-- MODREF: dst = modifyRef(refReg, closureReg)
+dispatch vm 0x7F a b c _ _ _ = do
+    refVal <- readReg vm b
+    closureVal' <- readReg vm c
+    case refVal of
+        VObj (HRef ref) -> do
+            oldVal <- readIORef ref
+            result <- callClosureSync vm closureVal' [oldVal]
+            case result of
+                Left err -> return $ Left err
+                Right newVal -> do
+                    writeIORef ref newVal
+                    writeReg vm a VUnit
+                    execLoop vm
+        _ -> return $ Left (VMRuntimeError "modifyRef: not a ref")
+
+-- MCALL: r = obj.method(args) — OOP dynamic method dispatch
+-- For now: not yet implemented (no AWFY programs use classes)
+dispatch _vm 0x80 _ b _ _ _ _ = do
+    return $ Left (VMRuntimeError "MCALL: OOP method dispatch not yet implemented in bytecode VM")
 
 -- DEBUGLOC (no-op for now; stores source location for debugger)
 dispatch vm 0xF0 _ _ _ _ _ _ = execLoop vm
 
--- ERROR
+-- ERROR (constant message)
 dispatch vm 0xF1 _ _ _ imm16 _ _ = do
     let k = bmConstants (vmModule vm) V.! imm16
     return $ Left (VMRuntimeError (constToText k))
+
+-- ERRORREG (register message)
+dispatch vm 0xF2 a _ _ _ _ _ = do
+    val <- readReg vm a
+    let msg = case val of
+            VString s -> s
+            _         -> T.pack (show val)
+    return $ Left (VMRuntimeError msg)
 
 -- NOP
 dispatch vm 0xFE _ _ _ _ _ _ = execLoop vm
@@ -938,78 +1002,6 @@ constToText (KFloat d)  = T.pack (show d)
 constToText (KString s) = s
 constToText (KName n)   = n
 
--- | Dispatch a builtin/intrinsic function by name.
-dispatchBuiltin :: VMState -> Text -> [Val] -> IO (Either VMError Val)
-dispatchBuiltin _vm "__show_i64" [VInt n] =
-    return $ Right (VString (T.pack (show n)))
-dispatchBuiltin _vm "__show_f64" [VFloat d] =
-    return $ Right (VString (T.pack (show d)))
-dispatchBuiltin _vm "__show_char" [VChar ch] =
-    return $ Right (VString (T.singleton ch))
-dispatchBuiltin _vm "__string_show" [VString s] =
-    return $ Right (VString ("\"" <> s <> "\""))
-dispatchBuiltin _vm "__print_newline" _ = do
-    TIO.putStrLn ""
-    return $ Right VUnit
-dispatchBuiltin _vm "__int_min_i64" _ =
-    return $ Right (VInt minBound)
-dispatchBuiltin _vm "__int_max_i64" _ =
-    return $ Right (VInt maxBound)
-dispatchBuiltin _vm "__error" [VString msg] =
-    return $ Left (VMRuntimeError msg)
-dispatchBuiltin _vm "__error" _ =
-    return $ Left (VMRuntimeError "error called")
-dispatchBuiltin vm "modifyRef" [VObj (HRef ref), closureVal'] =
-    dispatchModifyRef vm ref closureVal'
-dispatchBuiltin vm "__modifyref" [VObj (HRef ref), closureVal'] =
-    dispatchModifyRef vm ref closureVal'
--- == fallback for Bool (constructors)
-dispatchBuiltin _vm "==" [VBool a, VBool b] =
-    return $ Right (VBool (a == b))
-dispatchBuiltin _vm "==" [VObj (HCon t1 _ _), VObj (HCon t2 _ _)] =
-    return $ Right (VBool (t1 == t2))
--- show fallback for types that don't have __show_* extern mappings
-dispatchBuiltin _vm "show" [VBool True] =
-    return $ Right (VString "True")
-dispatchBuiltin _vm "show" [VBool False] =
-    return $ Right (VString "False")
-dispatchBuiltin _vm "show" [VInt n] =
-    return $ Right (VString (T.pack (show n)))
-dispatchBuiltin _vm "show" [VFloat d] =
-    return $ Right (VString (T.pack (show d)))
-dispatchBuiltin _vm "show" [VString s] =
-    return $ Right (VString ("\"" <> s <> "\""))
-dispatchBuiltin _vm "show" [VUnit] =
-    return $ Right (VString "()")
-dispatchBuiltin _vm "show" [VObj (HCon tag _ fields)] =
-    let showFields = T.intercalate ", " [T.pack (show (fields V.! i)) | i <- [0..V.length fields - 1]]
-    in return $ Right (VString ("Con(" <> T.pack (show tag) <> if V.null fields then ")" else ", " <> showFields <> ")"))
-dispatchBuiltin _vm "__string_concat" [VString a, VString b] =
-    return $ Right (VString (a <> b))
-dispatchBuiltin _vm "__string_length" [VString s] =
-    return $ Right (VInt (fromIntegral (T.length s)))
-dispatchBuiltin _vm name args =
-    return $ Left (VMRuntimeError ("Unknown dispatch: " <> name <> " with " <> T.pack (show (length args)) <> " args: " <> T.pack (show (map valTag args))))
-  where
-    valTag (VInt _) = "VInt"
-    valTag (VFloat _) = "VFloat"
-    valTag (VBool _) = "VBool"
-    valTag (VChar _) = "VChar"
-    valTag (VString _) = "VString"
-    valTag VUnit = "VUnit"
-    valTag (VObj _) = "VObj"
-    valTag VEmpty = "VEmpty"
-
--- | Helper for modifyRef dispatch (shared between "modifyRef" and "__modifyref")
-dispatchModifyRef :: VMState -> IORef Val -> Val -> IO (Either VMError Val)
-dispatchModifyRef vm ref closureVal' = do
-    oldVal <- readIORef ref
-    result <- callClosureSync vm closureVal' [oldVal]
-    case result of
-        Left err -> return $ Left err
-        Right newVal -> do
-            writeIORef ref newVal
-            return $ Right VUnit
 
 -- | Call a closure synchronously by saving/restoring VM state.
 -- Used by DISPATCH for higher-order builtins like modifyRef.

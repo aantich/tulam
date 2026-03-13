@@ -1,3 +1,6 @@
+module AWFY_List;
+import Harness;
+
 // AWFY List — Linked List Recursion Benchmark
 // Purely functional benchmark using tulam's native List type.
 // Builds 3 lists, repeatedly applies tail operation, checks result length.
@@ -34,7 +37,24 @@ function benchList() : Int =
 
 function verifyList() : Bool = benchList() == 10;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchList();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == 10;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchList(); u = putStrLn("AWFY List: " ++ show(result)) } in
-    if verifyList() then putStrLn("PASS")
-    else putStrLn("FAIL: expected 10");
+    let {
+        u1 = putStrLn("Starting List benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("List", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("List", t, 10);

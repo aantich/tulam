@@ -367,6 +367,20 @@ target native {
         function hash(c) = __char_to_int(c)
     };
 
+    // Bool instances — no externs needed, pure pattern matching
+    instance Show(Bool) = {
+        function show(x) = match x | True -> "True" | False -> "False"
+    };
+
+    instance Eq(Bool) = {
+        function (==)(x, y) = match x
+            | True -> match y | True -> True | False -> False
+            | False -> match y | True -> False | False -> True;
+        function (!=)(x, y) = match x
+            | True -> match y | True -> False | False -> True
+            | False -> match y | True -> True | False -> False
+    };
+
 };
 
 // ============================================================================
@@ -665,4 +679,28 @@ target native {
     extern function __freeze(arr:MutArray(Int)) : Array(Int);
     extern function __thaw(arr:Array(Int)) : MutArray(Int);
     extern function __mutpush(arr:MutArray(Int), val:Int) : Unit;
+};
+
+// ============================================================================
+// Type conversions
+// ============================================================================
+
+target native {
+    extern function __sitofp_i64(n:Int) : Float64 = inline "sitofp";
+    extern function __fptosi_f64(x:Float64) : Int = inline "fptosi";
+    extern function __fpext_f32(x:Float32) : Float64 = inline "fpext";
+    extern function __fptrunc_f64(x:Float64) : Float32 = inline "fptrunc";
+};
+
+// ============================================================================
+// Clock
+// ============================================================================
+
+target native {
+    /// Monotonic clock returning nanoseconds since an arbitrary epoch.
+    extern function __clock_nanos() : Int;
+
+    handler NativeClock : Clock = {
+        function clockNanos() = __clock_nanos()
+    };
 };

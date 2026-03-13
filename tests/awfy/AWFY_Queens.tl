@@ -1,3 +1,6 @@
+module AWFY_Queens;
+import Harness;
+
 // AWFY Queens — N-Queens Problem (8x8)
 // Backtracking algorithm using mutable arrays for constraint tracking.
 
@@ -58,7 +61,24 @@ function benchQueens() : Bool = queensRepeat(10, 8);
 
 function verifyQueens() : Bool = benchQueens() == True;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchQueens();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == True;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchQueens(); u = putStrLn("AWFY Queens: " ++ show(result)) } in
-    if verifyQueens() then putStrLn("PASS")
-    else putStrLn("FAIL: expected True");
+    let {
+        u1 = putStrLn("Starting Queens benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Queens", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("Queens", t, 10);

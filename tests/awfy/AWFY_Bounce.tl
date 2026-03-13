@@ -1,7 +1,10 @@
+module AWFY_Bounce;
+import AWFY_Random;
+import Harness;
+
 // AWFY Bounce — Bouncing Balls Simulation
 // 100 balls bouncing in a 500x500 space, counting boundary collisions.
 // Uses flat MutArray(Int) for ball state: 4 ints per ball (x, y, xVel, yVel).
-// Uses LCG random from AWFY_Random.
 
 function initBalls(balls:MutArray(Int), i:Int, n:Int, seed:Ref(Int)) : Unit =
     if i >= n then Unit
@@ -19,6 +22,28 @@ function initBalls(balls:MutArray(Int), i:Int, n:Int, seed:Ref(Int)) : Unit =
         } in
         initBalls(balls, i + 1, n, seed);
 
+// bounceWall: pure function, returns (clampedPos, newVel, didBounce) packed as 3 values.
+// We encode the triple as: pos * 1000000 + vel_encoded * 10 + bounce_flag
+// where vel_encoded = vel + 500000 (to handle negatives), bounce_flag = 0 or 1.
+// Actually simpler: just return each component separately via helper functions.
+
+function bounceWallPos(pos:Int, vel:Int, limit:Int) : Int =
+    if pos > limit then limit
+    else if pos < 0 then 0
+    else pos;
+
+function bounceWallVel(pos:Int, vel:Int, limit:Int) : Int =
+    if pos > limit then 0 - abs(vel)
+    else if pos < 0 then abs(vel)
+    else vel;
+
+function bounceWallHit(pos:Int, limit:Int) : Bool =
+    if pos > limit then True
+    else if pos < 0 then True
+    else False;
+
+function abs(x:Int) : Int = if x < 0 then 0 - x else x;
+
 function bounceBall(balls:MutArray(Int), idx:Int) : Int =
     let {
         base = idx * 4;
@@ -28,31 +53,19 @@ function bounceBall(balls:MutArray(Int), idx:Int) : Int =
         yv = mutRead(balls, base + 3);
         nx = x + xv;
         ny = y + yv;
-        bounces = newRef(0);
-    } in
-    let nxv = if nx < 0 then
-            let u = modifyRef(bounces, fn(c) = c + 1) in
-            0 - xv
-        else if nx >= 500 then
-            let u = modifyRef(bounces, fn(c) = c + 1) in
-            0 - xv
-        else xv in
-    let nyv = if ny < 0 then
-            let u = modifyRef(bounces, fn(c) = c + 1) in
-            0 - yv
-        else if ny >= 500 then
-            let u = modifyRef(bounces, fn(c) = c + 1) in
-            0 - yv
-        else yv in
-    let {
-        finalX = if nx < 0 then 0 - nx else if nx >= 500 then 1000 - nx else nx;
-        finalY = if ny < 0 then 0 - ny else if ny >= 500 then 1000 - ny else ny;
-        u5 = mutWrite(balls, base, finalX);
-        u6 = mutWrite(balls, base + 1, finalY);
-        u7 = mutWrite(balls, base + 2, nxv);
-        u8 = mutWrite(balls, base + 3, nyv);
-    } in
-    readRef(bounces);
+        // Pure computation — no Ref needed
+        nxv = bounceWallVel(nx, xv, 500);
+        nyv = bounceWallVel(ny, yv, 500);
+        finalX = bounceWallPos(nx, xv, 500);
+        finalY = bounceWallPos(ny, yv, 500);
+        bx = bounceWallHit(nx, 500);
+        by = bounceWallHit(ny, 500);
+        bounced = if bx then 1 else if by then 1 else 0;
+        u1 = mutWrite(balls, base, finalX);
+        u2 = mutWrite(balls, base + 1, finalY);
+        u3 = mutWrite(balls, base + 2, nxv);
+        u4 = mutWrite(balls, base + 3, nyv);
+    } in bounced;
 
 function bounceBalls(balls:MutArray(Int), i:Int, n:Int, bounceCount:Ref(Int)) : Unit =
     if i >= n then Unit
@@ -81,7 +94,24 @@ function verifyBounce() : Bool =
     let result = benchBounce() in
     result > 0;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchBounce();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result > 0;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchBounce(); u = putStrLn("AWFY Bounce: " ++ show(result)) } in
-    if verifyBounce() then putStrLn("PASS")
-    else putStrLn("FAIL: expected > 0");
+    let {
+        u1 = putStrLn("Starting Bounce benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Bounce", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("Bounce", t, 10);

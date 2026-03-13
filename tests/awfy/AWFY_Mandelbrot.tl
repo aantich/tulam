@@ -1,5 +1,10 @@
+module AWFY_Mandelbrot;
+import Harness;
+
 // AWFY Mandelbrot — Mandelbrot Set Computation
 // Escape-time iteration over a grid with bit-packed checksum.
+
+function toFloat(n:Int) : Float64 = __sitofp_i64(n);
 
 function mandelbrotIter(cr:Float64, ci:Float64, zr:Float64, zi:Float64, i:Int, limit:Int) : Int =
     if i >= limit then 1
@@ -51,13 +56,28 @@ function mandelbrot(sz:Int) : Int =
     let { sum = newRef(0); byteAcc = newRef(0); bitNum = newRef(0); u = mandelbrotRows(0, sz, sum, byteAcc, bitNum) } in
     readRef(sum);
 
-function benchMandelbrot() : Int = mandelbrot(10);
+function benchMandelbrot() : Int = mandelbrot(500);
 
-function verifyMandelbrot() : Bool =
-    let r = mandelbrot(10) in
-    r >= 0;
+function verifyMandelbrot() : Bool = mandelbrot(500) == 255;
+
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchMandelbrot();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == 255;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
 
 function main() : Unit =
-    let { result = benchMandelbrot(); u = putStrLn("AWFY Mandelbrot: " ++ show(result)) } in
-    if verifyMandelbrot() then putStrLn("PASS")
-    else putStrLn("FAIL: expected >= 0");
+    let {
+        u1 = putStrLn("Starting Mandelbrot benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Mandelbrot", 3, 0, total);
+        t = readRef(total)
+    } in benchSummary("Mandelbrot", t, 3);

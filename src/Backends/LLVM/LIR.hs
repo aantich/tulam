@@ -24,6 +24,7 @@ module Backends.LLVM.LIR
   , LBlock(..)
   , LFunction(..)
   , LGlobal(..)
+  , globalName
   , LModule(..)
   ) where
 
@@ -172,10 +173,14 @@ data LInstr
   | LLShr LOperand LOperand         -- ^ Logical shift right
 
   -- Memory / Heap
-  | LAlloc Int Int                   -- ^ alloc(tag, numFields) → ptr
+  | LAlloc Int Int                   -- ^ alloc(tag, numFields) → ptr (via runtime call)
+  | LAllocInline Int Int             -- ^ alloc(tag, numFields) → ptr (inline bump pointer)
   | LStore LOperand LOperand Int     -- ^ store value into object at field index
   | LLoad LOperand Int LType         -- ^ load field from object at index
   | LGetTag LOperand                 -- ^ extract tag (i16) from heap object header
+  | LFree LOperand                   -- ^ free heap object (return to free list)
+  | LIsNull LOperand                 -- ^ null check → i1
+  | LIsNotNull LOperand              -- ^ non-null check → i1
 
   -- Function calls
   | LCall Name [LOperand] LType     -- ^ Call named function, return type
@@ -236,9 +241,13 @@ instrResultType (LShl a _)      = operandType a
 instrResultType (LAShr a _)     = operandType a
 instrResultType (LLShr a _)     = operandType a
 instrResultType (LAlloc _ _)    = LTPtr
+instrResultType (LAllocInline _ _) = LTPtr
 instrResultType (LStore _ _ _)  = LTVoid
 instrResultType (LLoad _ _ ty)  = ty
 instrResultType (LGetTag _)     = LTInt16
+instrResultType (LFree _)       = LTVoid
+instrResultType (LIsNull _)     = LTBool
+instrResultType (LIsNotNull _)  = LTBool
 instrResultType (LCall _ _ ty)  = ty
 instrResultType (LCallPtr _ _ ty) = ty
 instrResultType (LSext _ ty)    = ty
@@ -266,6 +275,8 @@ data LTerminator
   | LCondBr LOperand Name Name      -- ^ Conditional branch (cond, true, false)
   | LSwitch LOperand Name [(Integer, Name)]
     -- ^ Switch on integer value (val, default, [(case, block)])
+  | LTailCall Name [LOperand] LType -- ^ Tail call: musttail call + ret
+  | LTailCallVoid Name [LOperand]   -- ^ Tail call returning void
   | LUnreachable                     -- ^ Unreachable (after noreturn calls)
   deriving (Show, Eq)
 
@@ -287,6 +298,7 @@ data LFunction = LFunction
   , lfuncRetType :: LType
   , lfuncBlocks  :: [LBlock]            -- ^ First block = entry. Empty for externs.
   , lfuncExtern  :: Bool                -- ^ True = declaration only (extern)
+  , lfuncAttrs   :: [String]            -- ^ LLVM function attributes (e.g. "alwaysinline", "nounwind")
   } deriving (Show, Eq)
 
 -- | A global constant.
@@ -294,6 +306,11 @@ data LGlobal
   = LGlobalString Name String          -- ^ @name = private constant [N x i8] c"...\00"
   | LGlobalInt Name Integer LType      -- ^ @name = global iN value
   deriving (Show, Eq)
+
+-- | Get the name of a global.
+globalName :: LGlobal -> Name
+globalName (LGlobalString n _)   = n
+globalName (LGlobalInt n _ _)    = n
 
 -- | A complete LIR module.
 data LModule = LModule

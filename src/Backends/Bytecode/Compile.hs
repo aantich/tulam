@@ -546,7 +546,18 @@ compileCLMExpr expr cs = case expr of
            else (dstReg, emit (ICallCls dstReg funcReg (length args)) cs4)
 
     -- Constructor
-    CLMCON (ConsTag cname tag) fields ->
+    CLMCON (ConsTag cname tag) fields
+        -- Special-case Bool constructors to native VBool values
+        | cname == "True"  && null fields ->
+            let (r, cs1) = allocReg cs
+            in (r, emit (ILoadTrue r) cs1)
+        | cname == "False" && null fields ->
+            let (r, cs1) = allocReg cs
+            in (r, emit (ILoadFalse r) cs1)
+        | cname == "Unit"  && null fields ->
+            let (r, cs1) = allocReg cs
+            in (r, emit (ILoadUnit r) cs1)
+        | otherwise ->
         let nfields = length fields
             (baseReg, cs1) = allocRegs (nfields + 1) cs  -- +1 for result
             dstReg = baseReg
@@ -709,7 +720,7 @@ compileCLMExpr expr cs = case expr of
                    then emit (IMov (baseReg + 2 + i) r) s'
                    else s'
                 ) cs4 (zip [0..] args)
-            cs6 = emit (IDispatch dstReg nameIdx nargs) cs5
+            cs6 = emit (IMCall dstReg nameIdx nargs) cs5
         in (dstReg, cs6)
 
     CLMSCALL objExpr methodName args ->
@@ -785,17 +796,41 @@ compileCall funcName args cs =
                     (dstReg, emit (IStrCat dstReg arg1Reg arg2Reg) cs2)
                 Just BStrLen ->
                     (dstReg, emit (IStrLen dstReg arg1Reg) cs2)
+                Just BClockNanos ->
+                    (dstReg, emit (IClock dstReg) cs2)
                 Just BPrintNewline ->
-                    -- Complex: fall through to DISPATCH (VM handles it)
-                    let (nameIdx, cs3) = addConstant (KName (T.pack funcName)) cs2
-                    in (dstReg, emit (IDispatch dstReg nameIdx nargs) cs3)
-                Just BDispatch ->
-                    let (nameIdx, cs3) = addConstant (KName (T.pack funcName)) cs2
-                    in (dstReg, emit (IDispatch dstReg nameIdx nargs) cs3)
+                    (dstReg, emit (ILoadUnit dstReg) $ emit IPrintNl cs2)
+                Just BModifyRef ->
+                    (dstReg, emit (IModRef dstReg arg1Reg arg2Reg) cs2)
+                Just BMutLen ->
+                    (dstReg, emit (IMutLen dstReg arg1Reg) cs2)
+                Just BShowI ->
+                    (dstReg, emit (IShowI dstReg arg1Reg) cs2)
+                Just BShowF ->
+                    (dstReg, emit (IShowF dstReg arg1Reg) cs2)
+                Just BShowC ->
+                    (dstReg, emit (IShowC dstReg arg1Reg) cs2)
+                Just BShowS ->
+                    (dstReg, emit (IShowS dstReg arg1Reg) cs2)
+                Just BError ->
+                    -- Error with runtime string argument
+                    (dstReg, emit (IErrorReg arg1Reg) cs2)
+                Just (BConstInt n) ->
+                    let (kIdx, cs3) = addConstant (KInt (fromIntegral n)) cs2
+                    in (dstReg, emit (ILoadK dstReg kIdx) cs3)
                 Nothing ->
-                    -- Unknown function: fall through to dispatch
-                    let (nameIdx, cs3) = addConstant (KName (T.pack funcName)) cs2
-                    in (dstReg, emit (IDispatch dstReg nameIdx nargs) cs3)
+                    -- Check if it's a local variable (closure/function parameter)
+                    case lookupName funcName cs2 of
+                        Just closureReg ->
+                            -- Call as closure: move closure reg, then CALLCLS
+                            let cs3 = emit (IMov dstReg closureReg) cs2
+                            in if isTail
+                               then (dstReg, emit (ITailCallCls dstReg nargs) cs3)
+                               else (dstReg, emit (ICallCls dstReg dstReg nargs) cs3)
+                        Nothing ->
+                            -- Truly unknown function: compile error
+                            let (msgIdx, cs3) = addConstant (KString (T.pack ("unresolved function: " ++ funcName))) cs2
+                            in (dstReg, emit (IError msgIdx) cs3)
 
 -- | Collect free variables from a CLM lambda (for closure captures).
 collectFreeVars :: CLMLam -> CompState -> [Name]

@@ -1,3 +1,6 @@
+module AWFY_Permute;
+import Harness;
+
 // AWFY Permute — Recursive Permutation Generation
 // Generates all permutations of n elements, counting via a mutable counter.
 
@@ -27,7 +30,24 @@ function initPermuteArr(v:MutArray(Int), i:Int, n:Int) : Unit =
 
 function verifyPermute() : Bool = benchPermute() == 720;
 
+function benchIter(name:String, n:Int, i:Int, total:Ref(Int)) : Unit =
+    if i >= n then Unit
+    else
+        let {
+            start = clockNanos();
+            result = benchPermute();
+            end = clockNanos();
+            elapsed = div(end - start, 1000);
+            ok = result == 720;
+            u1 = if ok then Unit else putStrLn("ERROR: verification failed");
+            u2 = benchOnce(name, result, elapsed, i);
+            u3 = modifyRef(total, fn(t) = t + elapsed)
+        } in benchIter(name, n, i + 1, total);
+
 function main() : Unit =
-    let { result = benchPermute(); u = putStrLn("AWFY Permute: " ++ show(result)) } in
-    if verifyPermute() then putStrLn("PASS")
-    else putStrLn("FAIL: expected 720");
+    let {
+        u1 = putStrLn("Starting Permute benchmark ...");
+        total = newRef(0);
+        u2 = benchIter("Permute", 10, 0, total);
+        t = readRef(total)
+    } in benchSummary("Permute", t, 10);
