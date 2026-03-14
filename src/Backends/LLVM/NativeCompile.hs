@@ -25,7 +25,7 @@ import System.Directory (doesFileExist)
 import Surface (Name, Lambda(..), Var(..), Expr(..), hasImplicit)
 import State (Environment(..), InterpreterState(..), lookupLambda)
 import Pipeline (lambdaToCLMLambda)
-import CompileDriver (CompilationPlan(..), buildCompilationPlan)
+import CompileDriver (CompilationPlan(..), buildCompilationPlan, MonomorphLevel(..))
 import Backends.LLVM.LIR
 import qualified Data.HashSet as HSet
 import CLM (CLMLam(..), CLMExpr(..))
@@ -70,8 +70,11 @@ compileNative env state config funcNames = do
             "Native target not loaded. Load lib/Backend/LLVM/Native.tl first."
         Just allTexterns -> do
             -- Step 1: Build compilation plan (reachability + monomorphization)
-            let plan = buildCompilationPlan funcNames "native" env state
-            let compilable = cpFunctions plan
+            let plan = buildCompilationPlan funcNames "native" MonoFull env state
+            -- Include non-intrinsic instance functions (MonoFull rewrites
+            -- implicit-param calls to direct instance function references)
+            let compilableInsts = Map.filter (\l -> body l /= Intrinsic) (cpInstances plan)
+            let compilable = Map.union (cpFunctions plan) compilableInsts
             if Map.null compilable
                 then return $ CompileError
                     "No compilable functions found. Check that the function exists and has concrete types."
@@ -132,9 +135,7 @@ compileNative env state config funcNames = do
                                     allGlobals
                                     (lirFuncs ++ mainFunc)
                                     extDecls
-
-                            -- Step 6: Emit LLVM IR
-                            let llvmIR = emitModule lmod
+                                llvmIR = emitModule lmod
 
                             if ncEmitIR config
                                 then return $ CompileIR llvmIR

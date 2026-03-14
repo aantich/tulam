@@ -42,3 +42,4 @@ export Math.Transform;
 export Math.Optimize;
 export Math.Random;
 export System.Time;
+export Backend.LLVM.Native;

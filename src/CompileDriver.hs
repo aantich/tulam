@@ -18,6 +18,7 @@ module CompileDriver
     , collectSurfaceRefs
     , collectExternRefs
     , buildOriginMap
+    , MonomorphLevel(..)
     ) where
 
 import qualified Data.HashMap.Strict as Map
@@ -28,7 +29,8 @@ import qualified Data.Set as Set
 
 import Surface
 import State
-import Monomorphize (monomorphizeLambdas)
+import Monomorphize (monomorphizeLambdas, MonomorphLevel(..))
+-- import qualified Debug.Trace as DT
 
 -- | A compilation plan: the minimal set of functions, instances, externs,
 -- and types needed to compile the given entry points.
@@ -47,14 +49,15 @@ data CompilationPlan = CompilationPlan
 -- This is the main entry point for any backend.
 buildCompilationPlan :: [Name]             -- ^ Entry point function names
                      -> Name               -- ^ Target name (e.g. "native")
+                     -> MonomorphLevel     -- ^ How aggressively to resolve instances
                      -> Environment        -- ^ Full loaded environment
                      -> InterpreterState   -- ^ For module provenance
                      -> CompilationPlan
-buildCompilationPlan entryPoints targetName env state =
+buildCompilationPlan entryPoints targetName monoLevel env state =
     let -- Phase A: Reachability analysis (pre-monomorphization)
         -- Pass target name so reachability prefers target instances over interpreter instances
         (reachFuncs, reachInsts, reachCons, reachTypes) =
-            computeReachableSet entryPoints targetName env
+            computeReachableSet entryPoints targetName monoLevel env
 
         -- Filter to only reachable names
         reachableLams = Map.filterWithKey (\k _ -> HSet.member k reachFuncs) (topLambdas env)
@@ -62,7 +65,7 @@ buildCompilationPlan entryPoints targetName env state =
 
         -- Monomorphize only reachable functions, using FULL env for lookups.
         -- The full env is needed so lookupLambda can find dispatch templates like "+"
-        (monoLams, monoInsts) = monomorphizeLambdas targetName env reachableLams reachableInsts
+        (monoLams, monoInsts) = monomorphizeLambdas monoLevel targetName env reachableLams reachableInsts
 
         -- Phase B: Collect extern refs from monomorphized bodies
         targetExts = case Map.lookup targetName (targetExterns env) of
@@ -88,9 +91,9 @@ buildCompilationPlan entryPoints targetName env state =
 -- | Compute the transitive closure of names reachable from entry points.
 -- Uses target-specific instances when available (not all interpreter instances).
 -- Returns (reachable functions, reachable instance keys, constructors, types).
-computeReachableSet :: [Name] -> Name -> Environment
+computeReachableSet :: [Name] -> Name -> MonomorphLevel -> Environment
                     -> (HashSet Name, HashSet Name, HashSet Name, HashSet Name)
-computeReachableSet entryPoints targetName env =
+computeReachableSet entryPoints targetName monoLevel env =
     go HSet.empty HSet.empty HSet.empty HSet.empty entryPoints
   where
     -- Target instances for the specific backend (e.g., "native")
@@ -124,8 +127,11 @@ computeReachableSet entryPoints targetName env =
 
                 Just _lam ->
                     -- Implicit-param function (dispatch template like +, show, ==, effectSeq)
+                    -- Mark as visited to prevent re-processing (critical for MonoFull
+                    -- where instance body refs can reference back to implicit-param functions)
+                    let funcs' = HSet.insert name funcs
                     -- Check handler ops first (effectSeq, putStrLn, etc.)
-                    let handlerBodyRefs = case Map.lookup name handlerOpsMap of
+                        handlerBodyRefs = case Map.lookup name handlerOpsMap of
                             Just hLam -> collectSurfaceRefs env (body hLam)
                             Nothing -> []
                     -- Then check target instances (algebra methods like +, show)
@@ -135,9 +141,21 @@ computeReachableSet entryPoints targetName env =
                                 Just lam -> collectSurfaceRefs env (body lam)
                                 Nothing -> [])
                             targetInstKeys
-                        newWork = filter (notVisited funcs insts)
-                                    (handlerBodyRefs ++ targetBodyRefs)
-                    in go funcs insts cons typs (newWork ++ rest)
+                    -- When MonoFull, also add instance keys (so they get compiled)
+                    -- and follow their bodies for transitive refs
+                        instanceKeysAndRefs = if monoLevel == MonoFull
+                            then let instKeys = findInstanceKeysForFunc name (instanceLambdas env)
+                                     nonIntrinsicKeys = filter (\k -> case Map.lookup k (instanceLambdas env) of
+                                        Just il -> body il /= Intrinsic
+                                        _ -> False) instKeys
+                                     bodyRefs = concatMap (\k -> case Map.lookup k (instanceLambdas env) of
+                                        Just il | body il /= Intrinsic -> collectSurfaceRefs env (body il)
+                                        _ -> []) instKeys
+                                 in nonIntrinsicKeys ++ bodyRefs
+                            else []
+                        newWork = filter (notVisited funcs' insts)
+                                    (handlerBodyRefs ++ targetBodyRefs ++ instanceKeysAndRefs)
+                    in go funcs' insts cons typs (newWork ++ rest)
 
                 Nothing ->
                     -- Not a top-level function. Check if it's an instance key.

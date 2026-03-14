@@ -737,6 +737,42 @@ addTargetExtern target funcName decl env =
 lookupInstanceLambda :: Name -> [Name] -> Maybe Name -> Environment -> Maybe Lambda
 lookupInstanceLambda funcNm typeNms mTag env = Map.lookup (mkInstanceKey funcNm typeNms mTag) (instanceLambdas env)
 
+-- | Tagged fallback: find any tagged instance when untagged fails.
+-- Mirrors lookupCLMInstanceAnyTag but on instanceLambdas.
+lookupInstanceLambdaAnyTag :: Name -> [Name] -> Environment -> Maybe Lambda
+lookupInstanceLambdaAnyTag funcNm typeNms env =
+    let baseKey = mkInstanceKey funcNm typeNms Nothing
+        tagPrefix = baseKey ++ "\0@"
+        matches = Data.List.sortOn fst $ Map.toList $ Map.filterWithKey
+                    (\k _ -> Prelude.take (Prelude.length tagPrefix) k == tagPrefix) (instanceLambdas env)
+    in case matches of
+        ((_, v):_) -> Just v
+        [] -> Nothing
+
+-- | Prefix-based lookup for morphisms (arg types known, return type unknown).
+-- Prefers non-composed instances to avoid infinite recursion.
+lookupInstanceLambdaPrefix :: Name -> [Name] -> Environment -> Maybe Lambda
+lookupInstanceLambdaPrefix funcNm typeNms env =
+    let key = mkInstanceKey funcNm typeNms Nothing
+        prefix = key ++ "\0"
+    in case Map.lookup key (instanceLambdas env) of
+        Just lam -> Just lam
+        Nothing ->
+            let matches = Map.toList $ Map.filterWithKey
+                    (\k _ -> Prelude.take (Prelude.length prefix) k == prefix) (instanceLambdas env)
+                (direct, composed) = Data.List.partition (isDirectInstanceLam funcNm . snd) matches
+            in case direct of
+                ((_, v):_) -> Just v
+                [] -> case composed of
+                    ((_, v):_) -> Just v
+                    [] -> Nothing
+
+-- | Check if a lambda is "direct" (not a composed morphism that re-dispatches).
+isDirectInstanceLam :: Name -> Lambda -> Bool
+isDirectInstanceLam funcNm lam = case body lam of
+    App (Id n) _ | n == funcNm -> False  -- re-dispatches same function
+    _ -> True
+
 addCLMInstance :: Name -> [Name] -> Maybe Name -> CLMLam -> Environment -> Environment
 addCLMInstance funcNm typeNms mTag clm env =
     env { clmInstances = Map.insert (mkInstanceKey funcNm typeNms mTag) clm (clmInstances env) }

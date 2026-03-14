@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 -- | Pre-CLM monomorphization: resolve implicit-param dispatch at the Surface AST level.
 --
 -- This pass runs BEFORE CLM conversion (between Pass 3 and Pass 4).
@@ -17,16 +18,22 @@ module Monomorphize
     , monomorphizeLambdas
     , resolveImplicitCalls
     , inferExprTypeName
+    , MonomorphLevel(..)
     ) where
 
 import qualified Data.HashMap.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import Data.Maybe (mapMaybe, fromMaybe, catMaybes)
-import Data.List (intercalate, foldl')
--- import qualified Debug.Trace as DT
+import Data.List (foldl', partition, sortOn)
 
 import Surface
 import State
+
+-- | How aggressively to resolve instance dispatch at the Surface level.
+data MonomorphLevel
+    = MonoTargetOnly   -- ^ Only resolve target instances (current behavior)
+    | MonoFull         -- ^ Also resolve instanceLambdas (for native/bytecode)
+    deriving (Show, Eq)
 
 -- | Type environment: maps variable names to their concrete type names.
 type TypeEnv = HashMap Name Name
@@ -38,29 +45,30 @@ type TypeEnv = HashMap Name Name
 -- target handler bodies.
 --
 -- This modifies topLambdas and instanceLambdas in the Environment.
-monomorphizeForTarget :: Name -> Environment -> Environment
-monomorphizeForTarget targetName env =
+monomorphizeForTarget :: MonomorphLevel -> Name -> Environment -> Environment
+monomorphizeForTarget monoLevel targetName env =
     let tInstances = fromMaybe Map.empty (Map.lookup targetName (targetInstances env))
         handlerOps = buildHandlerOpsMap targetName env
         -- Resolve in topLambdas
-        topLams' = Map.map (resolveInLambda env tInstances handlerOps) (topLambdas env)
+        topLams' = Map.map (resolveInLambda monoLevel env tInstances handlerOps) (topLambdas env)
         -- Resolve in instanceLambdas
-        instLams' = Map.map (resolveInLambda env tInstances handlerOps) (instanceLambdas env)
+        instLams' = Map.map (resolveInLambda monoLevel env tInstances handlerOps) (instanceLambdas env)
     in env { topLambdas = topLams', instanceLambdas = instLams' }
 
 -- | Monomorphize specific sets of lambdas, using the full environment for lookups.
 -- This is for reachability-driven compilation: we only transform the reachable
 -- functions, but need the full env to find dispatch templates (like +, show, ==).
-monomorphizeLambdas :: Name                  -- ^ Target name
+monomorphizeLambdas :: MonomorphLevel         -- ^ How aggressively to resolve
+                    -> Name                  -- ^ Target name
                     -> Environment           -- ^ Full environment (for lookups)
                     -> HashMap Name Lambda   -- ^ Top-level lambdas to transform
                     -> HashMap Name Lambda   -- ^ Instance lambdas to transform
                     -> (HashMap Name Lambda, HashMap Name Lambda)
-monomorphizeLambdas targetName env topLams instLams =
+monomorphizeLambdas monoLevel targetName env topLams instLams =
     let tInstances = fromMaybe Map.empty (Map.lookup targetName (targetInstances env))
         handlerOps = buildHandlerOpsMap targetName env
-    in ( Map.map (resolveInLambda env tInstances handlerOps) topLams
-       , Map.map (resolveInLambda env tInstances handlerOps) instLams
+    in ( Map.map (resolveInLambda monoLevel env tInstances handlerOps) topLams
+       , Map.map (resolveInLambda monoLevel env tInstances handlerOps) instLams
        )
 
 -- | Build a map from effect operation name → handler Lambda body.
@@ -79,12 +87,15 @@ buildHandlerOpsMap targetName env =
 
 -- | Resolve implicit-param calls within a single Lambda.
 -- Builds a TypeEnv from the Lambda's parameters, then walks the body.
-resolveInLambda :: Environment -> NameMap Lambda -> HashMap Name Lambda -> Lambda -> Lambda
-resolveInLambda env tInstances handlerOps lam =
+-- Threads the Lambda's return type as expected-type context for morphism dispatch.
+resolveInLambda :: MonomorphLevel -> Environment -> NameMap Lambda -> HashMap Name Lambda -> Lambda -> Lambda
+resolveInLambda monoLevel env tInstances handlerOps lam =
     let -- Build type env from params: name → concrete type name
         typeEnv = buildTypeEnv (params lam)
-        -- Resolve the body
-        body' = resolveImplicitCalls env tInstances handlerOps typeEnv (body lam)
+        -- Extract return type from the Lambda for expected-type-directed dispatch
+        mRetType = exprToTypeName (lamType lam)
+        -- Resolve the body with expected return type context
+        body' = resolveImplicitCalls monoLevel env tInstances handlerOps typeEnv mRetType (body lam)
     in lam { body = body' }
 
 -- | Build a type environment from function parameters.
@@ -108,21 +119,33 @@ exprToTypeName _ = Nothing
 -- | Walk a Surface expression, resolving implicit-param function calls
 -- to their target instance bodies where possible.
 -- Also resolves effect handler operations (putStrLn, readRef, etc.).
-resolveImplicitCalls :: Environment -> NameMap Lambda -> HashMap Name Lambda -> TypeEnv -> Expr -> Expr
-resolveImplicitCalls env tInstances handlerOps typeEnv = go
+--
+-- The expected return type (Maybe Name) is threaded from the containing
+-- function's lamType through control structures. This enables morphism
+-- dispatch where the return type is needed (e.g., Convertible(Nat, Int)
+-- needs both arg type Nat and return type Int).
+resolveImplicitCalls :: MonomorphLevel -> Environment -> NameMap Lambda
+                     -> HashMap Name Lambda -> TypeEnv -> Maybe Name -> Expr -> Expr
+resolveImplicitCalls monoLevel env tInstances handlerOps typeEnv mExpectedRet = goWith mExpectedRet
   where
-    go expr = case expr of
+    -- | Main walker, parameterized by expected return type from context.
+    goWith :: Maybe Name -> Expr -> Expr
+    goWith mRet expr = case expr of
         -- The key case: function application where funcName has implicit params
         App (Id funcName) args ->
             let isImplicit = case lookupLambda funcName env of
                     Just fun | hasImplicit fun -> True
                     _ -> False
                 -- Also try resolution for intrinsic functions with target instances
-                -- (like ++ which is an intrinsic but not an algebra method in topLambdas)
                 hasTargetInstance = hasAnyTargetInstance funcName tInstances
             in if isImplicit || hasTargetInstance
                 then
-                    let args' = map go args  -- resolve nested calls first
+                    -- For implicit-param calls, propagate type context to args.
+                    -- For homogeneous algebras (+, -, etc.), all args share the same type.
+                    -- Use the best known type (from outer mRet or from any arg's inferred type)
+                    -- as expected return type when resolving nested implicit calls in args.
+                    let argExpectedType = inferImplicitArgType funcName mRet args
+                        args' = map (goWith argExpectedType) args
                     in  -- Try handler operation first (putStrLn, readRef, etc.)
                         case Map.lookup funcName handlerOps of
                             Just handlerLam ->
@@ -137,12 +160,19 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
                                             Just resolvedBody ->
                                                 go (substituteInstanceBody resolvedBody args')
                                             Nothing ->
-                                                App (Id funcName) args'
+                                                -- Also try with return type appended (for morphisms)
+                                                case mRet of
+                                                    Just ret ->
+                                                        case resolveTargetInstanceMulti tInstances funcName (types ++ [ret]) of
+                                                            Just resolvedBody ->
+                                                                go (substituteInstanceBody resolvedBody args')
+                                                            Nothing ->
+                                                                -- Fallback: try instanceLambdas when MonoFull
+                                                                tryInstanceLambdaFallback funcName types mRet args'
+                                                    Nothing ->
+                                                        tryInstanceLambdaFallback funcName types mRet args'
                                     Nothing ->
                                         -- Partial type dispatch: try with just the known types.
-                                        -- Handles cases like `v == 1` where v's type is unknown
-                                        -- but 1's type (Int) suffices for dispatch (algebra methods
-                                        -- have same type for all params).
                                         let knownTypes = nub' (catMaybes argTypes)
                                         in if null knownTypes
                                             then App (Id funcName) args'
@@ -150,10 +180,13 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
                                                 Just resolvedBody ->
                                                     go (substituteInstanceBody resolvedBody args')
                                                 Nothing ->
-                                                    App (Id funcName) args'
+                                                    tryInstanceLambdaFallback funcName knownTypes mRet args'
                 else
-                    -- Not an implicit-param function and no target instance — just recurse
-                    App (Id funcName) (map go args)
+                    -- Not an implicit-param function — infer expected types from param signatures
+                    -- (e.g., nat_to_int(convert(True)): param type is Nat, so convert gets Nat)
+                    let paramTypes = inferParamExpectedTypes funcName (length args)
+                        args' = zipWith goWith paramTypes args
+                    in App (Id funcName) args'
 
         -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`, `readLine`)
         Id funcName ->
@@ -179,38 +212,41 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
                     , Just tn <- [inferExprTypeName env typeEnv arg]
                     ]
                 innerTypeEnv = Map.unions [inferredParamTypes, paramTypeEnv, typeEnv]
-                body' = resolveImplicitCalls env tInstances handlerOps innerTypeEnv (body lam)
+                -- The desugared let body has the same expected type as the outer context
+                body' = resolveImplicitCalls monoLevel env tInstances handlerOps innerTypeEnv mRet (body lam)
                 lam' = lam { body = body' }
             in App (Function lam') args'
 
-        -- Recurse into all other expression forms
+        -- Recurse into all other expression forms, threading expected types
         App f args -> App (go f) (map go args)
         Function lam ->
             let innerTypeEnv = Map.union (buildTypeEnv (params lam)) typeEnv
-            in Function $ lam { body = resolveImplicitCalls env tInstances handlerOps innerTypeEnv (body lam) }
+                lamRetType = exprToTypeName (lamType lam)
+            in Function $ lam { body = resolveImplicitCalls monoLevel env tInstances handlerOps innerTypeEnv lamRetType (body lam) }
         LetIn binds bodyExpr ->
-            -- Extend type env with let bindings where possible.
-            -- First resolve RHS expressions, then infer types from resolved forms.
             let binds' = map (\(v, ex) -> (v, go ex)) binds
                 inferredEnv = buildTypeEnvFromLetPairs env typeEnv binds'
                 letTypeEnv = Map.union inferredEnv typeEnv
-                bodyExpr' = resolveImplicitCalls env tInstances handlerOps letTypeEnv bodyExpr
+                -- Let body has the same expected type as outer context
+                bodyExpr' = resolveImplicitCalls monoLevel env tInstances handlerOps letTypeEnv mRet bodyExpr
             in LetIn binds' bodyExpr'
-        Typed e t -> Typed (go e) t
+        -- Typed annotation: the type IS the expected return type for the inner expr
+        Typed e t -> Typed (goWith (exprToTypeName t) e) t
         ExpandedCase checks bodyExpr si ->
-            ExpandedCase (map goPatternCheck checks) (go bodyExpr) si
+            ExpandedCase (map goPatternCheck checks) (goWith mRet bodyExpr) si
         PatternMatches cases ->
-            PatternMatches (map go cases)
+            PatternMatches (map (goWith mRet) cases)
         CaseOf cv ex si ->
             let patTypes = extractPatternTypes env typeEnv cv
                 innerTypeEnv = Map.union patTypes typeEnv
-                goInner = resolveImplicitCalls env tInstances handlerOps innerTypeEnv
+                goInner = resolveImplicitCalls monoLevel env tInstances handlerOps innerTypeEnv mRet
             in CaseOf (map (\v -> v { val = goInner (val v) }) cv) (goInner ex) si
         ConTuple ct args -> ConTuple ct (map go args)
         NTuple fields -> NTuple (map (\(mn, e) -> (mn, go e)) fields)
         DeclBlock exprs -> DeclBlock (map go exprs)
         ActionBlock stmts -> ActionBlock (map goActionStmt stmts)
-        IfThenElse c t e -> IfThenElse (go c) (go t) (go e)
+        -- Both branches of if/else have same expected type as outer context
+        IfThenElse c t e -> IfThenElse (go c) (goWith mRet t) (goWith mRet e)
         BinaryOp op l r -> BinaryOp op (go l) (go r)
         RecFieldAccess ac e -> RecFieldAccess ac (go e)
         ReprCast e t -> ReprCast (go e) t
@@ -218,12 +254,131 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
         Instance sn mTag ta impls reqs -> Instance sn mTag ta (map go impls) reqs
         _ -> expr  -- Lit, Id (non-implicit), U, UNDEFINED, Intrinsic, etc.
 
-    goPatternCheck (PatternGuard pc e) = PatternGuard pc (go e)
+    -- | Convenience: recurse with no expected return type (for subexpressions
+    -- where the expected type is unknown, like function arguments).
+    go :: Expr -> Expr
+    go = goWith Nothing
+
+    goPatternCheck (PatternGuard pc e) = PatternGuard pc (goWith mExpectedRet e)
     goPatternCheck other = other
 
     goActionStmt (ActionExpr e) = ActionExpr (go e)
     goActionStmt (ActionBind n e) = ActionBind n (go e)
     goActionStmt (ActionLet n e) = ActionLet n (go e)
+
+    -- | Infer expected types for each argument position from a function's parameter signatures.
+    -- For non-implicit functions like nat_to_int(n:Nat), this returns [Just "Nat"].
+    -- Falls back to Nothing for unknown functions or type variables.
+    inferParamExpectedTypes :: Name -> Int -> [Maybe Name]
+    inferParamExpectedTypes funcName numArgs =
+        case lookupLambda funcName env of
+            Just fun ->
+                let valueParams = filter (not . isImplicitVar) (params fun)
+                    paramTys = map (exprToTypeName . typ) valueParams
+                in take numArgs (paramTys ++ repeat Nothing)
+            Nothing ->
+                -- Try constructor (e.g., Succ(convert(n-1)) — Succ has param type Nat)
+                case lookupConstructor funcName env of
+                    Just (consLam, _) ->
+                        let valueParams = filter (not . isImplicitVar) (params consLam)
+                            paramTys = map (exprToTypeName . typ) valueParams
+                        in take numArgs (paramTys ++ repeat Nothing)
+                    Nothing ->
+                        replicate numArgs Nothing
+
+    -- | Infer the expected type for arguments of an implicit-param function.
+    -- For homogeneous algebra functions (all value params share the same type var),
+    -- the expected arg type = the expected return type or the type of any known arg.
+    -- This allows nested implicit calls (like convert(m) inside 1 + convert(m))
+    -- to receive the type context they need for morphism dispatch.
+    inferImplicitArgType :: Name -> Maybe Name -> [Expr] -> Maybe Name
+    inferImplicitArgType funcName outerRet args =
+        -- First try outer expected return type (from containing function's lamType)
+        case outerRet of
+            Just t -> Just t
+            Nothing ->
+                -- Try to infer from any arg's known type
+                firstJust [inferExprTypeName env typeEnv a | a <- args]
+
+    -- | Try resolving via instanceLambdas when MonoFull and target instance not found.
+    -- Rewrites the call to a direct reference to the instance function (by key),
+    -- rather than inlining the body, to avoid infinite expansion for recursive instances.
+    -- Uses both arg types and expected return type for morphism dispatch.
+    tryInstanceLambdaFallback :: Name -> [Name] -> Maybe Name -> [Expr] -> Expr
+    tryInstanceLambdaFallback funcName argTypes mRet args'
+        | monoLevel /= MonoFull = App (Id funcName) args'
+        | otherwise =
+            -- Try with return type appended first (for morphisms like Convertible)
+            let withRet = case mRet of
+                    Just ret -> resolveInstanceLambdaWithKey env funcName (argTypes ++ [ret])
+                    Nothing  -> Nothing
+            in case withRet of
+                Just (instKey, instLam) | body instLam /= Intrinsic ->
+                    App (Id instKey) args'
+                _ ->
+                    -- Fallback: try with arg types only (for algebras, single-param)
+                    case resolveInstanceLambdaWithKey env funcName argTypes of
+                        Just (instKey, instLam) | body instLam /= Intrinsic ->
+                            App (Id instKey) args'
+                        _ -> App (Id funcName) args'
+
+-- | Resolve an instance lambda using a cascade mirroring the runtime dispatcher.
+-- Returns both the instance key and the lambda.
+resolveInstanceLambdaWithKey :: Environment -> Name -> [Name] -> Maybe (Name, Lambda)
+resolveInstanceLambdaWithKey env funcName types =
+    let instLams = instanceLambdas env
+        key1 = mkInstanceKey funcName types Nothing
+        exact = Map.lookup key1 instLams
+    in firstJust'
+    -- 1. Exact multi-param: "convert\0Nat\0Int"
+    [ fmap (key1,) exact
+    -- 2. Any-tag: "combine\0Nat\0@Additive"
+    , let baseKey = mkInstanceKey funcName types Nothing
+          tagPrefix = baseKey ++ "\0@"
+          matches = sortOn fst $ Map.toList $ Map.filterWithKey
+                      (\k _ -> take (length tagPrefix) k == tagPrefix) instLams
+      in case matches of
+          ((k, v):_) -> Just (k, v)
+          [] -> Nothing
+    -- 3. Prefix (morphisms): "convert\0Nat" matches "convert\0Nat\0Int"
+    , let key = mkInstanceKey funcName types Nothing
+          prefix = key ++ "\0"
+      in case Map.lookup key instLams of
+          Just lam -> Just (key, lam)
+          Nothing ->
+              let matches = Map.toList $ Map.filterWithKey
+                      (\k _ -> take (length prefix) k == prefix) instLams
+                  (direct, composed) = partition (isDirectInstanceLam funcName . snd) matches
+              in case direct of
+                  ((k, v):_) -> Just (k, v)
+                  [] -> case composed of
+                      ((k, v):_) -> Just (k, v)
+                      [] -> Nothing
+    -- 4. Deduped types
+    , let uniq = nub' types
+      in if uniq /= types
+         then let key = mkInstanceKey funcName uniq Nothing
+              in fmap (key,) $ Map.lookup key instLams
+         else Nothing
+    -- 5. Single-param for each type
+    , firstJust [ let key = mkInstanceKey funcName [t] Nothing
+                  in fmap (key,) $ Map.lookup key instLams
+                | t <- nub' types ]
+    -- 6. Single-param any-tag
+    , firstJust [ let tagPrefix = mkInstanceKey funcName [t] Nothing ++ "\0@"
+                      matches = sortOn fst $ Map.toList $ Map.filterWithKey
+                                  (\k _ -> take (length tagPrefix) k == tagPrefix) instLams
+                  in case matches of
+                      ((k, v):_) -> Just (k, v)
+                      [] -> Nothing
+                | t <- nub' types ]
+    ]
+
+-- | Return the first Just from a list of Maybes (non-shadowing name).
+firstJust' :: [Maybe a] -> Maybe a
+firstJust' [] = Nothing
+firstJust' (Just x : _) = Just x
+firstJust' (Nothing : rest) = firstJust' rest
 
 -- | Build type env from let bindings.
 -- First tries explicit Var type annotations, then infers from the RHS expression.
@@ -336,8 +491,33 @@ inferExprTypeName env typeEnv (LetIn binds bodyExpr) =
     in inferExprTypeName env letTypeEnv bodyExpr
 -- ActionBlock: result type is Unit
 inferExprTypeName _ _ (ActionBlock _) = Just "Unit"
+-- RecFieldAccess: infer field type from container type + constructor info
+inferExprTypeName env typeEnv (RecFieldAccess (_, idx) e) =
+    case inferExprTypeName env typeEnv e of
+        Just typeName -> inferFieldType env typeName idx
+        Nothing -> Nothing
 -- Can't determine
 inferExprTypeName _ _ _ = Nothing
+
+-- | Infer the type of a field at a given index for a type.
+-- Scans constructors of the type and returns the field type if unambiguous.
+inferFieldType :: Environment -> Name -> Int -> Maybe Name
+inferFieldType env typeName idx =
+    let allCons = Map.toList (constructors env)
+        -- Find constructors whose return type matches
+        typeCons = [cLam | (_cName, (cLam, _)) <- allCons
+                   , exprToTypeName (lamType cLam) == Just typeName]
+        -- Get field type at idx from constructors that have enough fields
+        fieldTypes = catMaybes
+                     [exprToTypeName (typ vp)
+                     | cLam <- typeCons
+                     , let vps = filter (not . isImplicitVar) (params cLam)
+                     , idx >= 0 && idx < length vps
+                     , let vp = vps !! idx
+                     ]
+    in case nub' fieldTypes of
+        [t] -> Just t
+        _ -> Nothing
 
 -- | Look up the return type of a target extern function.
 -- Searches all targets (typically just "native").
