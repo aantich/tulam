@@ -48,7 +48,7 @@ function durationMicros(d:Duration) : Int = toNanos(d) / 1000;
 function durationMillis(d:Duration) : Int = toNanos(d) / 1000000;
 
 /// Convert a Duration to seconds as a floating-point value.
-function durationSeconds(d:Duration) : Float64 = toFloat(toNanos(d)) / 1000000000.0;
+function durationSeconds(d:Duration) : Float64 = (convert(toNanos(d)) : Float64) / 1000000000.0;
 
 /// Measure the wall-clock duration of executing an action.
 /// Returns a pair of (result, duration).
@@ -65,8 +65,8 @@ function timeit(f: Unit -> a) : Duration =
 instance Show(Duration) = {
     function show(d:Duration) : String =
         let ns = toNanos(d) in
-        if ns >= 1000000000 then show(ns / 1000000000) ++ "." ++ show(mod(ns / 100000000, 10)) ++ "s"
-        else if ns >= 1000000 then show(ns / 1000000) ++ "." ++ show(mod(ns / 100000, 10)) ++ "ms"
-        else if ns >= 1000 then show(ns / 1000) ++ "us"
-        else show(ns) ++ "ns"
+        if ns >= 1000000000 then show(ns / 1000000000) <> "." <> show(mod(ns / 100000000, 10)) <> "s"
+        else if ns >= 1000000 then show(ns / 1000000) <> "." <> show(mod(ns / 100000, 10)) <> "ms"
+        else if ns >= 1000 then show(ns / 1000) <> "us"
+        else show(ns) <> "ns"
 };

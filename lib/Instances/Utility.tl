@@ -10,6 +10,4 @@ function describeInt(x:Int) : Nat = match
     | n -> Succ(Succ(Z));
 
 /// Double a Nat using a where clause.
-function doubleNat(x:Nat) : Nat = plus(twice, twice) where {
-    twice = plus(x, x)
-};
+function doubleNat(x:Nat) : Nat = plus(x, x);

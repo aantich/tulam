@@ -1,7 +1,6 @@
-/// Nat instances: Eq, Ord, Show, Enum, Hashable, Semigroup, Monoid, Semiring.
+/// Nat instances: Eq, Ord, Show, Enum, Hashable, Semigroup, Monoid.
 ///
-/// All Nat operations (plus, mult, eq, natMax) are defined here as algebra
-/// instances or helper functions, not as standalone Core functions.
+/// All Nat operations are defined here as algebra instances or helper functions.
 module Instances.Nat;
 import Core;
 import Algebra;
@@ -63,7 +62,7 @@ instance Ord(Nat) = {
 instance Show(Nat) = {
     function show(x:Nat) : String = match
         | Z -> "Z"
-        | Succ(n) -> concat("Succ(", concat(show(n), ")"))
+        | Succ(n) -> "Succ(" <> show(n) <> ")"
 };
 
 instance Enum(Nat) = {
@@ -85,18 +84,24 @@ instance Hashable(Nat) = {
         | Succ(n) -> 1 + hash(n)
 };
 
-instance Semigroup(Nat) = {
+/// Nat forms a semigroup under addition (additive).
+instance Semigroup(Nat) as Additive = {
     function combine(x:Nat, y:Nat) : Nat = plus(x, y)
 };
 
-instance Monoid(Nat) = {
+/// Nat forms a monoid under addition with Z as identity.
+instance Monoid(Nat) as Additive = {
     function combine(x:Nat, y:Nat) : Nat = plus(x, y);
     value empty = Z
 };
 
-instance Semiring(Nat) = {
-    function (+)(x:Nat, y:Nat) : Nat = plus(x, y);
-    function (*)(x:Nat, y:Nat) : Nat = mult(x, y);
-    value zero = Z;
-    value one = Succ(Z)
+/// Nat forms a semigroup under multiplication (multiplicative).
+instance Semigroup(Nat) as Multiplicative = {
+    function combine(x:Nat, y:Nat) : Nat = mult(x, y)
+};
+
+/// Nat forms a monoid under multiplication with Succ(Z) as identity.
+instance Monoid(Nat) as Multiplicative = {
+    function combine(x:Nat, y:Nat) : Nat = mult(x, y);
+    value empty = Succ(Z)
 };

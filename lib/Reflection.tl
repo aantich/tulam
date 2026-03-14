@@ -5,6 +5,8 @@
 /// implementations of Eq, Ord, Show, and Hashable used by derive blocks.
 module Reflection;
 import Core;
+import Algebra;
+import Repr;
 
 // ============================================================================
 // Reflection intrinsics
@@ -35,38 +37,52 @@ function constructorByIndex(typeName:String, i:Int) : a = intrinsic;
 /// Structural equality: compare constructor tags, then all fields recursively.
 function structuralEq(x:a, y:a) : Bool =
     if tag(x) != tag(y) then False
-    else eqFields(x, y, 0, arity(x));
+    else eqFields(x, y, fromRepr(arity(x)));
 
-function eqFields(x:a, y:a, i:Int, n:Int) : Bool =
-    if i >= n then True
-    else if field(x, i) == field(y, i) then eqFields(x, y, i + 1, n)
-    else False;
+/// Compare fields counting down from remaining to Z.
+function eqFields(x:a, y:a, remaining:Nat) : Bool = match
+    | x, y, Z -> True
+    | x, y, Succ(r) ->
+        let i = arity(x) - toRepr(remaining) in
+        if field(x, i) == field(y, i) then eqFields(x, y, r)
+        else False;
 
 /// Structural ordering: compare constructor tags first, then fields lexicographically.
 function structuralCompare(x:a, y:a) : Ordering =
     if tag(x) < tag(y) then LessThan
     else if tag(x) > tag(y) then GreaterThan
-    else compareFields(x, y, 0, arity(x));
+    else compareFields(x, y, fromRepr(arity(x)));
 
-function compareFields(x:a, y:a, i:Int, n:Int) : Ordering =
-    if i >= n then Equal
-    else match compare(field(x, i), field(y, i))
-         | Equal -> compareFields(x, y, i + 1, n)
-         | result -> result;
+/// Compare fields lexicographically, counting down.
+function compareFields(x:a, y:a, remaining:Nat) : Ordering = match
+    | x, y, Z -> Equal
+    | x, y, Succ(r) ->
+        let i = arity(x) - toRepr(remaining) in
+        match compare(field(x, i), field(y, i))
+        | Equal -> compareFields(x, y, r)
+        | result -> result;
 
 /// Structural show: constructor name followed by fields in parentheses.
 function structuralShow(x:a) : String =
     if arity(x) == 0 then tagName(x)
-    else concat(tagName(x), concat("(", concat(showFields(x, 0, arity(x)), ")")));
+    else tagName(x) <> "(" <> showFields(x, fromRepr(arity(x))) <> ")";
 
-function showFields(x:a, i:Int, n:Int) : String =
-    if i >= n - 1 then show(field(x, i))
-    else concat(show(field(x, i)), concat(", ", showFields(x, i + 1, n)));
+/// Show fields comma-separated, counting down.
+function showFields(x:a, remaining:Nat) : String = match
+    | x, Succ(Z) ->
+        let i = arity(x) - 1 in
+        show(field(x, i))
+    | x, Succ(r) ->
+        let i = arity(x) - toRepr(remaining) in
+        show(field(x, i)) <> ", " <> showFields(x, r);
 
 /// Structural hash: combine constructor tag with field hashes.
 function structuralHash(x:a) : Int =
-    hashFields(x, tag(x) * 31, 0, arity(x));
+    hashFields(x, tag(x) * 31, fromRepr(arity(x)));
 
-function hashFields(x:a, acc:Int, i:Int, n:Int) : Int =
-    if i >= n then acc
-    else hashFields(x, acc * 31 + hash(field(x, i)), i + 1, n);
+/// Hash fields, counting down.
+function hashFields(x:a, acc:Int, remaining:Nat) : Int = match
+    | x, acc, Z -> acc
+    | x, acc, Succ(r) ->
+        let i = arity(x) - toRepr(remaining) in
+        hashFields(x, acc * 31 + hash(field(x, i)), r);

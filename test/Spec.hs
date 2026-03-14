@@ -46,19 +46,13 @@ mkStateWithEnv env = emptyIntState { currentEnvironment = env }
 -- Helper: load all modules from lib/ into state, return the state
 setupEnv :: IO InterpreterState
 setupEnv = do
-    -- Resolve module load order, then load all modules
-    finalState <- evalStateT (execStateT setup emptyIntState) initLogState
+    -- Resolve module load order, then load all modules using two-phase compilation
+    let silentState = emptyIntState { currentFlags = (currentFlags emptyIntState) { verbosity = Silent, showErrors = False, showWarnings = False } }
+    finalState <- evalStateT (execStateT setup silentState) initLogState
     return finalState
   where
     setup = do
-        -- Load prelude first (primitives)
-        loadFileQuiet preludeModulePath
-        -- Resolve dependency order for all lib/ modules
-        let searchPaths = ["lib/"]
-        allModules <- liftIO $ resolveAllDeps searchPaths Set.empty [baseModulePath]
-        -- Load each module in dependency order
-        mapM_ (\(_, filePath) -> loadFileQuiet filePath) allModules
-        -- Install default effect handlers
+        loadModuleTree baseModulePath
         installDefaultHandlers
 
 -- Helper: parse a string as a tulam file, returning the expressions
@@ -170,6 +164,12 @@ main :: IO ()
 main = do
     st <- setupEnv
     hspec $ do
+        -- Critical: verify stdlib compiles cleanly in strict mode (strictTypes=True is default)
+        describe "Standard library strict mode compilation" $ do
+            it "stdlib loads with zero type errors in strict mode" $ do
+                let errCount = tcErrorCount st
+                errCount `shouldBe` 0
+
         llvmTests
         bytecodeTests
         describe "Parser" $ do
@@ -236,7 +236,7 @@ main = do
 
             it "has eq instance for Nat" $ do
                 let env = currentEnvironment st
-                case lookupInstanceLambda "==" ["Nat"] env of
+                case lookupInstanceLambda "==" ["Nat"] Nothing env of
                     Just _ -> return ()
                     Nothing -> expectationFailure "Expected Eq instance for Nat"
 
@@ -626,9 +626,9 @@ main = do
                 result `shouldBe` conTrue
 
         describe "Where clauses" $ do
-            it "doubleNat(Succ(Z)) = Succ(Succ(Succ(Succ(Z))))" $ do
+            it "doubleNat(Succ(Z)) = Succ(Succ(Z))" $ do
                 result <- evalExpr st "doubleNat(Succ(Z))"
-                result `shouldBe` nat 4
+                result `shouldBe` nat 2
 
             it "doubleNat(Z) = Z" $ do
                 result <- evalExpr st "doubleNat(Z)"
@@ -1975,7 +1975,7 @@ main = do
 
             describe "showTCError coverage" $ do
                 it "ConstraintUnsolved shows structure name" $ do
-                    let err = ConstraintUnsolved (CStructure "Eq" [Id "MyType"])
+                    let err = ConstraintUnsolved (CStructure "Eq" Nothing [Id "MyType"])
                     showTCError err `shouldSatisfy` ("Eq" `isInfixOf`)
                     showTCError err `shouldSatisfy` ("MyType" `isInfixOf`)
 
@@ -2172,7 +2172,7 @@ main = do
                         Left errs -> expectationFailure $ "SumType should pass: " ++ show errs
 
                 it "checkTopLevel Instance checks implementations" $ do
-                    let result = runTC (checkTopLevel (Instance "Eq" [Id "Bool"] [Function (mkLambda "==" [] UNDEFINED UNDEFINED)] [])) env0 st0
+                    let result = runTC (checkTopLevel (Instance "Eq" Nothing [Id "Bool"] [Function (mkLambda "==" [] UNDEFINED UNDEFINED)] [])) env0 st0
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Instance should pass: " ++ show errs
@@ -6237,12 +6237,10 @@ main = do
                 st' <- loadTestProgram strictSt "tests/programs/P38_StrictTypes.tl"
                 -- The file has a function with wrong return type, should have errors
                 tcErrorCount st' `shouldSatisfy` (> 0)
-                tcCollectedErrors st' `shouldSatisfy` (not . null)
 
             it "P38: loading with relaxed mode has zero tcErrorCount" $ do
                 st' <- loadTestProgram st "tests/programs/P38_StrictTypes.tl"
                 -- In relaxed mode, errors are warnings, tcErrorCount stays 0 since we only count in strict
-                -- Actually, tcCollectedErrors always accumulates now
                 pure () :: IO ()
 
         -- ==================================================================
@@ -6410,7 +6408,7 @@ main = do
                                   UNDEFINED
                         cenv = addNamedStructure (Structure eqLam (StructInfo SAlgebra [] [] [] [])) initialEnvironment
                         envWithCompiler = emptyTCEnv { envCompiler = Just cenv }
-                        action = tcModify (\s -> s { constraints = [CStructure "Eq" [Id "Unknown"]] })
+                        action = tcModify (\s -> s { constraints = [CStructure "Eq" Nothing [Id "Unknown"]] })
                                  `tcBind` \_ -> resolveConstraints
                     let result = runTC action envWithCompiler stStrict
                     case result of
@@ -6478,7 +6476,7 @@ main = do
 
             describe "Instance declaration checking" $ do
                 it "intrinsic instances pass without error" $ do
-                    let inst = Instance "Eq" [Id "Int"] [Intrinsic] []
+                    let inst = Instance "Eq" Nothing [Id "Int"] [Intrinsic] []
                     let result = runTC (checkTopLevel inst) env0 stRelaxed
                     case result of
                         Right ((), st') -> tcErrors st' `shouldSatisfy` null

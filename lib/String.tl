@@ -97,12 +97,12 @@ algebra StringLike(s:Type) = {
 
     function charCount(str:s) : Int = charCountFrom(str, 0, 0);
 
-    function charCountFrom(str:s, byteOff:Int, count:Int) : Int =
-        charCountStep(strDecodeAt(str, byteOff), count, str);
+    function charCountFrom(str:s, byteOff:Int, cnt:Int) : Int =
+        charCountStep(strDecodeAt(str, byteOff), cnt, str);
 
-    function charCountStep(r:Maybe(Pair(Char, Int)), count:Int, str:s) : Int = match
-        | Nothing, count, str -> count
-        | Just(Pair(ch, nextOff)), count, str -> charCountFrom(str, nextOff, count + 1);
+    function charCountStep(r:Maybe(Pair(Char, Int)), cnt:Int, str:s) : Int = match
+        | Nothing, cnt, str -> cnt
+        | Just(Pair(ch, nextOff)), cnt, str -> charCountFrom(str, nextOff, cnt + 1);
 
     function nthChar(str:s, n:Int) : Maybe(Char) = nthCharHelper(str, 0, n);
 

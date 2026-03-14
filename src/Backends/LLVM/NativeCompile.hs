@@ -28,11 +28,12 @@ import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import Backends.LLVM.LIR
 import qualified Data.HashSet as HSet
+import CLM (CLMLam(..), CLMExpr(..))
 import Backends.LLVM.CLMToLIR (lowerFunction, buildExternMap,
                                 surfaceTypeToLType, surfaceRetTypeToLType,
                                 ExternMap, externDeclarations,
                                 sanitizeName, LowerError(..),
-                                detectNullaryAsNull)
+                                collectConTags)
 import Backends.LLVM.LIRToLLVM (emitModule, addRuntimeExterns)
 
 -- | Compilation result.
@@ -91,8 +92,17 @@ compileNative env state config funcNames = do
                                  , surfaceRetTypeToLType (lamType lam)
                                  )) | (n, lam) <- Map.toList compilable]
 
-                    -- Detect nullary-as-null tags globally (Phase 2)
-                    let globalNullary = mconcat [detectNullaryAsNull clm | (_, clm) <- Map.toList clmFuncs]
+                    -- Detect nullary-as-null tags globally (Phase N3).
+                    -- Must collect ALL nullary/non-nullary tags globally first,
+                    -- then take the difference. Same tag integer can be nullary
+                    -- in one type (e.g., Nil=tag0) and non-nullary in another.
+                    let allClmBodies = [case clm of
+                            CLMLam _ b      -> b
+                            CLMLamCases _ cs -> CLMPROG cs
+                            | (_, clm) <- Map.toList clmFuncs]
+                        (nullaryRaw, nonNullary) = mconcat
+                            [collectConTags e | e <- allClmBodies]
+                        globalNullary = HSet.difference nullaryRaw nonNullary
 
                     -- Step 5: Lower CLM → LIR (with per-function error reporting)
                     results <- mapM (\(n, clm) -> do

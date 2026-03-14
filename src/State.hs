@@ -14,6 +14,7 @@ import Data.IORef
 import Data.Text as L
 
 import Data.Sequence as S
+import qualified Data.Foldable as Foldable
 
 import Surface
 import CLM
@@ -25,6 +26,7 @@ import qualified Data.List
 import Util.IOLogger as Log
 import Util.PrettyPrinting
 import Logs as Logs
+import Control.Monad (when, forM_)
 import GHC.Generics (Generic)
 import Data.Hashable (Hashable)
 import Data.Binary (Binary)
@@ -171,8 +173,8 @@ data Environment = Environment {
     -- instance-specialized functions: key is "funcName\0typeName"
     instanceLambdas :: NameMap Lambda,
     clmInstances    :: NameMap CLMLam,
-    -- structure inheritance: maps child structure name to list of parent names
-    structInheritance :: NameMap [Name],
+    -- structure inheritance: maps child structure name to list of (parent name, optional tag)
+    structInheritance :: NameMap [(Name, Maybe Name)],
     -- repr map: user type -> list of (reprTypeName, isDefault, toReprLam, fromReprLam, maybeInvariant)
     reprMap :: NameMap [(Name, Bool, Lambda, Lambda, Maybe Expr)],
     -- effect declarations: effect name -> (params, operations)
@@ -362,8 +364,13 @@ data InterpreterState = InterpreterState {
     defaultHandlerCount :: !Int,
     -- Type checker error count (per-module, reset before each typecheck pass)
     tcErrorCount   :: !Int,
-    -- Accumulated TC error messages (across all modules, for diagnostics)
-    tcCollectedErrors :: [String]
+    -- Two-phase compilation: per-module saved state after Phase 1
+    -- Keyed by module file path. Stores (parsedExprs, namesBefore, prevLoadedMods)
+    -- for Phase 2 retrieval.
+    moduleParsedExprs :: HashMap String ([(Expr, SourceInfo)], Set.Set Name, HashMap String ModuleEnv),
+    -- Modules whose type checking was deferred because imports weren't loaded yet.
+    -- Each entry: (filePath, parsedExprs, list of required module keys not yet loaded)
+    deferredTCModules :: [(String, [(Expr, SourceInfo)], [String])]
 }
 
 instance Show InterpreterState where
@@ -375,7 +382,7 @@ instance Show InterpreterState where
         ++ " }"
 
 emptyIntState = InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True False,
+    currentFlags = defaultFlags,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -390,7 +397,8 @@ emptyIntState = InterpreterState {
     handlerStack = [],
     defaultHandlerCount = 0,
     tcErrorCount = 0,
-    tcCollectedErrors = []
+    moduleParsedExprs = Map.empty,
+    deferredTCModules = []
 }
 
 -- | Per-pass optimization flags
@@ -406,12 +414,39 @@ data OptFlags = OptFlags {
 defaultOptFlags :: OptFlags
 defaultOptFlags = OptFlags True True True True True True
 
+defaultFlags :: CurrentFlags
+defaultFlags = CurrentFlags
+    { strict = False
+    , pretty = True
+    , tracing = False
+    , strictTypes = True
+    , verbosity = Normal
+    , showErrors = True
+    , showWarnings = True
+    , newStrings = False
+    , optSettings = defaultOptFlags
+    , checkPositivity = True
+    , checkTermination = True
+    , checkCoverage = True
+    , checkPurity = False
+    }
+
+-- | Compiler output verbosity levels (ordered: Silent < Errors < ... < Verbose)
+data Verbosity = Silent    -- ^ No output (for tests)
+               | Errors    -- ^ Only errors
+               | Warnings  -- ^ Errors + warnings
+               | Normal    -- ^ Errors + warnings + progress (default)
+               | Verbose   -- ^ All above + per-pass timing
+               deriving (Show, Eq, Ord)
+
 data CurrentFlags = CurrentFlags {
     strict    :: Bool -- true if strict, false if lazy
   , pretty    :: Bool -- pretty print or raw output
   , tracing   :: Bool -- whether to trace execution steps
   , strictTypes :: Bool -- true if type errors are fatal, false for warnings
-  , verbose   :: Bool -- verbose pass logging and timing
+  , verbosity :: Verbosity -- compiler output verbosity level
+  , showErrors   :: Bool -- independently toggle error display
+  , showWarnings :: Bool -- independently toggle warning display
   , newStrings :: Bool -- true if string literals desugar to fromStringLiteral
   , optSettings :: OptFlags -- optimization pass settings
   , checkPositivity   :: Bool -- positivity checking for inductive types
@@ -429,7 +464,7 @@ maxEvalDepth = 1000
 
 initializeInterpreter :: IO InterpreterState
 initializeInterpreter = return $ InterpreterState {
-    currentFlags = CurrentFlags False True False False False False defaultOptFlags True True True False,
+    currentFlags = defaultFlags,
     parsedModule = [],
     currentSource = "",
     currentEnvironment = initialEnvironment,
@@ -444,7 +479,8 @@ initializeInterpreter = return $ InterpreterState {
     handlerStack = [],
     defaultHandlerCount = 0,
     tcErrorCount = 0,
-    tcCollectedErrors = []
+    moduleParsedExprs = Map.empty,
+    deferredTCModules = []
 }
 
 -- | Look up a handler op by name in the handler stack (innermost first)
@@ -540,7 +576,8 @@ traverseExprM f (Structure lam si) = do
     b <- f (body lam)
     pure $ Structure (lam { body = b }) si
 traverseExprM f (Binding (Var nm tp val)) = Binding <$> (Var nm <$> f tp <*> f val)
-traverseExprM f (Instance nm targs impls reqs) = Instance nm <$> mapM f targs <*> mapM f impls <*> mapM f reqs
+traverseExprM f (Instance nm mTag targs impls reqs) = Instance nm mTag <$> mapM f targs <*> mapM f impls <*> mapM f reqs
+traverseExprM f (NamedRef e tag) = (\e' -> NamedRef e' tag) <$> f e
 traverseExprM f (IfThenElse c t e) = IfThenElse <$> f c <*> f t <*> f e
 traverseExprM f (LetIn binds bdy) = LetIn <$> mapM (\(v,ex) -> (,) v <$> f ex) binds <*> f bdy
 traverseExprM f (Pi mn e1 e2) = Pi mn <$> f e1 <*> f e2
@@ -582,12 +619,12 @@ addNamedStructure :: Expr -> Environment -> Environment
 addNamedStructure st@(Structure lam _si) env = env { types = Map.insert (lamName lam) st (types env) }
 addNamedStructure e env = env
 
--- Register structure inheritance: child extends parents
-registerInheritance :: Name -> [Name] -> Environment -> Environment
+-- Register structure inheritance: child extends parents (with optional tags)
+registerInheritance :: Name -> [(Name, Maybe Name)] -> Environment -> Environment
 registerInheritance child parents env =
     env { structInheritance = Map.insert child parents (structInheritance env) }
 
--- Get all transitive parents of a structure
+-- Get all transitive parents of a structure (names only, ignoring tags)
 getAllParents :: Name -> Environment -> [Name]
 getAllParents name env = go [name] []
   where
@@ -596,7 +633,18 @@ getAllParents name env = go [name] []
       | n `Prelude.elem` visited = go ns visited
       | otherwise = case Map.lookup n (structInheritance env) of
           Nothing      -> go ns (visited ++ [n])
-          Just parents -> go (parents ++ ns) (visited ++ [n])
+          Just parents -> go (Prelude.map fst parents ++ ns) (visited ++ [n])
+
+-- Get all transitive parents with their tags
+getAllParentsWithTags :: Name -> Environment -> [(Name, Maybe Name)]
+getAllParentsWithTags name env = go [(name, Nothing)] []
+  where
+    go [] visited = visited
+    go ((n, tag):ns) visited
+      | n `Prelude.elem` Prelude.map fst visited = go ns visited
+      | otherwise = case Map.lookup n (structInheritance env) of
+          Nothing      -> go ns (visited ++ [(n, tag)])
+          Just parents -> go (parents ++ ns) (visited ++ [(n, tag)])
 
 -- Class hierarchy helpers
 lookupClass :: Name -> Environment -> Maybe ClassMeta
@@ -653,19 +701,21 @@ addManyNamedConstructors i (c:cs) env = addManyNamedConstructors (i+1) cs (addNa
 -- addManyNamedConstructors :: [Lambda] -> Environment -> Environment
 -- addManyNamedConstructors ls env = env { constructors = Prelude.foldl (\acc l1 -> Map.insert (lamName l1) l1 acc) (topLambdas env) ls }
 
--- Instance functions: keyed by "funcName\0type1\0type2\0..."
--- For single-param: mkInstanceKey "==" ["Nat"] → "==\0Nat" (backward compatible)
-mkInstanceKey :: Name -> [Name] -> Name
-mkInstanceKey funcName typeNames = funcName ++ "\0" ++ Data.List.intercalate "\0" typeNames
+-- Instance functions: keyed by "funcName\0type1\0type2\0..." or with tag "funcName\0type1\0...\0@Tag"
+-- For single-param: mkInstanceKey "==" ["Nat"] Nothing → "==\0Nat" (backward compatible)
+-- For named instances: mkInstanceKey "combine" ["Int"] (Just "Additive") → "combine\0Int\0@Additive"
+mkInstanceKey :: Name -> [Name] -> Maybe Name -> Name
+mkInstanceKey funcName typeNames Nothing    = funcName ++ "\0" ++ Data.List.intercalate "\0" typeNames
+mkInstanceKey funcName typeNames (Just tag) = funcName ++ "\0" ++ Data.List.intercalate "\0" typeNames ++ "\0@" ++ tag
 
-addInstanceLambda :: Name -> [Name] -> Lambda -> Environment -> Environment
-addInstanceLambda funcNm typeNms lam env =
-    env { instanceLambdas = Map.insert (mkInstanceKey funcNm typeNms) lam (instanceLambdas env) }
+addInstanceLambda :: Name -> [Name] -> Maybe Name -> Lambda -> Environment -> Environment
+addInstanceLambda funcNm typeNms mTag lam env =
+    env { instanceLambdas = Map.insert (mkInstanceKey funcNm typeNms mTag) lam (instanceLambdas env) }
 
 -- | Add a target-qualified instance lambda.
-addTargetInstance :: Name -> Name -> [Name] -> Lambda -> Environment -> Environment
-addTargetInstance target funcNm typeNms lam env =
-    let key = mkInstanceKey funcNm typeNms
+addTargetInstance :: Name -> Name -> [Name] -> Maybe Name -> Lambda -> Environment -> Environment
+addTargetInstance target funcNm typeNms mTag lam env =
+    let key = mkInstanceKey funcNm typeNms mTag
         existing = maybe Map.empty id (Map.lookup target (targetInstances env))
         updated = Map.insert key lam existing
     in env { targetInstances = Map.insert target updated (targetInstances env) }
@@ -684,15 +734,15 @@ addTargetExtern target funcName decl env =
         updated = Map.insert funcName decl existing
     in env { targetExterns = Map.insert target updated (targetExterns env) }
 
-lookupInstanceLambda :: Name -> [Name] -> Environment -> Maybe Lambda
-lookupInstanceLambda funcNm typeNms env = Map.lookup (mkInstanceKey funcNm typeNms) (instanceLambdas env)
+lookupInstanceLambda :: Name -> [Name] -> Maybe Name -> Environment -> Maybe Lambda
+lookupInstanceLambda funcNm typeNms mTag env = Map.lookup (mkInstanceKey funcNm typeNms mTag) (instanceLambdas env)
 
-addCLMInstance :: Name -> [Name] -> CLMLam -> Environment -> Environment
-addCLMInstance funcNm typeNms clm env =
-    env { clmInstances = Map.insert (mkInstanceKey funcNm typeNms) clm (clmInstances env) }
+addCLMInstance :: Name -> [Name] -> Maybe Name -> CLMLam -> Environment -> Environment
+addCLMInstance funcNm typeNms mTag clm env =
+    env { clmInstances = Map.insert (mkInstanceKey funcNm typeNms mTag) clm (clmInstances env) }
 
-lookupCLMInstance :: Name -> [Name] -> Environment -> Maybe CLMLam
-lookupCLMInstance funcNm typeNms env = Map.lookup (mkInstanceKey funcNm typeNms) (clmInstances env)
+lookupCLMInstance :: Name -> [Name] -> Maybe Name -> Environment -> Maybe CLMLam
+lookupCLMInstance funcNm typeNms mTag env = Map.lookup (mkInstanceKey funcNm typeNms mTag) (clmInstances env)
 
 -- Reverse lookup: given a constructor name, find which type it belongs to
 lookupTypeOfConstructor :: Name -> Environment -> Maybe Name
@@ -704,16 +754,29 @@ lookupTypeOfConstructor consName env =
             _     -> Nothing
         Nothing -> Nothing
 
+-- Tagged fallback CLM instance lookup: when untagged lookup fails, find any tagged instance.
+-- Searches for keys matching funcName\0type1\0...\0typeN\0@* pattern.
+-- When multiple tagged instances exist, prefers alphabetically first tag (e.g., Additive < Multiplicative).
+lookupCLMInstanceAnyTag :: Name -> [Name] -> Environment -> Maybe CLMLam
+lookupCLMInstanceAnyTag funcNm typeNms env =
+    let baseKey = mkInstanceKey funcNm typeNms Nothing  -- e.g. "combine\0Nat"
+        tagPrefix = baseKey ++ "\0@"
+        matches = Data.List.sortOn fst $ Map.toList $ Map.filterWithKey
+                    (\k _ -> Prelude.take (Prelude.length tagPrefix) k == tagPrefix) (clmInstances env)
+    in case matches of
+        ((_, v):_) -> Just v
+        [] -> Nothing
+
 -- Prefix-based CLM instance lookup: find instances where key starts with funcName\0type1\0type2...
 -- Used for morphism dispatch where we know arg types but not return type.
 -- When multiple matches exist, prefer non-composed instances (those whose body
 -- does NOT re-dispatch via CLMIAP) to avoid infinite recursion from composed
 -- instances that call the same function.
-lookupCLMInstancePrefix :: Name -> [Name] -> Environment -> Maybe CLMLam
-lookupCLMInstancePrefix funcNm typeNms env =
-    let prefix = mkInstanceKey funcNm typeNms ++ "\0"
+lookupCLMInstancePrefix :: Name -> [Name] -> Maybe Name -> Environment -> Maybe CLMLam
+lookupCLMInstancePrefix funcNm typeNms mTag env =
+    let prefix = mkInstanceKey funcNm typeNms mTag ++ "\0"
         -- try exact match first, then prefix
-        exact = Map.lookup (mkInstanceKey funcNm typeNms) (clmInstances env)
+        exact = Map.lookup (mkInstanceKey funcNm typeNms mTag) (clmInstances env)
     in case exact of
         Just _ -> exact
         Nothing ->
@@ -824,11 +887,42 @@ trace msg = do
     tr <- currentFlags <$> get >>= pure . tracing
     if tr then liftIO (putStrLn msg) else pure ()
 
--- outputs a message only if verbose is on
+-- outputs a message only if verbosity >= Verbose
 verboseLog :: String -> IntState ()
 verboseLog msg = do
-    v <- currentFlags <$> get >>= pure . verbose
-    if v then liftIO (putStrLn msg) else pure ()
+    v <- verbosity . currentFlags <$> get
+    if v >= Verbose then liftIO (putStrLn msg) else pure ()
+
+-- | Display accumulated logs respecting verbosity + independent error/warning flags, then clear.
+-- Replaces clearAllLogs everywhere in the pipeline.
+flushLogs :: IntState ()
+flushLogs = do
+    st <- get
+    logMsgs <- State.getAllLogs
+    let flags = currentFlags st
+        v = verbosity flags
+        errOn = showErrors flags
+        warnOn = showWarnings flags
+        srcMap = loadedSources st
+        src = currentSource st
+    liftIO $ forM_ (Foldable.toList logMsgs) $ \logMsg ->
+        let shouldShow = case Log.level logMsg of
+              LogError   -> v > Silent && errOn
+              LogWarning -> v > Silent && warnOn
+              _          -> v >= Verbose
+        in when shouldShow $
+            let fname = filename (payload logMsg)
+                srcText = case Map.lookup fname srcMap of
+                    Just s  -> s
+                    Nothing -> src
+            in putStrLn (showErrorWithSource srcText logMsg)
+    State.clearAllLogs
+
+-- | Output a compiler progress/status message at a given verbosity threshold.
+compilerMsg :: Verbosity -> String -> IntState ()
+compilerMsg minLevel msg = do
+    v <- verbosity . currentFlags <$> get
+    when (v >= minLevel) $ liftIO $ putStrLn msg
 
 -- lifted versions of the IOLogger monad functions
 logError :: LogPayload -> IntState ()

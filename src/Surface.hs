@@ -263,7 +263,8 @@ data Expr =
   | Implicit Expr -- current solution for implicit parameter functions
   -- that result e.g. from structure (typeclass) expansions -
   -- only used in the TYPE place!!!
-  | Instance Name [Expr] [Expr] [Expr] -- Instance structureName [typeArgs] [function implementations] [requires]
+  | Instance Name (Maybe Name) [Expr] [Expr] [Expr] -- Instance structureName maybeTag [typeArgs] [function implementations] [requires]
+  | NamedRef Expr Name -- Tagged struct reference: Semigroup(a) as Additive
   | IfThenElse Expr Expr Expr -- if cond then e1 else e2 (desugared in afterparse)
   | LetIn [(Var, Expr)] Expr -- let x = e1, y = e2 in body (desugared in afterparse)
   | Law Lambda Expr -- law declaration: law name(params) = lawBody
@@ -423,7 +424,8 @@ traverseExpr _ e@(Meta _) = e
 traverseExpr _ RowEmpty = RowEmpty
 traverseExpr f (RowExtend n t r) = RowExtend n (f $ traverseExpr f t) (f $ traverseExpr f r)
 traverseExpr f (Sigma mn e1 e2) = Sigma mn (f $ traverseExpr f e1) (f $ traverseExpr f e2)
-traverseExpr f (Instance nm targs impls reqs) = Instance nm (map (f . traverseExpr f) targs) (map (f . traverseExpr f) impls) (map (f . traverseExpr f) reqs)
+traverseExpr f (Instance nm mTag targs impls reqs) = Instance nm mTag (map (f . traverseExpr f) targs) (map (f . traverseExpr f) impls) (map (f . traverseExpr f) reqs)
+traverseExpr f (NamedRef e tag) = NamedRef (f $ traverseExpr f e) tag
 traverseExpr f (IfThenElse c t e) = IfThenElse (f $ traverseExpr f c) (f $ traverseExpr f t) (f $ traverseExpr f e)
 traverseExpr f (LetIn binds body) = LetIn (map (\(v,ex) -> (v, f $ traverseExpr f ex)) binds) (f $ traverseExpr f body)
 traverseExpr f (Law lam ex) = Law (lam { body = f $ traverseExpr f (body lam) }) (f $ traverseExpr f ex)
@@ -608,11 +610,13 @@ instance PrettyPrint Expr where
     ++ showListRoBr ppr (params lam)
     ++ pprTyp (lamType lam) ++ " = "
     ++ pprConstructors (body lam)
-  ppr (Instance nm targs impls reqs) = (as [bold,green] "instance ") ++ nm
+  ppr (Instance nm mTag targs impls reqs) = (as [bold,green] "instance ") ++ nm
     ++ showListRoBr ppr targs
+    ++ maybe "" (\t -> " as " ++ t) mTag
     ++ pprRequires reqs
     ++ " = "
     ++ showListCuBr ppr impls
+  ppr (NamedRef e tag) = ppr e ++ " as " ++ tag
   ppr (IfThenElse c t e) = "if " ++ ppr c ++ " then " ++ ppr t ++ " else " ++ ppr e
   ppr (LetIn binds body) = "let " ++ showListPlainSep (\(v,ex) -> ppr v ++ " = " ++ ppr ex) ", " binds ++ " in " ++ ppr body
   ppr (Implicit e) = "Implicit (" ++ ppr e ++ ")"

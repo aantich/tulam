@@ -114,7 +114,7 @@ vmTests = describe "VM execution" $ do
             Right bm -> do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
-                result `shouldBe` Right (VInt 42)
+                result `shouldBe` Right (intVal 42)
 
     it "returns a boolean true" $ do
         let lam = CLMLam [] (CLMCON (ConsTag "True" 0) [])
@@ -125,8 +125,8 @@ vmTests = describe "VM execution" $ do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
                 case result of
-                    Right (VBool True) -> return ()
-                    other -> expectationFailure $ "Expected VBool True, got: " ++ show other
+                    Right v | v == boolVal True -> return ()
+                    other -> expectationFailure $ "Expected True, got: " ++ show other
 
     it "constructs and accesses fields" $ do
         -- function f() = let p = Pair(10, 20) in p.0
@@ -141,7 +141,7 @@ vmTests = describe "VM execution" $ do
             Right bm -> do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
-                result `shouldBe` Right (VInt 10)
+                result `shouldBe` Right (intVal 10)
 
     it "calls another function" $ do
         -- function double(x) = x + x  (simplified: just return x for now)
@@ -157,7 +157,7 @@ vmTests = describe "VM execution" $ do
                     Nothing -> expectationFailure "main not found"
                     Just (idx, _) -> do
                         result <- runFunction vm idx []
-                        result `shouldBe` Right (VInt 21)
+                        result `shouldBe` Right (intVal 21)
 
     it "handles sequential expressions (CLMPROG)" $ do
         let lam = CLMLam []
@@ -168,7 +168,7 @@ vmTests = describe "VM execution" $ do
             Right bm -> do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
-                result `shouldBe` Right (VInt 3)
+                result `shouldBe` Right (intVal 3)
 
     it "returns Unit for empty" $ do
         let lam = CLMLam [] CLMEMPTY
@@ -178,7 +178,7 @@ vmTests = describe "VM execution" $ do
             Right bm -> do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
-                result `shouldBe` Right VUnit
+                result `shouldBe` Right unitVal
 
     it "field access on second field" $ do
         let lam = CLMLam []
@@ -192,7 +192,7 @@ vmTests = describe "VM execution" $ do
             Right bm -> do
                 vm <- initVM bm
                 result <- runFunction vm 0 []
-                result `shouldBe` Right (VInt 20)
+                result `shouldBe` Right (intVal 20)
 
     it "disassembles a function" $ do
         let lam = CLMLam [] (CLMLIT (LInt 42))

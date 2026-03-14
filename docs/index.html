@@ -43,7 +43,7 @@
 <section class="hero">
   <h1><span>(</span>tulam<span>)</span></h1>
   <p class="tagline">The most expressive type system.<br>Every backend. Native performance.</p>
-  <p class="tagline-sub">Dependent types, algebraic effects, and a compiler targeting JS, .NET, and LLVM &mdash; faster than C++ on real benchmarks.</p>
+  <p class="tagline-sub">Dependent types, algebraic effects, and a compiler targeting JS, .NET, and LLVM &mdash; 20% faster than C++ on real benchmarks.</p>
   <div class="cta">
     <a href="#getting-started" class="btn btn-primary">Get Started</a>
     <a href="#examples" class="btn btn-secondary">See Examples</a>
@@ -301,84 +301,84 @@
         <tbody>
           <tr>
             <td>List</td>
-            <td>7 &micro;s</td>
+            <td>8 &micro;s</td>
             <td>6 &micro;s</td>
-            <td>50 &micro;s</td>
-            <td class="col-tulam">19 &micro;s</td>
-            <td class="col-ratio">2.7x</td>
+            <td>51 &micro;s</td>
+            <td class="col-tulam">11 &micro;s</td>
+            <td class="col-ratio">1.3x</td>
           </tr>
           <tr class="bench-win">
             <td>Queens</td>
-            <td>32 &micro;s</td>
+            <td>34 &micro;s</td>
             <td>3 &micro;s</td>
-            <td>70 &micro;s</td>
+            <td>76 &micro;s</td>
             <td class="col-tulam">7 &micro;s</td>
             <td class="col-ratio">0.2x</td>
           </tr>
           <tr class="bench-win">
             <td>Permute</td>
-            <td>10 &micro;s</td>
-            <td>37 &micro;s</td>
-            <td>76 &micro;s</td>
-            <td class="col-tulam">5 &micro;s</td>
-            <td class="col-ratio">0.5x</td>
+            <td>12 &micro;s</td>
+            <td>35 &micro;s</td>
+            <td>87 &micro;s</td>
+            <td class="col-tulam">2 &micro;s</td>
+            <td class="col-ratio">0.1x</td>
           </tr>
           <tr>
             <td>Sieve</td>
-            <td>9 &micro;s</td>
-            <td>28 &micro;s</td>
-            <td>94 &micro;s</td>
-            <td class="col-tulam">22 &micro;s</td>
-            <td class="col-ratio">2.4x</td>
+            <td>7 &micro;s</td>
+            <td>27 &micro;s</td>
+            <td>105 &micro;s</td>
+            <td class="col-tulam">11 &micro;s</td>
+            <td class="col-ratio">1.5x</td>
           </tr>
           <tr>
             <td>Towers</td>
             <td>14 &micro;s</td>
-            <td>45 &micro;s</td>
-            <td>128 &micro;s</td>
-            <td class="col-tulam">47 &micro;s</td>
-            <td class="col-ratio">3.3x</td>
-          </tr>
-          <tr>
-            <td>NBody</td>
-            <td>9.2 ms</td>
-            <td>22.8 ms</td>
-            <td>11.1 ms</td>
-            <td class="col-tulam">13.1 ms</td>
-            <td class="col-ratio">1.4x</td>
-          </tr>
-          <tr>
-            <td>Bounce</td>
-            <td>6 &micro;s</td>
-            <td>18 &micro;s</td>
-            <td>156 &micro;s</td>
-            <td class="col-tulam">17 &micro;s</td>
-            <td class="col-ratio">2.8x</td>
+            <td>47 &micro;s</td>
+            <td>125 &micro;s</td>
+            <td class="col-tulam">33 &micro;s</td>
+            <td class="col-ratio">2.3x</td>
           </tr>
           <tr class="bench-win">
-            <td>Storage</td>
-            <td>219 &micro;s</td>
-            <td>71 &micro;s</td>
-            <td>175 &micro;s</td>
-            <td class="col-tulam">216 &micro;s</td>
+            <td>NBody</td>
+            <td>8.9 ms</td>
+            <td>24.8 ms</td>
+            <td>12.7 ms</td>
+            <td class="col-tulam">8.8 ms</td>
             <td class="col-ratio">0.9x</td>
           </tr>
           <tr class="bench-win">
+            <td>Bounce</td>
+            <td>27 &micro;s</td>
+            <td>26 &micro;s</td>
+            <td>166 &micro;s</td>
+            <td class="col-tulam">8 &micro;s</td>
+            <td class="col-ratio">0.2x</td>
+          </tr>
+          <tr class="bench-win">
+            <td>Storage</td>
+            <td>192 &micro;s</td>
+            <td>86 &micro;s</td>
+            <td>203 &micro;s</td>
+            <td class="col-tulam">118 &micro;s</td>
+            <td class="col-ratio">0.6x</td>
+          </tr>
+          <tr class="bench-win">
             <td>Mandelbrot</td>
-            <td>19.8 ms</td>
-            <td>8.3 ms</td>
-            <td>17.6 ms</td>
-            <td class="col-tulam">15.8 ms</td>
-            <td class="col-ratio">0.7x</td>
+            <td>19.9 ms</td>
+            <td>9.4 ms</td>
+            <td>20.4 ms</td>
+            <td class="col-tulam">11.6 ms</td>
+            <td class="col-ratio">0.5x</td>
           </tr>
         </tbody>
         <tfoot>
           <tr>
             <td>Geometric mean</td>
             <td>1.0x</td>
-            <td>1.8x</td>
-            <td>7.2x</td>
-            <td class="col-tulam">1.6x</td>
+            <td>1.6x</td>
+            <td>5.4x</td>
+            <td class="col-tulam">0.8x</td>
             <td class="col-ratio">&mdash;</td>
           </tr>
         </tfoot>
@@ -409,7 +409,7 @@
           <li class="done">Bidirectional type checker</li>
           <li class="done">Module system with caching</li>
           <li class="done">Standard library (13 modules)</li>
-          <li class="done">1050+ tests passing</li>
+          <li class="done">1086 tests passing</li>
         </ul>
       </div>
       <div class="status-card">

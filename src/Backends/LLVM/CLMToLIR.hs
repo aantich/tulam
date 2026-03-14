@@ -19,13 +19,14 @@ module Backends.LLVM.CLMToLIR
   , surfaceRetTypeToLType
   , externDeclarations
   , detectNullaryAsNull
+  , collectConTags
   ) where
 
 import qualified Data.HashMap.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashSet as HSet
-import Control.Monad (forM, forM_, zipWithM)
-import Data.List (partition)
+import Control.Monad (forM, forM_, void, when, zipWithM)
+import Data.List (foldl', partition)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Except
 import Control.Monad.IO.Class (liftIO)
@@ -207,6 +208,9 @@ data LowerState = LowerState
   , lsLiftedCount   :: !Int                  -- Counter for unique lifted function names
   , lsSingletonMap  :: HashMap Int Name      -- Zero-field constructor tag → global name
   , lsNullaryAsNull :: HSet.HashSet Int     -- Tags represented as null pointers (Phase 2)
+  , lsAllocaRefs   :: HSet.HashSet Name    -- Ref variables eligible for alloca (Phase N1)
+  , lsBodyUseCounts :: HashMap Name Int    -- Whole-body variable use counts (Phase N5)
+  , lsFuncParams   :: HSet.HashSet Name   -- Function parameter names (Phase N5: don't free params)
   }
 
 type LowerM = ExceptT LowerError (StateT LowerState IO)
@@ -342,17 +346,52 @@ lowerExpr (CLMID name) = do
     Just op -> return op
     Nothing -> return $ LVar name LTPtr  -- assume global function ref
 
--- Special case: modifyRef(ref, fn(x) = body) → inline as writeref(ref, body[x := readref(ref)])
-lowerExpr (CLMAPP (CLMID "__modifyref") [refExpr, CLMLAM (CLMLam [(varName, _)] body)]) = do
+-- Phase N1: Ref operations — always inline as direct load/store.
+-- readRef/__readref(ref) → direct load i64 from pointer (no function call)
+lowerExpr (CLMAPP (CLMID fn_) [refExpr])
+  | isReadRefName fn_ = do
   refOp <- lowerExpr refExpr
-  -- Read current value
-  curVal <- emitFresh "refval_" LTInt64 (LCall "__readref" [refOp] LTInt64)
-  -- Bind lambda param to current value and evaluate body
+  emitFresh "refval_" LTInt64 (LLoadRaw refOp LTInt64)
+
+-- writeRef/__writeref(ref, val) → direct store i64 to pointer (no function call)
+lowerExpr (CLMAPP (CLMID fn_) [refExpr, valExpr])
+  | isWriteRefName fn_ = do
+  refOp <- lowerExpr refExpr
+  valOp <- lowerExpr valExpr
+  coercedVal <- coerceArg valOp LTInt64
+  emitFresh "_wref_" LTVoid (LStoreRaw coercedVal refOp LTInt64)
+
+-- modifyRef(ref, fn(x) = body) → inline as load + apply + store
+lowerExpr (CLMAPP (CLMID fn_) [refExpr, CLMLAM (CLMLam [(varName, _)] body)])
+  | isModifyRefName fn_ = do
+  refOp <- lowerExpr refExpr
+  curVal <- emitFresh "refval_" LTInt64 (LLoadRaw refOp LTInt64)
   bindVar varName curVal
   newVal <- lowerExpr body
-  -- Write back (coerce to i64 — __writeref uses i64 for all value types)
   coercedVal <- coerceArg newVal LTInt64
-  emitFresh "_wref_" LTVoid (LCall "__writeref" [refOp, coercedVal] LTVoid)
+  emitFresh "_wref_" LTVoid (LStoreRaw coercedVal refOp LTInt64)
+
+-- Phase N1: Inline MutArray operations as GEP + load/store.
+-- __mutread(arr, index) → load i64 from arr[index+1] (skip length header at arr[0])
+lowerExpr (CLMAPP (CLMID fn_) [arrExpr, idxExpr])
+  | fn_ == "__mutread" || fn_ == "mutRead" = do
+  arrOp <- lowerExpr arrExpr
+  idxOp <- lowerExpr idxExpr
+  coercedIdx <- coerceArg idxOp LTInt64
+  -- Add 1 to skip length header at index 0
+  offsetOp <- emitFresh "moff_" LTInt64 (LAdd coercedIdx (LLitInt 1 LTInt64))
+  emitFresh "mrd_" LTInt64 (LGepLoad arrOp offsetOp LTInt64)
+
+-- __mutwrite(arr, index, value) → store i64 to arr[index+1]
+lowerExpr (CLMAPP (CLMID fn_) [arrExpr, idxExpr, valExpr])
+  | fn_ == "__mutwrite" || fn_ == "mutWrite" = do
+  arrOp <- lowerExpr arrExpr
+  idxOp <- lowerExpr idxExpr
+  valOp <- lowerExpr valExpr
+  coercedIdx <- coerceArg idxOp LTInt64
+  coercedVal <- coerceArg valOp LTInt64
+  offsetOp <- emitFresh "moff_" LTInt64 (LAdd coercedIdx (LLitInt 1 LTInt64))
+  emitFresh "_mwr_" LTVoid (LGepStore coercedVal arrOp offsetOp LTInt64)
 
 -- Direct function application: CLMAPP (CLMID funcName) args
 -- Resolution order: (1) declarative ExternMap, (2) legacy intrinsicToLIR, (3) function call
@@ -447,7 +486,25 @@ lowerExpr (CLMPROG [])     = return LLitNull
 lowerExpr (CLMPROG [e])    = lowerExpr e
 lowerExpr (CLMPROG (e:es)) = lowerExpr e >> lowerExpr (CLMPROG es)
 
--- Let binding
+-- Let binding — with Phase N1 alloca interception for newRef/__newref
+lowerExpr (CLMBIND name (CLMAPP (CLMID fn_) [initExpr]))
+  | isNewRefName fn_ = do
+  allocaSet <- getsS lsAllocaRefs
+  if HSet.member name allocaSet
+    then do
+      -- Non-escaping ref: use stack alloca instead of heap allocation
+      initOp <- lowerExpr initExpr
+      coercedInit <- coerceArg initOp LTInt64
+      allocaOp <- emitFresh "sref_" LTPtr (LAlloca LTInt64)
+      emitFresh "_sinit_" LTVoid (LStoreRaw coercedInit allocaOp LTInt64)
+      bindVar name allocaOp
+      return allocaOp
+    else do
+      -- Escaping ref: use runtime heap allocation
+      op <- lowerExpr (CLMAPP (CLMID "__newref") [initExpr])
+      bindVar name op
+      return op
+
 lowerExpr (CLMBIND name expr) = do
   op <- lowerExpr expr
   bindVar name op
@@ -528,11 +585,34 @@ lowerOneCheck (CLMCheckTag (ConsTag _ tagVal) scrutExpr) = do
       if tagVal == 0  -- True constructor
         then return scrut
         else emitFresh "not_" LTBool (LXor scrut (LLitBool True))
-    -- Normal ADT: get tag from heap object (coerce to ptr if needed)
+    -- Normal ADT: check nullary-as-null before accessing tag
     _ -> do
+      nullSet <- getsS lsNullaryAsNull
       scrutPtr <- coerceArg scrut LTPtr
-      tagOp <- emitFresh "tag_" LTInt16 (LGetTag scrutPtr)
-      emitFresh "eq_" LTBool (LICmpEq tagOp (LLitInt (fromIntegral tagVal) LTInt16))
+      if HSet.member tagVal nullSet
+        then
+          -- Phase N3: This tag is represented as null — check with icmp eq null
+          emitFresh "eq_" LTBool (LIsNull scrutPtr)
+        else do
+          -- Non-null tag: need null guard if ANY nullary tag exists in the set
+          -- to prevent LGetTag on null values that could reach here
+          tagOp <- if HSet.null nullSet
+            then emitFresh "tag_" LTInt16 (LGetTag scrutPtr)
+            else do
+              -- Emit safe tag extraction: if null → impossible tag (-1), else getTag
+              -- This is safe because this branch is only reached for non-null-tag checks,
+              -- but the scrutinee *could* be null (will fail the eq check harmlessly).
+              isNotNull <- emitFresh "nn_" LTBool (LIsNotNull scrutPtr)
+              safeLabel <- freshBlock "safe_tag_"
+              nullTagLabel <- freshBlock "null_tag_"
+              mergeLabel <- freshBlock "tag_merge_"
+              sealBlock (LCondBr isNotNull safeLabel nullTagLabel) safeLabel
+              realTag <- emitFresh "tag_" LTInt16 (LGetTag scrutPtr)
+              sealBlock (LBr mergeLabel) nullTagLabel
+              sealBlock (LBr mergeLabel) mergeLabel
+              emitFresh "tag_phi_" LTInt16
+                (LPhi [(realTag, safeLabel), (LLitInt (-1) LTInt16, nullTagLabel)] LTInt16)
+          emitFresh "eq_" LTBool (LICmpEq tagOp (LLitInt (fromIntegral tagVal) LTInt16))
 
 lowerOneCheck (CLMCheckLit lit scrutExpr) = do
   scrut <- lowerExpr scrutExpr
@@ -567,6 +647,14 @@ lowerFunction name clmLam funcMap extMap nullaryTags = do
                 Just (_, _, rt) -> rt
                 Nothing         -> LTInt64
       initEnv = Map.fromList [(n, LVar (sanitizeName n) ty) | (n, ty) <- params]
+      -- Phase N1: Analyze which Ref variables can be stack-allocated
+      clmBody = case clmLam of
+                  CLMLam _ body -> body
+                  CLMLamCases _ cases -> CLMPROG cases
+      allocaRefs = analyzeNonEscapingRefs clmBody
+      -- Phase N5: Compute whole-body variable use counts for last-use deallocation
+      bodyUseCounts = countVarUses clmBody
+      funcParamNames = HSet.fromList (map fst vars)
       initState = emptyLowerState
         { lsEnv = initEnv
         , lsFuncMap = funcMap
@@ -574,6 +662,9 @@ lowerFunction name clmLam funcMap extMap nullaryTags = do
         , lsCurrentBlock = "entry"
         , lsGlobalPrefix = sanitizeName name ++ "_"
         , lsNullaryAsNull = nullaryTags
+        , lsAllocaRefs = allocaRefs
+        , lsBodyUseCounts = bodyUseCounts
+        , lsFuncParams = funcParamNames
         }
   result <- runLowerM initState $ case clmLam of
     CLMLam _vars body -> do
@@ -635,19 +726,18 @@ lowerCaseChain cases retTy' =
       let isBool = maybe False (\op -> operandType op == LTBool) mOp
       if isBool
         then lowerCaseChainLinear cases retTy'
-        else lowerTagSwitchRet scrutName tagCases mDefault retTy'
+        else lowerTagSwitchRet scrutName tagCases mDefault retTy' cases
     Nothing -> lowerCaseChainLinear cases retTy'
 
 -- | Switch-based case chain (return version: each arm returns).
-lowerTagSwitchRet :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> LType -> LowerM ([LBlock], [LGlobal])
-lowerTagSwitchRet scrutName tagCases mDefault retTy' = do
-  -- Lower the scrutinee and get its tag
+lowerTagSwitchRet :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> LType -> [CLMExpr] -> LowerM ([LBlock], [LGlobal])
+lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
+  -- Lower the scrutinee
   mScrutOp <- lookupVar scrutName
   scrutOp <- case mScrutOp of
     Just op -> return op
     Nothing -> throwL $ "switch: unbound scrutinee " ++ scrutName
   scrutPtr <- coerceArg scrutOp LTPtr
-  tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
 
   -- Generate body labels
   bodyLabels <- forM (zip [0..] tagCases) $ \(i, _) ->
@@ -655,10 +745,29 @@ lowerTagSwitchRet scrutName tagCases mDefault retTy' = do
   defLabel <- freshBlock "sw_default_"
   failLabel <- freshBlock "match_fail_"
 
-  -- Emit switch
-  let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels ]
-      defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
-  sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
+  -- Phase N3: Null guard — if any case matches a nullary-as-null tag,
+  -- emit null check before LGetTag (which would segfault on null).
+  nullSet <- getsS lsNullaryAsNull
+  let nullCases = [(tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels
+                               , HSet.member tag nullSet]
+  case nullCases of
+    [] -> do
+      -- No nullary-as-null tags: emit LGetTag + switch directly
+      tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
+      let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels ]
+          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
+      sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
+    ((nullTag, nullLabel):_) -> do
+      -- Emit: if (scrut == null) goto nullBody else goto tagSwitch
+      isNull <- emitFresh "isnull_" LTBool (LIsNull scrutPtr)
+      tagSwitchLabel <- freshBlock "sw_tag_"
+      sealBlock (LCondBr isNull nullLabel tagSwitchLabel) tagSwitchLabel
+      -- Now emit the tag switch for non-null cases
+      tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
+      let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels
+                                                   , not (HSet.member tag nullSet) ]
+          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
+      sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
 
   -- Emit each body
   let nextTargets = tail bodyLabels ++ [defLabel]
@@ -755,22 +864,21 @@ lowerCaseExprChain cases =
       let isBool = maybe False (\op -> operandType op == LTBool) mOp
       if isBool
         then lowerCaseExprChainLinear cases
-        else lowerTagSwitchExpr scrutName tagCases mDefault
+        else lowerTagSwitchExpr scrutName tagCases mDefault cases
     Nothing -> lowerCaseExprChainLinear cases
 
 -- | Switch-based case chain (expression version: produces phi).
-lowerTagSwitchExpr :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> LowerM LOperand
-lowerTagSwitchExpr scrutName tagCases mDefault = do
+lowerTagSwitchExpr :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> [CLMExpr] -> LowerM LOperand
+lowerTagSwitchExpr scrutName tagCases mDefault originalCases = do
   mergeLabel <- freshBlock "sw_merge_"
   failLabel  <- freshBlock "sw_fail_"
 
-  -- Lower scrutinee and extract tag
+  -- Lower scrutinee
   mScrutOp <- lookupVar scrutName
   scrutOp <- case mScrutOp of
     Just op -> return op
     Nothing -> throwL $ "switch: unbound scrutinee " ++ scrutName
   scrutPtr <- coerceArg scrutOp LTPtr
-  tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
 
   -- Generate body + trampoline labels
   labels <- forM (zip [0..] tagCases) $ \(i, _) -> do
@@ -779,10 +887,25 @@ lowerTagSwitchExpr scrutName tagCases mDefault = do
     return (bd, trmp)
   defLabel <- freshBlock "sw_def_"
 
-  -- Emit switch
-  let switchCases = [ (fromIntegral tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels ]
-      defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
-  sealBlock (LSwitch tagOp defTarget switchCases) (fst (head labels))
+  -- Phase N3: Null guard for nullary-as-null tags
+  nullSet <- getsS lsNullaryAsNull
+  let nullCases = [(tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels
+                                   , HSet.member tag nullSet]
+  case nullCases of
+    [] -> do
+      tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
+      let switchCases = [ (fromIntegral tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels ]
+          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
+      sealBlock (LSwitch tagOp defTarget switchCases) (fst (head labels))
+    ((_, nullLabel):_) -> do
+      isNull <- emitFresh "isnull_" LTBool (LIsNull scrutPtr)
+      tagSwitchLabel <- freshBlock "sw_tag_"
+      sealBlock (LCondBr isNull nullLabel tagSwitchLabel) tagSwitchLabel
+      tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
+      let switchCases = [ (fromIntegral tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels
+                                                       , not (HSet.member tag nullSet) ]
+          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
+      sealBlock (LSwitch tagOp defTarget switchCases) (fst (head labels))
 
   -- Emit each body → trampoline
   let nextBlocks = map fst (tail labels) ++ [defLabel]
@@ -937,8 +1060,19 @@ lowerModule modName clmLams clmInsts requested extMap = do
         | null requested = Map.toList clmLams
         | otherwise = [(n, lam) | (n, lam) <- Map.toList allFuncs, n `elem` requested]
 
-  -- Detect nullary-as-null tags globally across all functions (Phase 2)
-  let globalNullary = mconcat [detectNullaryAsNull lam | (_, lam) <- toCompile]
+  -- Detect nullary-as-null tags globally across ALL functions (Phase N3).
+  -- Must use allFuncs (not just toCompile) because toCompile may be a subset
+  -- but all functions share the same tag namespace.
+  -- Collect ALL nullary and non-nullary tag sets globally first, THEN take
+  -- the difference. Per-function difference followed by union is wrong because
+  -- different types can reuse the same tag integer (e.g., EQ=tag1 nullary,
+  -- Cons=tag1 non-nullary).
+  let allBodies = [case lam of CLMLam _ b -> b; CLMLamCases _ cs -> CLMPROG cs
+                  | (_, lam) <- Map.toList allFuncs]
+      (globalNullaryRaw, globalNonNullary) = mconcat (map collectConTags (concatMap flattenCLM allBodies))
+      globalNullary = HSet.difference globalNullaryRaw globalNonNullary
+      flattenCLM (CLMPROG es) = es
+      flattenCLM e = [e]
   results <- mapM (\(n, lam) -> lowerFunction n lam funcMap extMap globalNullary) toCompile
 
   case sequence results of
@@ -1007,7 +1141,7 @@ intrinsicToLIR _ = Nothing
 -- ============================================================================
 
 emptyLowerState :: LowerState
-emptyLowerState = LowerState 0 0 [] [] "entry" [] Map.empty Map.empty Map.empty Map.empty "" [] 0 Map.empty HSet.empty
+emptyLowerState = LowerState 0 0 [] [] "entry" [] Map.empty Map.empty Map.empty Map.empty "" [] 0 Map.empty HSet.empty HSet.empty Map.empty HSet.empty
 
 clmLamParams :: CLMLam -> [CLMVar]
 clmLamParams (CLMLam vars _)      = vars
@@ -1093,13 +1227,16 @@ coerceToI64ForStore op = case operandType op of
 -- ============================================================================
 
 -- | Detect nullary constructors that can be represented as null pointers.
--- Currently disabled: returns empty set. The null-pointer optimization requires
--- null guards at ALL LGetTag sites, which adds complexity to the switch-based
--- and linear pattern matching paths. Phase 1 (inline alloc) and Phase 3
--- (function attributes) provide the main performance wins.
--- TODO: Enable when all pattern match paths handle null correctly.
+-- A tag is null-eligible if it appears as a nullary constructor AND never
+-- appears as a non-nullary constructor (same tag with fields).
+-- Bool constructors are excluded (already unboxed as i1).
 detectNullaryAsNull :: CLMLam -> HSet.HashSet Int
-detectNullaryAsNull _clmLam = HSet.empty
+detectNullaryAsNull clmLam =
+  let body = case clmLam of
+        CLMLam _ b      -> b
+        CLMLamCases _ cs -> CLMPROG cs
+      (nullary, nonNullary) = collectConTags body
+  in HSet.difference nullary nonNullary
 
 -- | Collect (nullary tags, non-nullary tags) from all CLMCON nodes in a CLM expr.
 collectConTags :: CLMExpr -> (HSet.HashSet Int, HSet.HashSet Int)
@@ -1119,23 +1256,255 @@ collectConTags (CLMIAP f args) = mconcat (map collectConTags (f : args))
 collectConTags _ = (HSet.empty, HSet.empty)
 
 -- ============================================================================
+-- Last-use analysis (Phase N5)
+-- ============================================================================
+
+-- | Count references to each variable name in a CLM expression.
+-- Used to determine if a scrutinee can be freed after destructuring.
+countVarUses :: CLMExpr -> HashMap Name Int
+countVarUses = go
+  where
+    unionsWith f = foldl' (Map.unionWith f) Map.empty
+    go (CLMID nm) = Map.singleton nm 1
+    go (CLMAPP f args) = unionsWith (+) (map go (f : args))
+    go (CLMIAP f args) = unionsWith (+) (map go (f : args))
+    go (CLMPROG es) = unionsWith (+) (map go es)
+    go (CLMBIND _ e) = go e
+    go (CLMCASE checks body) =
+      unionsWith (+) (map goCheck checks ++ [go body])
+    go (CLMTYPED e _) = go e
+    go (CLMFieldAccess _ e) = go e
+    go (CLMCON _ fields) = unionsWith (+) (map go fields)
+    go (CLMLAM (CLMLam _ b)) = go b
+    go (CLMLAM (CLMLamCases _ cs)) = unionsWith (+) (map go cs)
+    go (CLMARRAY es) = unionsWith (+) (map go es)
+    go (CLMMCALL obj _ args) = unionsWith (+) (map go (obj : args))
+    go (CLMSCALL obj _ args) = unionsWith (+) (map go (obj : args))
+    go (CLMNEW _ args) = unionsWith (+) (map go args)
+    go (CLMHANDLE body _ lets ops) =
+      unionsWith (+) (go body : map (go . snd) lets ++ map (go . snd) ops)
+    go (CLMPAP f args) = unionsWith (+) (map go (f : args))
+    go _ = Map.empty
+
+    goCheck (CLMCheckTag _ e) = go e
+    goCheck (CLMCheckLit _ e) = go e
+
+-- | Check if a variable is only used for tag checks and field accesses
+-- in a list of cases (safe to free after destructuring).
+isOnlyScrutineeUse :: Name -> [CLMExpr] -> Bool
+isOnlyScrutineeUse scrutName cases = all checkCase cases
+  where
+    checkCase (CLMCASE checks body) =
+      -- In checks: scrutinee must only appear as direct CLMID in CLMCheckTag
+      all checkGuard checks &&
+      -- In body: scrutinee must only appear under CLMFieldAccess
+      onlyFieldAccess scrutName body
+    checkCase _ = True  -- default body: no scrutinee use
+
+    checkGuard (CLMCheckTag _ (CLMID nm)) | nm == scrutName = True
+    checkGuard (CLMCheckTag _ _) = False
+    checkGuard (CLMCheckLit _ _) = True  -- literal checks don't use scrutinee
+
+    -- Check that a name is only used under CLMFieldAccess, not directly
+    onlyFieldAccess nm (CLMFieldAccess _ (CLMID n)) | n == nm = True
+    onlyFieldAccess nm (CLMFieldAccess _ e) = onlyFieldAccess nm e
+    onlyFieldAccess nm (CLMID n) | n == nm = False  -- direct use = escaping
+    onlyFieldAccess _ (CLMID _) = True
+    onlyFieldAccess nm (CLMAPP f args) = all (onlyFieldAccess nm) (f : args)
+    onlyFieldAccess nm (CLMIAP f args) = all (onlyFieldAccess nm) (f : args)
+    onlyFieldAccess nm (CLMPROG es) = all (onlyFieldAccess nm) es
+    onlyFieldAccess nm (CLMBIND _ e) = onlyFieldAccess nm e
+    onlyFieldAccess nm (CLMCASE checks body) =
+      all (onlyFieldAccessCheck nm) checks && onlyFieldAccess nm body
+    onlyFieldAccess nm (CLMTYPED e _) = onlyFieldAccess nm e
+    onlyFieldAccess nm (CLMCON _ fields) = all (onlyFieldAccess nm) fields
+    onlyFieldAccess nm (CLMLAM (CLMLam _ b)) = onlyFieldAccess nm b
+    onlyFieldAccess nm (CLMLAM (CLMLamCases _ cs)) = all (onlyFieldAccess nm) cs
+    onlyFieldAccess _ _ = True  -- literals, etc.
+
+    onlyFieldAccessCheck nm (CLMCheckTag _ e) = onlyFieldAccess nm e
+    onlyFieldAccessCheck nm (CLMCheckLit _ e) = onlyFieldAccess nm e
+
+-- | Count uses of a variable within a list of CLM case expressions.
+-- Counts occurrences in guards (CLMCheckTag) and bodies.
+localCaseUseCount :: Name -> [CLMExpr] -> Int
+localCaseUseCount nm cases = sum (map countInCase cases)
+  where
+    countInCase (CLMCASE checks body) =
+      sum (map countInCheck checks) + countInExpr body
+    countInCase e = countInExpr e
+
+    countInCheck (CLMCheckTag _ (CLMID n)) | n == nm = 1
+    countInCheck (CLMCheckTag _ e) = countInExpr e
+    countInCheck (CLMCheckLit _ e) = countInExpr e
+
+    countInExpr (CLMID n) | n == nm = 1
+    countInExpr (CLMID _) = 0
+    countInExpr (CLMFieldAccess _ e) = countInExpr e
+    countInExpr (CLMAPP f args) = sum (map countInExpr (f : args))
+    countInExpr (CLMIAP f args) = sum (map countInExpr (f : args))
+    countInExpr (CLMPROG es) = sum (map countInExpr es)
+    countInExpr (CLMBIND _ e) = countInExpr e
+    countInExpr (CLMCASE checks body) =
+      sum (map countInCheck checks) + countInExpr body
+    countInExpr (CLMTYPED e _) = countInExpr e
+    countInExpr (CLMCON _ fields) = sum (map countInExpr fields)
+    countInExpr (CLMLAM (CLMLam _ b)) = countInExpr b
+    countInExpr (CLMLAM (CLMLamCases _ cs)) = sum (map countInExpr cs)
+    countInExpr (CLMARRAY es) = sum (map countInExpr es)
+    countInExpr (CLMMCALL obj _ args) = sum (map countInExpr (obj : args))
+    countInExpr (CLMSCALL obj _ args) = sum (map countInExpr (obj : args))
+    countInExpr (CLMNEW _ args) = sum (map countInExpr args)
+    countInExpr (CLMHANDLE body _ lets ops) =
+      countInExpr body + sum (map (countInExpr . snd) lets) + sum (map (countInExpr . snd) ops)
+    countInExpr (CLMPAP f args) = sum (map countInExpr (f : args))
+    countInExpr _ = 0
+
+-- | Determine if it is safe to free a scrutinee after pattern matching.
+-- Requires: (1) scrutinee only used for tag checks + field access in cases,
+-- (2) whole-body use count == local case use count (no outside uses),
+-- (3) scrutinee is not captured in a closure (lambda body),
+-- (4) scrutinee is NOT a function parameter (caller owns the reference).
+canFreeAfterMatch :: Name -> [CLMExpr] -> HashMap Name Int -> HSet.HashSet Name -> Bool
+canFreeAfterMatch scrutName cases globalUseCounts funcParams =
+  let localCount = localCaseUseCount scrutName cases
+      globalCount = Map.lookupDefault 0 scrutName globalUseCounts
+  in localCount > 0
+     && localCount == globalCount
+     && not (HSet.member scrutName funcParams)
+     && isOnlyScrutineeUse scrutName cases
+
+-- ============================================================================
+-- Ref-to-Alloca escape analysis (Phase N1)
+-- ============================================================================
+
+-- | Analyze a CLM expression to find Ref variables that don't escape.
+-- A ref is "non-escaping" if it's created by __newref and only used in
+-- __readref, __writeref, and __modifyref calls — never passed to other
+-- functions, stored in constructors, or returned.
+analyzeNonEscapingRefs :: CLMExpr -> HSet.HashSet Name
+analyzeNonEscapingRefs expr =
+  let refBinds = collectRefBinds expr           -- names bound to __newref results
+      allUses  = collectRefUses expr             -- (name, isSafeUse) pairs
+      -- A ref escapes if it has ANY unsafe use
+      escapingRefs = HSet.fromList
+        [ n | (n, safe) <- allUses, not safe ]
+  in HSet.difference refBinds escapingRefs
+
+-- | Names that create a new ref.
+isNewRefName :: Name -> Bool
+isNewRefName "__newref" = True
+isNewRefName "newRef"   = True
+isNewRefName _          = False
+
+-- | Names that are safe ref operations (read/write/modify).
+isSafeRefOp :: Name -> Bool
+isSafeRefOp "__readref"   = True
+isSafeRefOp "__writeref"  = True
+isSafeRefOp "__modifyref" = True
+isSafeRefOp "readRef"     = True
+isSafeRefOp "writeRef"    = True
+isSafeRefOp "modifyRef"   = True
+isSafeRefOp _             = False
+
+-- | Names that are ref read operations.
+isReadRefName :: Name -> Bool
+isReadRefName "__readref" = True
+isReadRefName "readRef"   = True
+isReadRefName _           = False
+
+-- | Names that are ref write operations.
+isWriteRefName :: Name -> Bool
+isWriteRefName "__writeref" = True
+isWriteRefName "writeRef"   = True
+isWriteRefName _            = False
+
+-- | Names that are ref modify operations.
+isModifyRefName :: Name -> Bool
+isModifyRefName "__modifyref" = True
+isModifyRefName "modifyRef"   = True
+isModifyRefName _             = False
+
+-- | Collect names bound to newRef/_ _newref results.
+collectRefBinds :: CLMExpr -> HSet.HashSet Name
+collectRefBinds (CLMBIND name (CLMAPP (CLMID fn_) _))
+  | isNewRefName fn_ = HSet.singleton name
+collectRefBinds (CLMPROG es) = mconcat (map collectRefBinds es)
+collectRefBinds (CLMBIND _ e) = collectRefBinds e
+collectRefBinds (CLMCASE _ body) = collectRefBinds body
+collectRefBinds (CLMTYPED e _) = collectRefBinds e
+collectRefBinds (CLMAPP f args) = mconcat (map collectRefBinds (f : args))
+collectRefBinds (CLMLAM (CLMLam _ b)) = collectRefBinds b
+collectRefBinds (CLMLAM (CLMLamCases _ cs)) = mconcat (map collectRefBinds cs)
+collectRefBinds _ = HSet.empty
+
+-- | Collect (name, isSafeUse) pairs for all variable references.
+-- A "safe" use is one where the ref is only used as the first argument to
+-- readRef/writeRef/modifyRef. All other uses are "unsafe" (escaping).
+collectRefUses :: CLMExpr -> [(Name, Bool)]
+collectRefUses (CLMAPP (CLMID fn_) [CLMID n])
+  | isReadRefName fn_ = [(n, True)]
+collectRefUses (CLMAPP (CLMID fn_) [CLMID n, val])
+  | isWriteRefName fn_ = (n, True) : collectRefUses val
+collectRefUses (CLMAPP (CLMID fn_) [CLMID n, fn2])
+  | isModifyRefName fn_ = (n, True) : collectRefUses fn2
+-- Any other use of a variable is potentially escaping
+collectRefUses (CLMAPP (CLMID fn_) args)
+  | isSafeRefOp fn_ =
+    -- ref arg is not a simple CLMID, so it might be computed — mark all refs in args
+    concatMap collectRefUsesUnsafe args
+  | otherwise = concatMap collectRefUsesUnsafe args
+collectRefUses (CLMAPP f args) =
+  concatMap collectRefUsesUnsafe (f : args)
+collectRefUses (CLMBIND _ e) = collectRefUses e
+collectRefUses (CLMPROG es) = concatMap collectRefUses es
+collectRefUses (CLMCASE _ body) = collectRefUses body
+collectRefUses (CLMTYPED e _) = collectRefUses e
+collectRefUses (CLMCON _ fields) = concatMap collectRefUsesUnsafe fields
+collectRefUses (CLMFieldAccess _ e) = collectRefUses e
+collectRefUses (CLMLAM (CLMLam _ b)) = collectRefUses b
+collectRefUses (CLMLAM (CLMLamCases _ cs)) = concatMap collectRefUses cs
+collectRefUses (CLMIAP f args) = concatMap collectRefUsesUnsafe (f : args)
+collectRefUses _ = []
+
+-- | Mark all variable references as unsafe (escaping).
+collectRefUsesUnsafe :: CLMExpr -> [(Name, Bool)]
+collectRefUsesUnsafe (CLMID n) = [(n, False)]
+collectRefUsesUnsafe (CLMAPP f args) = concatMap collectRefUsesUnsafe (f : args)
+collectRefUsesUnsafe (CLMBIND _ e) = collectRefUsesUnsafe e
+collectRefUsesUnsafe (CLMPROG es) = concatMap collectRefUsesUnsafe es
+collectRefUsesUnsafe (CLMCASE _ b) = collectRefUsesUnsafe b
+collectRefUsesUnsafe (CLMTYPED e _) = collectRefUsesUnsafe e
+collectRefUsesUnsafe (CLMCON _ fs) = concatMap collectRefUsesUnsafe fs
+collectRefUsesUnsafe (CLMFieldAccess _ e) = collectRefUsesUnsafe e
+collectRefUsesUnsafe (CLMLAM (CLMLam _ b)) = collectRefUsesUnsafe b
+collectRefUsesUnsafe (CLMLAM (CLMLamCases _ cs)) = concatMap collectRefUsesUnsafe cs
+collectRefUsesUnsafe (CLMIAP f args) = concatMap collectRefUsesUnsafe (f : args)
+collectRefUsesUnsafe _ = []
+
+-- ============================================================================
 -- Function attributes (Phase 3)
 -- ============================================================================
 
 -- | Compute LLVM function attributes based on function body.
--- Small functions get alwaysinline, all get nounwind.
+-- Phase N2: Three-tier inlining strategy.
+-- Tier 1 (alwaysinline): ≤15 instrs, no non-trivial calls — leaf functions
+-- Tier 2 (alwaysinline): ≤30 instrs, may have calls — small helpers
+-- Tier 3 (inlinehint):   ≤50 instrs — medium functions, let LLVM decide
 computeFuncAttrs :: [LBlock] -> [String]
 computeFuncAttrs blocks =
   let instrCount = sum [length (lblockInstrs b) | b <- blocks]
-      -- Count only non-trivial instructions (skip phi, copy, trampoline branches).
-      -- Pure functions with nested if/else create many blocks but few real ops.
-      isSmall = instrCount <= 20
       hasAlloc = any blockHasAlloc blocks
       hasStore = any blockHasStore blocks
       hasCall = any blockHasCall blocks
       base = ["nounwind"]
-      inline = if isSmall && not hasCall then ["alwaysinline"] else []
-      readonly = if not hasAlloc && not hasStore then ["readonly"] else []
+      inline
+        | instrCount <= 15 && not hasCall  = ["alwaysinline"]  -- Tier 1: leaf (no calls)
+        | instrCount <= 25 && not hasAlloc = ["alwaysinline"]  -- Tier 2: small, no alloc
+        | instrCount <= 40                 = ["inlinehint"]    -- Tier 3: medium, suggest
+        | otherwise                        = []                -- LLVM's own heuristics
+      -- readonly: only truly leaf functions (no stores, no alloc, no calls)
+      readonly = if not hasAlloc && not hasStore && not hasCall then ["readonly"] else []
   in base ++ inline ++ readonly
   where
     blockHasAlloc b = any isAllocInstr (map snd (lblockInstrs b))
@@ -1146,12 +1515,19 @@ computeFuncAttrs blocks =
     isAllocInstr (LCall "tlm_alloc_slow" _ _) = True
     isAllocInstr _ = False
     isStoreInstr (LStore _ _ _) = True
+    isStoreInstr (LStoreRaw _ _ _) = True
+    isStoreInstr (LGepStore _ _ _ _) = True
     isStoreInstr _ = False
+    -- Check both instructions AND terminators (tail calls are terminators)
     blockHasCall b = any isCallInstr (map snd (lblockInstrs b))
+                  || isTerminatorCall (lblockTerm b)
     isCallInstr (LCall "tlm_error" _ _) = False  -- always in unreachable blocks
     isCallInstr (LCall _ _ _) = True
     isCallInstr (LCallPtr _ _ _) = True
     isCallInstr _ = False
+    isTerminatorCall (LTailCall _ _ _)   = True
+    isTerminatorCall (LTailCallVoid _ _) = True
+    isTerminatorCall _ = False
 
 -- ============================================================================
 -- Lambda lifting (non-capturing lambdas → top-level functions)

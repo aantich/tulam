@@ -178,6 +178,28 @@ emitNamedInstrs (name, LIsNull obj) =
 emitNamedInstrs (name, LIsNotNull obj) =
   [ "  %" ++ name ++ " = icmp ne " ++ emitTypedOperand obj ++ ", null" ]
 
+-- Stack allocation (Phase N1: Ref-to-Alloca)
+emitNamedInstrs (name, LAlloca ty) =
+  [ "  %" ++ name ++ " = alloca " ++ emitType ty ++ ", align 8" ]
+
+-- Raw pointer store/load (no object header offset) — Phase N1
+emitNamedInstrs (_name, LStoreRaw val ptr ty) =
+  [ "  store " ++ emitType ty ++ " " ++ emitOperandBare val ++ ", " ++ emitTypedOperand ptr ++ ", align 8" ]
+emitNamedInstrs (name, LLoadRaw ptr ty) =
+  [ "  %" ++ name ++ " = load " ++ emitType ty ++ ", " ++ emitTypedOperand ptr ++ ", align 8" ]
+
+-- Indexed GEP load/store (for MutArray element access) — Phase N1
+emitNamedInstrs (name, LGepLoad ptr idx ty) =
+  let gepName = name ++ "_gep"
+  in [ "  %" ++ gepName ++ " = getelementptr " ++ emitType ty ++ ", " ++ emitTypedOperand ptr ++ ", " ++ emitTypedOperand idx
+     , "  %" ++ name ++ " = load " ++ emitType ty ++ ", ptr %" ++ gepName ++ ", align 8"
+     ]
+emitNamedInstrs (name, LGepStore val ptr idx ty) =
+  let gepName = name ++ "_gep"
+  in [ "  %" ++ gepName ++ " = getelementptr " ++ emitType ty ++ ", " ++ emitTypedOperand ptr ++ ", " ++ emitTypedOperand idx
+     , "  store " ++ emitType ty ++ " " ++ emitOperandBare val ++ ", ptr %" ++ gepName ++ ", align 8"
+     ]
+
 -- Free (Phase 4)
 emitNamedInstrs (_name, LFree obj) =
   [ "  call void @tlm_free(" ++ emitTypedOperand obj ++ ")" ]

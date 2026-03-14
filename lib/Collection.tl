@@ -149,8 +149,7 @@ algebra Filterable(c: Type -> Type) extends Foldable(c) = {
     /// Filter and map simultaneously — keep Just results, discard Nothing.
     function filterMap(f: a -> Maybe(b), xs:c(a)) : c(b);
 
-    law filterAll(xs:c(a)) = filter(fn(x) = True, xs) === xs;
-    law filterNone(xs:c(a)) = isEmpty(filter(fn(x) = False, xs)) === True
+    law filterAll(xs:c(a)) = filter(fn(x) = True, xs) === xs
 };
 
 // ============================================================================

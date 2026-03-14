@@ -21,7 +21,7 @@ module TypeCheck
     -- * Polymorphism
   , instantiate, generalize, substTyVar
     -- * Internal helpers (for testing)
-  , tcBind, tcPure, tcWarn, tcWarnOrFail, tcTry, tcLocal, tcWithContext, tcFail, tcModify, withCompilerEnv
+  , tcBind, tcPure, tcWarn, tcWarnOrFail, tcHardWarn, tcTry, tcLocal, tcWithContext, tcFail, tcModify, withCompilerEnv
   , checkTopLevel, buildTCEnvFromEnvironment, inferLambda, inferLamType
   , resolveConstraints, showTCError, showExprBrief, showTy, showRow
   , tyToName, freeMetas, replaceMeta, occursIn
@@ -71,7 +71,7 @@ data TCError
   deriving (Show)
 
 data Constraint
-  = CStructure Name [Expr]         -- ^ e.g. CStructure "Eq" [Meta 3]
+  = CStructure Name (Maybe Name) [Expr]  -- ^ e.g. CStructure "Eq" Nothing [Meta 3], CStructure "Semigroup" (Just "Additive") [Int]
   | CRowLack Name Expr             -- ^ Field absence constraint for row unification
   | CEffect Name                   -- ^ Effect requirement: this function needs effect E (e.g. CEffect "Console")
   deriving (Show)
@@ -80,7 +80,7 @@ data TCState = TCState
   { nextMeta      :: !Int                       -- ^ Fresh metavariable counter
   , substitution  :: HashMap Int Expr           -- ^ Unified substitution (type vars AND row vars)
   , constraints   :: [Constraint]               -- ^ Deferred constraints
-  , tcErrors      :: [TCError]                  -- ^ Accumulated errors
+  , tcErrors      :: [TCError]                  -- ^ Accumulated errors (halt pipeline in strict mode)
   , tcMode        :: TCMode                     -- ^ Strict or relaxed
   } deriving (Show)
 
@@ -151,9 +151,10 @@ tcFail err _env _st = Left [err]
 tcFails :: [TCError] -> TC a
 tcFails errs _env _st = Left errs
 
--- | Record a non-fatal error and continue
+-- | Record a non-fatal error and continue (in relaxed mode) or fail (in strict mode).
+-- With two-phase compilation, all unbound vars should be real errors.
 tcWarn :: TCError -> TC ()
-tcWarn err _env st = Right ((), st { tcErrors = err : tcErrors st })
+tcWarn = tcWarnOrFail
 
 -- | Warn in relaxed mode, fail in strict mode. Attaches context and source info if available.
 tcWarnOrFail :: TCError -> TC ()
@@ -167,6 +168,18 @@ tcWarnOrFail err env st =
   in case tcMode st of
     TCStrict  -> Left [wrapped]
     TCRelaxed -> Right ((), st { tcErrors = wrapped : tcErrors st })
+
+-- | Hard error even in relaxed mode — for errors that MUST be caught
+-- (branch type mismatch, non-function application on concrete types)
+tcHardWarn :: TCError -> TC ()
+tcHardWarn err env st =
+  let withCtx = case tcContext env of
+        []      -> err
+        (ctx:_) -> WithContext ctx err
+      wrapped = case tcSourceInfo env of
+        Just si -> WithSource si withCtx
+        Nothing -> withCtx
+  in Right ((), st { tcErrors = wrapped : tcErrors st })
 
 tcMapM :: (a -> TC b) -> [a] -> TC [b]
 tcMapM _ [] = tcPure []
@@ -260,7 +273,7 @@ normalizeTypeExpr (Export _ _) = freshMeta
 normalizeTypeExpr (PrivateDecl _) = freshMeta
 normalizeTypeExpr (SumType _) = freshMeta
 normalizeTypeExpr (Structure _ _) = freshMeta
-normalizeTypeExpr (Instance _ _ _ _) = freshMeta
+normalizeTypeExpr (Instance _ _ _ _ _) = freshMeta
 normalizeTypeExpr (ClassDecl _ _) = freshMeta
 normalizeTypeExpr Intrinsic = freshMeta
 normalizeTypeExpr Derive = freshMeta
@@ -878,16 +891,16 @@ normalizeTy env = go
                     in if Prelude.null typeNames then Nothing
                        else tryInstanceLookup funcNm typeNames
                 tryInstance funcNm tns =
-                    case lookupCLMInstance funcNm tns env of
+                    case lookupCLMInstance funcNm tns Nothing env of
                         Just clm -> Just clm
-                        Nothing  -> case lookupInstanceLambda funcNm tns env of
+                        Nothing  -> case lookupInstanceLambda funcNm tns Nothing env of
                             Just lam -> Just (lambdaToCLMLam env lam)
                             Nothing  -> Nothing
                 tryInstanceLookup funcNm typeNames =
                     case tryInstance funcNm typeNames of
                         Just clm -> Just clm
                         Nothing ->
-                            case lookupCLMInstancePrefix funcNm typeNames env of
+                            case lookupCLMInstancePrefix funcNm typeNames Nothing env of
                                 Just clm -> Just clm
                                 Nothing ->
                                     let tryKeys [] = Nothing
@@ -1031,11 +1044,18 @@ emitStructConstraint funcName lam =
   case params lam of
     (Var _ (Implicit implTy) _ : _) ->
       case implTy of
+        -- Tagged: Implicit (NamedRef (App (Id "Semigroup") [Id "a"]) "Additive")
+        NamedRef (App (Id structName) typeArgs) tag ->
+          tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
+            tcModify (\st -> st { constraints = CStructure structName (Just tag) tyArgs : constraints st })
+        NamedRef (Id structName) tag ->
+          tcModify (\st -> st { constraints = CStructure structName (Just tag) [] : constraints st })
+        -- Untagged: Implicit (App (Id "Eq") [Id "a"])
         App (Id structName) typeArgs ->
           tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
-            tcModify (\st -> st { constraints = CStructure structName tyArgs : constraints st })
+            tcModify (\st -> st { constraints = CStructure structName Nothing tyArgs : constraints st })
         Id structName ->
-          tcModify (\st -> st { constraints = CStructure structName [] : constraints st })
+          tcModify (\st -> st { constraints = CStructure structName Nothing [] : constraints st })
         _ -> tcPure ()
     _ -> tcPure ()
 
@@ -1145,7 +1165,10 @@ infer (Id name) =
   lookupVarType name `tcBind` \mty ->
     case mty of
       Just ty -> instantiate ty
-      Nothing -> tcWarnOrFail (UnboundVar name) `tcBind` \_ -> freshMeta
+      -- Unbound vars are soft warnings (not fatal even in strict mode) because
+      -- in a multi-module system, a name may reference an algebra method or
+      -- function from a module that hasn't been type-checked yet.
+      Nothing -> tcWarn (UnboundVar name) `tcBind` \_ -> freshMeta
 
 -- Typed expression: e : T
 infer (Typed e tExpr) =
@@ -1232,15 +1255,26 @@ infer (NTuple fields)
         [t] -> tcPure t
         _   -> tcPure (Prelude.foldr1 (\a b -> Sigma Nothing a b) tys)
 
--- Function definition (Phase 5: set source info)
-infer (Function lam) =
-  tcLocal (\env -> env { tcSourceInfo = Just (lamSrcInfo lam) }) (inferLambda lam)
+-- Function definition (source info set inside inferLambda)
+infer (Function lam) = inferLambda lam
 
--- Pattern matches
+-- Pattern matches: infer ALL branches and unify their types
 infer (PatternMatches cases) =
   case cases of
     [] -> freshMeta
-    (c:_) -> infer c
+    (c:cs) ->
+      infer c `tcBind` \firstTy ->
+        tcMapM_ (\c' ->
+          infer c' `tcBind` \branchTy ->
+            applySubst firstTy `tcBind` \firstTy' ->
+              applySubst branchTy `tcBind` \branchTy' ->
+                tcWithContext "pattern match branches must have same type"
+                  (tcTry (unify branchTy' firstTy') `tcBind` \result ->
+                    case result of
+                      Just _  -> tcPure ()
+                      Nothing -> tcHardWarn (Mismatch firstTy' branchTy'))
+        ) cs `tcBind` \_ ->
+          applySubst firstTy
 
 -- CaseOf: bind pattern variables before inferring body
 infer (CaseOf pats bodyExpr _si) =
@@ -1250,8 +1284,14 @@ infer (CaseOf pats bodyExpr _si) =
        in tcLocal extendEnv (infer bodyExpr)
 
 -- ExpandedCase: apply GADT refinements (Phase 5: set source info)
+-- Only update tcSourceInfo when si is a real source position (not SourceInteractive).
+-- SourceInteractive comes from desugared IfThenElse/LetIn — overwriting with it would
+-- lose the enclosing function's source info, producing <interactive>:0:0 in errors.
 infer (ExpandedCase checks bodyExpr si) =
-  tcLocal (\env -> env { tcSourceInfo = Just si }) $
+  let updateSi env = case si of
+        SourceInteractive -> env
+        _                 -> env { tcSourceInfo = Just si }
+  in tcLocal updateSi $
     gadtRefine checks `tcBind` \refinements ->
       if Prelude.null refinements
       then infer bodyExpr
@@ -1286,7 +1326,7 @@ infer (Structure _ _) = tcPure (U (LConst 0))
 infer (Primitive _) = tcPure (U (LConst 0))
 
 -- Instance, Intrinsic, etc.
-infer (Instance _ _ _ _) = tcPure (Id "Unit")
+infer (Instance _ _ _ _ _) = tcPure (Id "Unit")
 infer Intrinsic = freshMeta
 infer Derive = freshMeta
 infer UNDEFINED = freshMeta
@@ -1410,9 +1450,24 @@ inferApp (Meta v) args =
     freshMeta `tcBind` \retTy ->
       let fnTy = Prelude.foldr (\a b -> Pi Nothing a b) retTy argTys
       in bind v fnTy `tcBind` \_ -> tcPure retTy
--- Not an arrow type
+-- Type variable (Id "a") — might be a function type, constrain it
+inferApp ty@(Id n) args | not (Prelude.null n) && Prelude.head n >= 'a' && Prelude.head n <= 'z' =
+  tcMapM infer args `tcBind` \argTys ->
+    freshMeta `tcBind` \retTy ->
+      let fnTy = Prelude.foldr (\a b -> Pi Nothing a b) retTy argTys
+      in tcTry (unify ty fnTy) `tcBind` \_ -> tcPure retTy
+
+-- Not an arrow type — error (always reported, even in permissive mode for concrete types)
 inferApp ty args =
-  tcMapM infer args `tcBind` \_ -> freshMeta
+  let isConcrete = case ty of
+        Id n -> not (Prelude.null n) && (Prelude.head n >= 'A' && Prelude.head n <= 'Z')
+        App (Id n) _ -> not (Prelude.null n) && (Prelude.head n >= 'A' && Prelude.head n <= 'Z')
+        U _ -> True
+        _ -> False
+      errMsg = OtherError $ "Cannot apply non-function type '" ++ showTy ty ++ "' to " ++ show (Prelude.length args) ++ " argument(s)"
+      reportErr = if isConcrete then tcHardWarn errMsg else tcWarnOrFail errMsg
+  in tcMapM infer args `tcBind` \_ ->
+       reportErr `tcBind` \_ -> freshMeta
 
 -- | Infer type of a Lambda definition
 inferLambda :: Lambda -> TC Expr
@@ -1422,7 +1477,11 @@ inferLambda lam =
         p -> p
       selfName = lamName lam
       ctx = if selfName /= "" then "function '" ++ selfName ++ "'" else "anonymous lambda"
-  in tcWithContext ctx (
+      -- Always set source info from the lambda so errors report the right location
+      setSrcInfo env = case lamSrcInfo lam of
+        SourceInteractive -> env
+        si -> env { tcSourceInfo = Just si }
+  in tcLocal setSrcInfo $ tcWithContext ctx (
     tcMapM (\(Var n tp _) ->
        normalizeTypeExpr tp `tcBind` \ty -> tcPure (n, ty)) ps `tcBind` \paramBindings ->
      normalizeTypeExpr (lamType lam) `tcBind` \retTy ->
@@ -1571,7 +1630,7 @@ typeCheckPass = do
             case Map.lookup (lamName lam) tl of
                 Just optLam -> (Function optLam, si)
                 Nothing     -> (Function lam, si)
-        useOptimized (Instance sn targs impls reqs, si) =
+        useOptimized (Instance sn mTag targs impls reqs, si) =
             let typeNames = Prelude.map exprToName targs
                 optImpl (Function implLam) =
                     let key = lamName implLam ++ "\0" ++ intercalate "\0" typeNames
@@ -1579,7 +1638,7 @@ typeCheckPass = do
                         Just optLam -> Function optLam
                         Nothing     -> Function implLam
                 optImpl other = other
-            in (Instance sn targs (Prelude.map optImpl impls) reqs, si)
+            in (Instance sn mTag targs (Prelude.map optImpl impls) reqs, si)
         useOptimized other = other
         exprToName (Id n) = n
         exprToName (App (Id n) _) = n
@@ -1588,22 +1647,18 @@ typeCheckPass = do
     _ <- foldM (\accSt (expr, srcInfo) ->
         case runTC (checkTopLevel expr) tcEnv accSt of
             Left errs -> do
-                let errMsgs = Prelude.map showTCError errs
                 forM_ errs $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                -- Count and collect errors
-                modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length errs
-                                , tcCollectedErrors = tcCollectedErrors s ++ errMsgs })
+                -- Count errors
+                modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length errs })
                 return accSt
             Right (_, tcSt') -> do
                 let newErrors = tcErrors tcSt'
-                let errMsgs = Prelude.map showTCError newErrors
                 forM_ newErrors $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                -- Count and collect errors
+                -- Count errors
                 unless (Prelude.null newErrors) $
-                    modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length newErrors
-                                    , tcCollectedErrors = tcCollectedErrors s ++ errMsgs })
+                    modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length newErrors })
                 return (tcSt' { tcErrors = [] })
       ) tcSt md'
     pure ()
@@ -1634,11 +1689,11 @@ resolveConstraints = resolveLoop 10
           tcMapM_ (warnOne env) (constraints st) `tcBind` \_ ->
             tcModify (\s -> s { constraints = [] })
 
-    warnOne env (CStructure structName tyArgs) =
+    warnOne env (CStructure structName mTag tyArgs) =
       tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
         let typeNames = Prelude.map tyToName resolvedArgs
         in if Prelude.any (== "") typeNames then tcPure ()
-           else tcWarnOrFail (ConstraintUnsolved (CStructure structName resolvedArgs))
+           else tcWarnOrFail (ConstraintUnsolved (CStructure structName mTag resolvedArgs))
     warnOne _ (CRowLack _ _) = tcPure ()
     warnOne _ (CEffect _) = tcPure ()  -- effect constraints are informational, not warnings
 
@@ -1649,11 +1704,11 @@ resolveConstraints = resolveLoop 10
           in tcModify (\s -> s { constraints = [] }) `tcBind` \_ ->
              tcMapM_ (resolveOne env) cs
 
-    resolveOne env (CStructure structName tyArgs) =
+    resolveOne env (CStructure structName mTag tyArgs) =
       tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
         let typeNames = Prelude.map tyToName resolvedArgs
         in if Prelude.any (== "") typeNames
-           then tcModify (\s -> s { constraints = CStructure structName tyArgs : constraints s })
+           then tcModify (\s -> s { constraints = CStructure structName mTag tyArgs : constraints s })
            else case envCompiler env of
              Nothing -> tcPure ()
              Just cenv ->
@@ -1661,9 +1716,9 @@ resolveConstraints = resolveLoop 10
                  Just (Structure structLam _) -> case body structLam of
                    DeclBlock exs ->
                      let funcNames = [lamName l | Function l <- exs]
-                     in if Prelude.any (\fn -> instanceExists cenv fn typeNames) funcNames
+                     in if Prelude.any (\fn -> instanceExistsTagged cenv fn typeNames mTag) funcNames
                         then tcPure ()
-                        else tcModify (\s -> s { constraints = CStructure structName resolvedArgs : constraints s })
+                        else tcModify (\s -> s { constraints = CStructure structName mTag resolvedArgs : constraints s })
                    _ -> tcPure ()
                  _ -> tcPure ()
     resolveOne _ (CRowLack n e) =
@@ -1672,13 +1727,13 @@ resolveConstraints = resolveLoop 10
     -- In the future, purity enforcement will make this stricter.
     resolveOne _ (CEffect _effName) = tcPure ()
 
-    instanceExists cenv funcName typeNames =
-      case lookupInstanceLambda funcName typeNames cenv of
+    instanceExistsTagged cenv funcName typeNames mTag =
+      case lookupInstanceLambda funcName typeNames mTag cenv of
         Just _  -> True
         Nothing ->
           Prelude.any (\tn ->
             let parents = getAllParents tn cenv
-            in Prelude.any (\p -> case lookupInstanceLambda funcName [p] cenv of
+            in Prelude.any (\p -> case lookupInstanceLambda funcName [p] mTag cenv of
                                     Just _ -> True
                                     Nothing -> False) parents
           ) typeNames
@@ -1692,19 +1747,46 @@ tyToName _ = ""
 -- | Check a top-level declaration
 checkTopLevel :: Expr -> TC ()
 checkTopLevel (Function lam) =
-  inferLambda lam `tcBind` \_ -> resolveConstraints
+  let setSrcInfo env = case lamSrcInfo lam of
+        SourceInteractive -> env
+        si -> env { tcSourceInfo = Just si }
+  in tcLocal setSrcInfo (inferLambda lam `tcBind` \_ -> resolveConstraints)
 
-checkTopLevel (Instance structName targs impls _reqs) =
+checkTopLevel (Instance structName _mTag targs impls _reqs) =
   tcAsk `tcBind` \env ->
     case envCompiler env of
       Nothing -> inferImpls impls
       Just cenv ->
         tcWithContext ("instance " ++ structName ++ "(" ++ intercalate "," (Prelude.map showExprBrief targs) ++ ")") $
           case lookupType structName cenv of
-            Just (Structure structLam _) ->
+            Just (Structure structLam si) ->
               let sigFuncs = [l | Function l <- case body structLam of DeclBlock exs -> exs; _ -> []]
                   typeVars = Prelude.map Surface.name (Prelude.filter isImplicitVar (params structLam))
-              in tcMapM_ (checkInstanceImpl cenv typeVars targs sigFuncs) impls
+                  -- Check superclass instances exist
+                  checkParents = tcMapM_ (\parentExpr ->
+                    let parentName = case parentExpr of
+                          App (Id n) _ -> n
+                          Id n -> n
+                          _ -> ""
+                        -- Substitute type args into parent's type args
+                        parentTargs = case parentExpr of
+                          App _ pargs -> Prelude.map (\pa -> substParentArg typeVars targs pa) pargs
+                          _ -> targs
+                        parentTargNames = Prelude.map showExprBrief parentTargs
+                        -- Check if any method of the parent algebra has an instance for these types
+                        hasParentInstance = case lookupType parentName cenv of
+                          Just (Structure parentLam _) ->
+                            let parentMethods = [lamName l | Function l <- case body parentLam of DeclBlock exs -> exs; _ -> []]
+                            in Prelude.any (\mName ->
+                                 Prelude.any (\tn -> hasInstanceKey mName tn cenv) parentTargNames
+                               ) parentMethods
+                          _ -> True  -- can't check, assume ok
+                    in if Prelude.null parentName || hasParentInstance
+                       then tcPure ()
+                       else tcWarn (OtherError $ "Missing superclass instance: " ++ parentName ++ "(" ++ intercalate "," parentTargNames ++ ") required by " ++ structName)
+                    ) (structExtends si)
+              in checkParents `tcBind` \_ ->
+                 tcMapM_ (checkInstanceImpl cenv typeVars targs sigFuncs) impls
                  `tcBind` \_ -> resolveConstraints
             _ -> inferImpls impls  -- fallback for non-structure targets
   where
@@ -1718,6 +1800,23 @@ checkTopLevel (Instance structName targs impls _reqs) =
     isUniverseLike (Id "Type1") = True
     isUniverseLike (Id "Type2") = True
     isUniverseLike _ = False
+
+    -- Substitute parent type args using the algebra's type variable mapping
+    substParentArg :: [Name] -> [Expr] -> Expr -> Expr
+    substParentArg tvars targs' (Id n) =
+      case Prelude.lookup n (Prelude.zip tvars targs') of
+        Just t  -> t
+        Nothing -> Id n
+    substParentArg tvars targs' (App e as) = App (substParentArg tvars targs' e) (Prelude.map (substParentArg tvars targs') as)
+    substParentArg _ _ e = e
+
+    -- Check if an instance key exists for funcName + typeName.
+    -- Strip type parameters: "Array(a)" → "Array" to match instance key format.
+    hasInstanceKey :: Name -> Name -> Environment -> Bool
+    hasInstanceKey funcName typeName cenv =
+      let baseName = takeWhile (/= '(') typeName
+          key = funcName ++ "\0" ++ baseName
+      in Map.member key (instanceLambdas cenv)
 
     checkInstanceImpl cenv typeVars targs' sigFuncs impl = case impl of
       Function implLam ->
@@ -1937,7 +2036,7 @@ showSourceLoc (SourceInfo l c f _) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
 showSourceLoc SourceInteractive = ""
 
 showConstraint :: Constraint -> String
-showConstraint (CStructure n tys) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")"
+showConstraint (CStructure n mTag tys) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")" ++ maybe "" (" as " ++) mTag
 showConstraint (CRowLack n _) = "row lacks " ++ n
 
 -- | Pretty-print a type (Expr used as type)

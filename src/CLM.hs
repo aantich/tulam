@@ -10,6 +10,7 @@ where
 import Util.PrettyPrinting
 import Logs
 import Surface
+import qualified Data.Char
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Set as Set
 import GHC.Generics (Generic)
@@ -379,6 +380,9 @@ inferTypePure :: (Name -> Maybe Name) -> CLMExpr -> Maybe Name
 inferTypePure consLookup (CLMCON (ConsTag consNm _) _) = consLookup consNm
 inferTypePure _ (CLMLIT lit) = litTypeName lit
 inferTypePure _ (CLMARRAY _) = Just "Array"
+-- Type-level arguments: extract head type name for associated type dispatch
+inferTypePure _ (CLMID name) | not (Prelude.null name) && Data.Char.isUpper (Prelude.head name) = Just name
+inferTypePure _ (CLMAPP (CLMID name) _) | not (Prelude.null name) && Data.Char.isUpper (Prelude.head name) = Just name
 inferTypePure _ _             = Nothing
 
 -- | Normalize a level by evaluating concrete arithmetic

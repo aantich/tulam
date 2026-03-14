@@ -1,9 +1,10 @@
-/// List instances: Semigroup, Monoid, Show, and Collection algebras.
+/// List instances: Semigroup, Monoid, Show, Collection algebras, Functor, Applicative, Monad.
 ///
 /// Also provides convenience functions: head, tail.
 module Instances.List;
 import Core;
 import Algebra;
+import Categorical;
 import Collection;
 
 // ============================================================================
@@ -49,8 +50,10 @@ instance Filterable(List) = {
         | p, Nil -> Pair(Nil, Nil)
         | p, Cons(h, t) ->
             let rest = partition(p, t) in
-            if p(h) then Pair(Cons(h, fst(rest)), snd(rest))
-            else Pair(fst(rest), Cons(h, snd(rest)));
+            match rest
+            | Pair(yes, no) ->
+                if p(h) then Pair(Cons(h, yes), no)
+                else Pair(yes, Cons(h, no));
     function filterMap(f, xs) = match
         | f, Nil -> Nil
         | f, Cons(h, t) -> match f(h)
@@ -87,5 +90,35 @@ instance Monoid(List(a)) = {
 instance Show(List(a)) = {
     function show(x:List(a)) : String = match
         | Nil -> "Nil"
-        | Cons(h, t) -> concat("Cons(", concat(show(h), concat(", ", concat(show(t), ")"))))
+        | Cons(h, t) -> "Cons(" ⊕ show(h) ⊕ ", " ⊕ show(t) ⊕ ")"
+};
+
+// ----------------------------------------------------------------------------
+// Categorical instances
+// ----------------------------------------------------------------------------
+
+instance Functor(List) = {
+    function fmap(g, xs) = match
+        | g, Nil -> Nil
+        | g, Cons(h, t) -> Cons(g(h), fmap(g, t))
+};
+
+instance Applicative(List) = {
+    function pure(x) = Cons(x, Nil);
+    function ap(ff, fa) = match
+        | Nil, fa -> Nil
+        | Cons(g, gs), fa -> combine(fmap(g, fa), ap(gs, fa))
+};
+
+instance Monad(List) = {
+    function pure(x) = Cons(x, Nil);
+    function bind(xs, f) = match
+        | Nil, f -> Nil
+        | Cons(h, t), f -> combine(f(h), bind(t, f));
+    function ap(ff, fa) = match
+        | Nil, fa -> Nil
+        | Cons(g, gs), fa -> combine(fmap(g, fa), ap(gs, fa));
+    function seq(xs, ys) = match
+        | Nil, ys -> Nil
+        | Cons(h, t), ys -> combine(ys, seq(t, ys))
 };

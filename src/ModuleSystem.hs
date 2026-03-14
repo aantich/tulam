@@ -25,6 +25,8 @@ module ModuleSystem
     , resolveAllDeps
     , runParseOnly
     , runModulePasses
+    , runPhase1Passes
+    , runPhase2Passes
     , CompiledModule(..)
     , baseModulePath
     , preludeModulePath
@@ -247,44 +249,58 @@ data CompiledModule = CompiledModule
 -- Modifies currentEnvironment in place (adds types, constructors, lambdas, CLM, etc.).
 runModulePasses :: IntState ()
 runModulePasses = do
+    runPhase1Passes
+    runPhase2Passes
+
+-- | Phase 1: Parse through case optimization (Passes 0-2).
+-- Builds the environment but does NOT type-check or generate CLM.
+-- Used in two-phase compilation: all modules run Phase 1 first.
+runPhase1Passes :: IntState ()
+runPhase1Passes = do
     timedPass "Pass 0 (desugar)" afterparserPass
-    clearAllLogs
+    flushLogs
     timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
-    clearAllLogs
+    flushLogs
     timedPass "Pass 0.5 (action desugar)" actionDesugarPass
-    clearAllLogs
+    flushLogs
     timedPass "Pass 1 (env build)" buildEnvPass
-    clearAllLogs
+    flushLogs
     timedPass "Pass 1.5 (record desugar)" recordDesugarPass
-    clearAllLogs
+    flushLogs
     timedPass "Pass 2 (case opt)" caseOptimizationPass
     checkSealedExhaustiveness
     positivityCheckPass
     coverageCheckPass
-    clearAllLogs
+    flushLogs
+
+-- | Phase 2: Type checking through CLM (Passes 3-4.5).
+-- Assumes Phase 1 has run and currentEnvironment is fully populated.
+runPhase2Passes :: IntState ()
+runPhase2Passes = do
     -- Reset TC error count before type checking this module
     modify (\s -> s { tcErrorCount = 0 })
     timedPass "Pass 3 (typecheck)" typeCheckPass
     terminationCheckPass
-    clearAllLogs
+    flushLogs
     -- In strict mode, halt pipeline if type errors were found in this module
     st <- get
     let moduleErrors = tcErrorCount st
     let shouldHalt = strictTypes (currentFlags st) && moduleErrors > 0
     if shouldHalt
-      then liftIO $ putStrLn $ "[TC] " ++ show moduleErrors
+      then
+        compilerMsg Errors $ "[TC] " ++ show moduleErrors
              ++ " type error(s) found. Halting compilation (strict mode)."
       else do
         timedPass "Pass 4 (CLM)" lamToCLMPass
-        clearAllLogs
+        flushLogs
         timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
-        clearAllLogs
+        flushLogs
 
 -- | Finalize a compiled module: compute public/private names, build ModuleEnv,
 -- enforce visibility, and write cache if applicable.
 finalizeModule :: String -> T.Text -> Set.Set Name -> HashMap String ModuleEnv
                -> [Expr] -> IntState CompiledModule
-finalizeModule nm fileText namesBefore prevLoadedMods exprs = do
+finalizeModule nm fileText namesBefore _prevLoadedMods exprs = do
     st' <- get
     let namesAfter = allEnvNames (currentEnvironment st')
     let newNames = Set.difference namesAfter namesBefore
@@ -297,6 +313,9 @@ finalizeModule nm fileText namesBefore prevLoadedMods exprs = do
     let modKey = case modPath of
             [] -> nm
             path -> modPathToKey path
+    -- Use CURRENT loadedModules (not stale Phase 1 snapshot) so all previously
+    -- finalized modules are visible
+    let currentLoaded = loadedModules (currentModuleEnv st')
     let menv = ModuleEnv
             { moduleName = modPath
             , publicNames = pubNames
@@ -305,7 +324,7 @@ finalizeModule nm fileText namesBefore prevLoadedMods exprs = do
             , moduleExports = exports
             , loadedModules = Map.insert modKey
                 (ModuleEnv modPath pubNames privNames imports exports Map.empty)
-                prevLoadedMods
+                currentLoaded
             }
     let env' = if Set.null privNames
             then currentEnvironment st'
@@ -334,25 +353,29 @@ finalizeModule nm fileText namesBefore prevLoadedMods exprs = do
                 }
     return $ CompiledModule modKey modPath pubNames privNames imports exports
 
--- | Quiet version of file loading — runs all passes without printing.
--- Tracks per-module defined names and stores in loadedModules.
--- Phase 2A: Scopes parsedModule per module — saves/restores so each module's
--- passes only see that module's parsed expressions.
+-- | Two-phase file loading for a single file.
+-- Phase 1 (env build + case opt) then immediately Phase 2 (TC + CLM).
+-- Used for REPL :load and test program loading (single files on top of existing env).
 loadFileQuiet :: String -> IntState ()
 loadFileQuiet nm = do
+    loadFileQuietPhase1 nm
+    runModulePhase2 nm
+
+-- | Phase 1 only version of loadFileQuiet.
+-- Runs Passes 0-2 (desugar, env build, case opt) but NOT type checking or CLM.
+-- Saves the parsedModule to moduleParsedExprs for Phase 2 retrieval.
+-- Does NOT call finalizeModule (deferred to Phase 2).
+loadFileQuietPhase1 :: String -> IntState ()
+loadFileQuietPhase1 nm = do
     st <- get
-    -- Phase 2A: Save the accumulated parsedModule from previous modules
     let prevParsedModule = parsedModule st
-    -- Clear parsedModule so parsing only produces this module's expressions
     put $ st { parsedModule = [] }
     fileText <- liftIO (TIO.readFile nm)
     res <- parseWholeFile fileText nm
     st2 <- get
-    -- Snapshot environment names before this module's compilation
+    -- Snapshot environment names BEFORE this module's Phase 1
     let namesBefore = allEnvNames (currentEnvironment st2)
-    -- Reset module env for this module, preserving loadedModules
     let prevLoadedMods = loadedModules (currentModuleEnv st2)
-    -- Store source text for error display
     let srcs = Map.insert nm fileText (loadedSources st2)
     put $ st2 { currentSource = fileText
               , currentModuleEnv = emptyModuleEnv { loadedModules = prevLoadedMods }
@@ -361,15 +384,60 @@ loadFileQuiet nm = do
     case res of
         Left _err -> do
             liftIO $ putStrLn $ "Error loading " ++ nm ++ ": parse error"
-            -- Phase 2A: Restore parsedModule even on parse failure
             modify (\s -> s { parsedModule = prevParsedModule })
-        Right exprs -> do
-            runModulePasses
-            _cm <- finalizeModule nm fileText namesBefore prevLoadedMods exprs
-            -- Phase 2A: Restore accumulated parsedModule (this module's + all previous)
+        Right _exprs -> do
+            runPhase1Passes
+            -- Save this module's parsed expressions + snapshot for Phase 2
             st' <- get
-            let allParsed = parsedModule st' ++ prevParsedModule
+            let thisModuleParsed = parsedModule st'
+            modify (\s -> s { moduleParsedExprs =
+                Map.insert nm (thisModuleParsed, namesBefore, prevLoadedMods) (moduleParsedExprs s) })
+            -- Restore accumulated parsedModule
+            let allParsed = thisModuleParsed ++ prevParsedModule
             modify (\s -> s { parsedModule = allParsed })
+
+-- | Run Phase 2 (TC + CLM) for a module that already went through Phase 1.
+-- Restores parsedModule from moduleParsedExprs, runs type checking and CLM,
+-- then finalizes the module.
+runModulePhase2 :: String -> IntState ()
+runModulePhase2 nm = do
+    st <- get
+    case Map.lookup nm (moduleParsedExprs st) of
+        Nothing -> return ()  -- Module not found (maybe cached or parse error)
+        Just (savedParsed, namesBefore, savedPrevLoadedMods) -> do
+            -- Save current parsedModule and restore this module's
+            let prevParsedModule = parsedModule st
+            put $ st { parsedModule = savedParsed }
+            -- Load file text for finalize
+            let fileText = case Map.lookup nm (loadedSources st) of
+                    Just t  -> t
+                    Nothing -> ""
+            let exprs = Prelude.map fst savedParsed
+            -- Check if all imported modules are loaded; defer TC if not
+            let deps = extractDependencies exprs
+                importedKeys = [intercalate "." d | d <- deps]
+                loadedKeys = loadedModules (currentModuleEnv st)
+                missingKeys = [k | k <- importedKeys, not (Map.member k loadedKeys)]
+            if Prelude.null missingKeys
+              then do
+                -- All deps loaded: run Phase 2 passes (TC + CLM)
+                runPhase2Passes
+                -- Finalize module (visibility, cache, etc.)
+                _cm <- finalizeModule nm fileText namesBefore savedPrevLoadedMods exprs
+                -- Restore accumulated parsedModule
+                st' <- get
+                let allParsed = parsedModule st' ++ prevParsedModule
+                modify (\s -> s { parsedModule = allParsed })
+              else do
+                -- Deps not loaded: defer TC, but still register Phase 1 completion
+                -- (definitions ARE available, TC is just deferred validation)
+                _cm <- finalizeModule nm fileText namesBefore savedPrevLoadedMods exprs
+                modify (\s -> s { deferredTCModules =
+                    (nm, savedParsed, missingKeys) : deferredTCModules s })
+                -- Restore accumulated parsedModule
+                st' <- get
+                let allParsed = parsedModule st' ++ prevParsedModule
+                modify (\s -> s { parsedModule = allParsed })
 
 -- | Load a module from cache if fresh, otherwise compile from source and cache.
 loadFileWithCache :: String -> String -> IntState ()
@@ -402,57 +470,110 @@ loadFileWithCache modKey filePath = do
             loadFileQuiet filePath
 
 -- | Load a module tree starting from an entry file.
--- Resolves all dependencies recursively, topologically sorts them,
--- and loads each module in order. Always loads Prelude first.
--- Uses binary cache when available for fast loading.
+-- Uses two-phase compilation: Phase 1 (env build) for ALL modules first,
+-- then Phase 2 (TC + CLM) for ALL modules. This ensures the type checker
+-- sees the complete global environment including definitions from later modules.
 loadModuleTree :: FilePath -> IntState ()
 loadModuleTree entryFile = do
     st <- get
     let searchPaths = libSearchPaths st
     -- Ensure cache directory exists
     liftIO ensureCacheDir
-    -- Load prelude first (primitives, no dependencies)
-    liftIO $ putStrLn "  Loading Prelude..."
+    -- Load prelude first (primitives, no dependencies) — full pipeline (no cross-deps)
+    compilerMsg Normal "  Loading Prelude..."
     loadFileWithCache "Prelude" preludeModulePath
     -- Parse entry file to get its dependencies
-    liftIO $ putStrLn "  Resolving module dependencies..."
+    compilerMsg Normal "  Resolving module dependencies..."
     allModules <- liftIO $ resolveAllDeps searchPaths Set.empty [entryFile]
-    -- Load each module in order (prelude already loaded, skip it)
-    liftIO $ putStrLn $ "  Loading " ++ show (length allModules) ++ " modules..."
-    mapM_ (\(modKey, filePath) -> do
-        liftIO $ putStrLn $ "    " ++ modKey
-        loadFileWithCache modKey filePath
-        ) allModules
-    liftIO $ putStrLn "  All modules loaded."
+    compilerMsg Normal $ "  Loading " ++ show (length allModules) ++ " modules..."
+    -- Phase 1: All modules through env build + case optimization
+    -- After this, currentEnvironment has ALL types, constructors, lambdas, instances
+    compilerMsg Normal "  Phase 1: Building environments..."
+    phase1Modules <- loadAllModulesPhase1 allModules
+    -- Phase 2: All modules through type checking + CLM generation
+    -- TC now sees the complete global environment
+    compilerMsg Normal "  Phase 2: Type checking & CLM..."
+    mapM_ (\(_, filePath) -> do
+        runModulePhase2 filePath
+        ) phase1Modules
+    compilerMsg Normal "  All modules loaded."
+
+-- | Load all modules through Phase 1 only (env build + case opt).
+-- Returns the list of modules that need Phase 2 (excludes cache hits).
+-- Cache hits go through full pipeline immediately since they don't need TC.
+loadAllModulesPhase1 :: [(String, FilePath)] -> IntState [(String, FilePath)]
+loadAllModulesPhase1 modules = do
+    -- For each module: try cache first, otherwise run Phase 1 only
+    phase2Needed <- mapM (\(modKey, filePath) -> do
+        compilerMsg Verbose $ "    " ++ modKey
+        needsPhase2 <- loadFileWithCacheOrPhase1 modKey filePath
+        return (if needsPhase2 then Just (modKey, filePath) else Nothing)
+        ) modules
+    return [m | Just m <- phase2Needed]
+
+-- | Try to load from cache; if cache miss, run Phase 1 only.
+-- Returns True if Phase 2 is still needed (cache miss), False if fully loaded from cache.
+loadFileWithCacheOrPhase1 :: String -> String -> IntState Bool
+loadFileWithCacheOrPhase1 modKey filePath = do
+    fileText <- liftIO (TIO.readFile filePath)
+    let srcHash = hashSource fileText
+    st0 <- get
+    mCache <- liftIO $ loadCacheIfFresh modKey fileText (moduleSourceHashes st0)
+    case mCache of
+        Just mc -> do
+            -- Cache hit: merge cached environment slice directly (full load)
+            modify (\s -> s {
+                currentEnvironment = mergeEnvironment (currentEnvironment s) (mcEnvironment mc),
+                moduleSourceHashes = Map.insert modKey srcHash (moduleSourceHashes s)
+            })
+            st <- get
+            let prevLoadedMods = loadedModules (currentModuleEnv st)
+            let pubNames = allEnvNames (mcEnvironment mc)
+            let menv = (currentModuleEnv st) {
+                    loadedModules = Map.insert modKey
+                        (ModuleEnv [] pubNames Set.empty [] [] Map.empty)
+                        prevLoadedMods
+                }
+            put $ st { currentModuleEnv = menv }
+            return False  -- No Phase 2 needed
+        Nothing -> do
+            -- Cache miss: run Phase 1 only
+            loadFileQuietPhase1 filePath
+            return True  -- Phase 2 still needed
 
 -- | Recursively resolve all dependencies starting from a list of files.
 -- Returns modules in dependency order (dependencies first).
+-- Tracks both fully loaded modules AND modules currently being resolved
+-- to prevent infinite recursion on circular dependencies.
 resolveAllDeps :: [FilePath] -> Set.Set String -> [FilePath] -> IO [(String, FilePath)]
-resolveAllDeps _ _ [] = return []
-resolveAllDeps searchPaths loaded (filePath:rest) = do
+resolveAllDeps searchPaths loaded files = resolveAllDeps' searchPaths loaded Set.empty files
+
+resolveAllDeps' :: [FilePath] -> Set.Set String -> Set.Set String -> [FilePath] -> IO [(String, FilePath)]
+resolveAllDeps' _ _ _ [] = return []
+resolveAllDeps' searchPaths loaded resolving (filePath:rest) = do
     fileText <- TIO.readFile filePath
     parseResult <- runParseOnly fileText filePath
     case parseResult of
-        Left _ -> resolveAllDeps searchPaths loaded rest  -- skip unparseable files
+        Left _ -> resolveAllDeps' searchPaths loaded resolving rest  -- skip unparseable files
         Right exprs -> do
             let modKey = case extractModuleKey exprs of
                     Just k  -> k
                     Nothing -> filePath  -- fallback to file path
-            if Set.member modKey loaded || modKey == "Prelude"
-                then resolveAllDeps searchPaths loaded rest
+            if Set.member modKey loaded || modKey == "Prelude" || Set.member modKey resolving
+                then resolveAllDeps' searchPaths loaded resolving rest
                 else do
-                    -- Resolve dependencies first
+                    -- Resolve dependencies first (mark this module as resolving to break cycles)
                     let deps = extractDependencies exprs
                     depFiles <- mapM (resolveModulePath searchPaths) deps
                     let validDeps = [fp | Just fp <- depFiles]
-                    -- Recurse into dependencies
-                    depModules <- resolveAllDeps searchPaths loaded validDeps
+                    let resolving' = Set.insert modKey resolving
+                    depModules <- resolveAllDeps' searchPaths loaded resolving' validDeps
                     let loaded' = Set.union loaded (Set.fromList [k | (k, _) <- depModules])
                     -- Now add this module if not yet loaded
                     if Set.member modKey loaded'
-                        then resolveAllDeps searchPaths loaded' rest
+                        then resolveAllDeps' searchPaths loaded' resolving rest
                         else do
-                            restModules <- resolveAllDeps searchPaths (Set.insert modKey loaded') rest
+                            restModules <- resolveAllDeps' searchPaths (Set.insert modKey loaded') resolving rest
                             return $ depModules ++ [(modKey, filePath)] ++ restModules
 
 -- | Parse a file just to extract expressions (no state effects).

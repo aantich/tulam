@@ -5,6 +5,6 @@ import Algebra;
 
 instance Show(Either(a, b)) = {
     function show(x:Either(a, b)) : String = match
-        | Left(v) -> concat("Left(", concat(show(v), ")"))
-        | Right(v) -> concat("Right(", concat(show(v), ")"))
+        | Left(v) -> "Left(" ⊕ show(v) ⊕ ")"
+        | Right(v) -> "Right(" ⊕ show(v) ⊕ ")"
 };

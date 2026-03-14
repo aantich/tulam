@@ -324,10 +324,11 @@ checkSealedExhaustiveness = do
     mapM_ (checkLambda env) (Map.elems instLambdas)
   where
     checkLambda env lam = case body lam of
-        PatternMatches cases -> checkCases env (lamName lam) cases
+        PatternMatches cases -> checkCases env lam cases
         _ -> pure ()
 
-    checkCases env funcName cases = do
+    checkCases env lam cases = do
+        let funcName = lamName lam
         -- Extract ConsTag names from ExpandedCase patterns
         let matchedNames = Data.List.nub [nm | ExpandedCase checks _ _ <- cases
                                               , ExprConsTagCheck (ConsTag nm _) _ <- checks]
@@ -337,14 +338,15 @@ checkSealedExhaustiveness = do
                                                , Just pn <- [cmParent cm]
                                                , isSealedClass pn env]
         -- For each sealed parent, check exhaustiveness
-        mapM_ (checkSealed env funcName matchedNames cases) sealedParents
+        mapM_ (checkSealed env lam matchedNames cases) sealedParents
 
-    checkSealed env funcName matchedNames cases parentName = do
+    checkSealed env lam matchedNames cases parentName = do
+        let funcName = lamName lam
         let allChildren = Prelude.filter (/= parentName) (getAllSubclasses parentName env)
         let hasWildcard = Prelude.any isWildcard cases
         let missing = Prelude.filter (`Prelude.notElem` matchedNames) allChildren
         when (not hasWildcard && not (Prelude.null missing)) $
-            logWarning (LogPayload 0 0 "" ("[sealed] non-exhaustive match in " ++ funcName
+            logWarning (mkLogPayload (lamSrcInfo lam) ("[sealed] non-exhaustive match in " ++ funcName
                 ++ ": missing " ++ Data.List.intercalate ", " missing
                 ++ " from sealed class " ++ parentName ++ "\n"))
 
@@ -390,7 +392,7 @@ checkConstructorPositivity typName conLam = do
         paramTypes = Prelude.map typ (params conLam)
     mapM_ (\paramTy ->
         case checkPositive typName Positive paramTy of
-            Just path -> logWarning (LogPayload 0 0 ""
+            Just path -> logWarning (mkLogPayload (lamSrcInfo conLam)
                 ("[positivity] type " ++ typName ++ " occurs in negative position in constructor "
                  ++ conName ++ ": " ++ path ++ "\n"))
             Nothing -> pure ()
@@ -430,7 +432,9 @@ checkPositiveList typName pol (e:es) =
 -- A call is structurally decreasing if at least one argument is a strict
 -- subterm of the corresponding parameter (obtained by pattern matching).
 
--- | Check all top-level functions for termination.
+-- | Check top-level functions for termination, scoped to current module only.
+-- Extracts function names from parsedModule and only checks those lambdas,
+-- preventing duplicate warnings when multiple modules share the environment.
 terminationCheckPass :: IntState ()
 terminationCheckPass = do
     s <- get
@@ -438,26 +442,75 @@ terminationCheckPass = do
     when (State.checkTermination flags) $ do
         let env = currentEnvironment s
         let lambdas = topLambdas env
-        mapM_ (checkFuncTermination env) (Map.toList lambdas)
+        -- Scope to current module: only check functions defined in parsedModule
+        let moduleNames = Set.fromList (extractModuleFuncNames (parsedModule s))
+        let moduleLambdas = Map.filterWithKey (\k _ -> k `Set.member` moduleNames) lambdas
+        mapM_ (checkFuncTermination env) (Map.toList moduleLambdas)
+
+-- | Extract function names from parsedModule expressions.
+-- Only includes top-level functions — NOT instance methods (which live in
+-- instanceLambdas, not topLambdas) and NOT algebra/structure defaults.
+-- Including instance method names would match the algebra's default body
+-- in topLambdas (e.g., combine, !=), causing false positives.
+extractModuleFuncNames :: [(Expr, SourceInfo)] -> [Name]
+extractModuleFuncNames = concatMap (go . fst)
+  where
+    go (Function lam) = [lamName lam]
+    go _ = []
 
 checkFuncTermination :: Environment -> (Name, Lambda) -> IntState ()
 checkFuncTermination env (funcName, lam) = do
-    -- Collect all names referenced in the body
-    let refs = Set.fromList (collectIdRefs (body lam))
-    -- Check if function is self-recursive
-    when (funcName `Set.member` refs) $ do
+    -- Skip type-level lambdas (type constructors like Maybe, List, etc.)
+    -- Their return type is U _ (a universe level), not a value type.
+    let isTypeLevelLam = case lamType lam of
+            U _ -> True
+            _   -> False
+    when (not isTypeLevelLam) $ do
+      -- Use the PRE-optimization body from parsedModule for subterm collection.
+      -- After case optimization (Pass 2), CaseOf nodes become ExpandedCase which
+      -- loses the original constructor pattern bindings. The pre-optimization body
+      -- still has CaseOf with Succ(k), Z, Cons(h,t) etc. — needed for structural
+      -- subterm detection.
+      s <- get
+      let preOptBody = lookupPreOptBody funcName (parsedModule s)
+          -- Use pre-opt body for BOTH subterm collection AND call site analysis.
+          -- After case optimization, variable names get replaced with field access
+          -- expressions (e.g., n → tupleField(0, x)), making them unrecognizable
+          -- as subterms. The pre-opt body preserves original variable names.
+          bodyForCheck = maybe (body lam) id preOptBody
+      -- Debug: uncomment to trace termination analysis
+      -- when (funcName == "plus") $ do
+      --     let paramNames2 = Set.fromList (Prelude.map name (params lam))
+      --     compilerMsg Normal $ "  [DBG] plus: subterms = " ++ show (collectSubterms bodyForCheck paramNames2)
+      --     compilerMsg Normal $ "  [DBG] plus: callArgs = " ++ show (Prelude.map (Prelude.map ppr) (collectRecursiveCallArgs funcName bodyForCheck))
+      -- Collect all names referenced in the body
+      let refs = Set.fromList (collectIdRefs bodyForCheck)
+      -- Check if function is self-recursive
+      when (funcName `Set.member` refs) $ do
         -- Get the function's parameter names
         let paramNames = Set.fromList (Prelude.map name (params lam))
         -- Find all pattern-destructured bindings (constructor subterms)
-        let subterms = collectSubterms (body lam) paramNames
+        let subterms = collectSubterms bodyForCheck paramNames
         -- Find all recursive call sites
-        let callArgs = collectRecursiveCallArgs funcName (body lam)
+        let callArgs = collectRecursiveCallArgs funcName bodyForCheck
         -- Check that at least one recursive call has a structurally smaller argument
         let allSafe = Prelude.all (hasDecreasingArg subterms) callArgs
         when (not allSafe && not (Prelude.null callArgs)) $
-            logWarning (LogPayload 0 0 ""
+            logWarning (mkLogPayload (lamSrcInfo lam)
                 ("[termination] function " ++ funcName
                  ++ " may not terminate: no structurally decreasing argument detected in recursive call(s)\n"))
+
+-- | Look up a function's pre-optimization body from parsedModule.
+lookupPreOptBody :: Name -> [(Expr, SourceInfo)] -> Maybe Expr
+lookupPreOptBody fn [] = Nothing
+lookupPreOptBody fn ((Function lam, _):rest)
+    | lamName lam == fn = Just (body lam)
+    | otherwise = lookupPreOptBody fn rest
+lookupPreOptBody fn ((Instance _ _ _ impls _, _):rest) =
+    case [body l | Function l <- impls, lamName l == fn] of
+        (b:_) -> Just b
+        []    -> lookupPreOptBody fn rest
+lookupPreOptBody fn (_:rest) = lookupPreOptBody fn rest
 
 -- | Collect names that are structural subterms of function parameters.
 -- When we see a pattern like | Succ(n) -> ..., then n is a subterm of the
@@ -550,11 +603,11 @@ coverageCheckPass = do
 
 checkLambdaCoverage :: Environment -> Lambda -> IntState ()
 checkLambdaCoverage env lam = case body lam of
-    PatternMatches cases -> checkCasesCoverage env (lamName lam) cases
+    PatternMatches cases -> checkCasesCoverage env lam cases
     _ -> pure ()
 
-checkCasesCoverage :: Environment -> Name -> [Expr] -> IntState ()
-checkCasesCoverage env funcName cases = do
+checkCasesCoverage :: Environment -> Lambda -> [Expr] -> IntState ()
+checkCasesCoverage env lam cases = do
     -- Check if there's a wildcard/default case
     let hasWildcard = Prelude.any isCoverageWildcard cases
     if hasWildcard
@@ -567,18 +620,19 @@ checkCasesCoverage env funcName cases = do
             let parentTypes = Data.List.nub [pn | nm <- matchedCons
                                                 , Just pn <- [lookupTypeOfConstructor nm env]]
             -- For each parent type, check exhaustiveness
-            mapM_ (checkTypeCoverage env funcName matchedCons) parentTypes
+            mapM_ (checkTypeCoverage env lam matchedCons) parentTypes
 
-checkTypeCoverage :: Environment -> Name -> [Name] -> Name -> IntState ()
-checkTypeCoverage env funcName matchedCons typName = do
+checkTypeCoverage :: Environment -> Lambda -> [Name] -> Name -> IntState ()
+checkTypeCoverage env lam matchedCons typName = do
+    let funcName = lamName lam
     -- Get all constructors of this type
     case lookupType typName env of
-        Just (SumType lam) -> case body lam of
+        Just (SumType typLam) -> case body typLam of
             Constructors cons -> do
                 let allConsNames = Prelude.map lamName cons
                     missing = Prelude.filter (`Prelude.notElem` matchedCons) allConsNames
                 when (not (Prelude.null missing)) $
-                    logWarning (LogPayload 0 0 ""
+                    logWarning (mkLogPayload (lamSrcInfo lam)
                         ("[coverage] non-exhaustive pattern match in " ++ funcName
                          ++ ": missing " ++ Data.List.intercalate ", " missing
                          ++ " from type " ++ typName ++ "\n"))

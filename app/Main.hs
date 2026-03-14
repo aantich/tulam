@@ -3,6 +3,7 @@ module Main where
 
 import System.Console.Haskeline
 import System.Directory
+import System.Environment (getArgs)
 import System.FilePath (takeDirectory)
 import System.Exit
 import Control.Monad.IO.Class (liftIO)
@@ -10,6 +11,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict -- trying state monad transformer to maintain state
 import State
 import Control.Monad (zipWithM_, void, when, forM_)
+import Data.List (intercalate, partition, sort, sortBy, isPrefixOf)
 
 import qualified Data.Text.IO as T (readFile)
 import qualified Data.Text as T
@@ -17,13 +19,14 @@ import qualified Data.Text.Lazy as TL
 
 import Surface
 import Pipeline
-import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness)
+import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass)
 import TypeCheck (typeCheckPass)
 import CLM (pprSummary)
 import Interpreter
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
-import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses, extractDependencies, resolveModulePath)
+import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses, extractDependencies, resolveModulePath, extractModulePath)
+import qualified Data.Set as Set
 import Interface (cacheVersion, toCachePath, ensureCacheDir)
 import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 import Backends.LLVM.NativeCompile (compileNative, CompileResult(..), NativeConfig(..), defaultNativeConfig)
@@ -33,12 +36,26 @@ import Backends.Bytecode.Module (dumpModule)
 import Text.Pretty.Simple (pPrint, pShow)
 
 import Data.HashMap.Strict as Map
-import Data.List (sort, sortBy, intercalate, isPrefixOf)
+-- Data.List already imported above
 
 import Parser as Lambda
 
 -- need this 4-monad stack to make sure Haskeline works with our state monad
 type InputTState = InputT IntState
+
+-- | Print only when verbosity >= given level
+logAt :: Verbosity -> String -> IntState ()
+logAt minLevel msg = do
+    v <- gets (verbosity . currentFlags)
+    when (v >= minLevel) $ liftIO $ putStrLn msg
+
+-- | Print progress info (pass names, file loading) — requires Normal or higher
+logProgress :: String -> IntState ()
+logProgress = logAt Normal
+
+-- | Print verbose/debug info — requires Verbose
+logDetail :: String -> IntState ()
+logDetail = logAt Verbose
 
 processNew :: T.Text -> IntState ()
 processNew line = do
@@ -77,7 +94,7 @@ showHelp = do
     putStrLn ":q[uit]           -- quit"
     putStrLn ":a[ll]            -- list everything that was parsed, -d - in core format"
     putStrLn ":l[oad] <name>    -- load and interpret file <name>"
-    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off, :s verbose on/off, :s stricttypes on/off)"
+    putStrLn ":s[et] <command>  -- set environment flags (:s trace on/off, :s verbose on/off, :s verbosity silent/errors/warnings/normal/verbose, :s stricttypes on/off)"
     putStrLn ":s optimize on/off      -- toggle all CLM optimization passes"
     putStrLn ":s opt:list             -- show all passes with status"
     putStrLn ":s opt:<name> on/off    -- toggle individual pass"
@@ -259,9 +276,10 @@ ppExprFull ind (Structure lam si) =
     ++ pprExtends (structExtends si)
     ++ pprRequires (structRequires si)
     ++ ppBody ind (body lam)
-ppExprFull ind (Instance nm targs impls reqs) =
+ppExprFull ind (Instance nm mTag targs impls reqs) =
     indent ind ++ TC.as [bold, green] "instance " ++ nm
     ++ showListRoBr ppr targs
+    ++ maybe "" (\t -> " as " ++ t) mTag
     ++ pprRequires reqs ++ " =\n"
     ++ unlines' (Prelude.map (ppExprFull (ind + 2)) impls)
 ppExprFull ind (ClassDecl lam ci) =
@@ -645,12 +663,38 @@ processSet "trace" ("off":_) = do
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "tracing off"
 
 processSet "verbose" ("on":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { verbose = True} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose on"
+    modify (\st -> st { currentFlags = (currentFlags st) { verbosity = Verbose} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbosity verbose"
 
 processSet "verbose" ("off":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { verbose = False} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbose off"
+    modify (\st -> st { currentFlags = (currentFlags st) { verbosity = Normal} } )
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "verbosity normal"
+
+processSet "verbosity" (level:_) = case level of
+    "silent"   -> setV Silent
+    "errors"   -> setV Errors
+    "warnings" -> setV Warnings
+    "normal"   -> setV Normal
+    "verbose"  -> setV Verbose
+    _          -> liftIO $ putStrLn "Usage: :s verbosity silent|errors|warnings|normal|verbose"
+  where
+    setV v = do
+        modify (\st -> st { currentFlags = (currentFlags st) { verbosity = v } })
+        liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] ("verbosity " ++ show v)
+
+processSet "errors" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { showErrors = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "errors on"
+processSet "errors" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { showErrors = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "errors off"
+
+processSet "warnings" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { showWarnings = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "warnings on"
+processSet "warnings" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { showWarnings = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "warnings off"
 
 processSet "positivity" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { checkPositivity = True} } )
@@ -755,23 +799,41 @@ setOptPass nm val = do
 
 loadFileNew :: String -> IntState ()
 loadFileNew nm = do
-    liftIO $ putStrLn $ "Loading file: " ++ nm
+    -- Check if module is already loaded (skip re-compilation)
+    st0Pre <- get
+    let modKey0 = filePathToModuleKey nm
+        loaded0 = loadedModules (currentModuleEnv st0Pre)
+    if Map.member modKey0 loaded0
+      then logProgress $ "Module already loaded: " ++ nm
+      else loadFileNewImpl nm
+
+loadFileNewImpl :: String -> IntState ()
+loadFileNewImpl nm = do
+    logProgress $ "Loading file: " ++ nm
     -- Add the file's directory to search paths so imports resolve relative to it
     let fileDir = takeDirectory nm
     st0 <- get
     when (fileDir /= "" && fileDir `notElem` libSearchPaths st0) $
         modify (\s -> s { libSearchPaths = fileDir : libSearchPaths s })
     fileText <- liftIO (T.readFile nm)
+    -- Save and clear parsedModule so we only parse/check THIS file's expressions
+    stPre <- get
+    let prevParsedModule = parsedModule stPre
+    put $ stPre { parsedModule = [] }
     res <- parseWholeFile fileText nm
     st <- get
     let srcs = Map.insert nm fileText (loadedSources st)
     put $ st { currentSource = fileText, loadedSources = srcs }
     -- liftIO $ print st
     case res of
-        Left err -> liftIO ( putStrLn $ "There were " ++ TC.as [TC.red] "parsing errors:") >> liftIO (putStrLn $ showSyntaxError fileText err)
+        Left err -> do
+            modify (\s -> s { parsedModule = prevParsedModule })
+            liftIO ( putStrLn $ "There were " ++ TC.as [TC.red] "parsing errors:") >> liftIO (putStrLn $ showSyntaxError fileText err)
         Right exprs -> do
-                -- Resolve and load any imported modules this file needs
+                -- Save this module's parsedModule BEFORE loading deps
+                -- (dep loading adds to parsedModule via loadFileQuiet)
                 st1 <- get
+                let thisModuleOnly = parsedModule st1
                 let deps = extractDependencies exprs
                 when (not (Prelude.null deps)) $ do
                     let searchPaths = libSearchPaths st1
@@ -781,53 +843,78 @@ loadFileNew nm = do
                         let depKey = intercalate "." depPath
                         loaded <- gets (loadedModules . currentModuleEnv)
                         when (not (Map.member depKey loaded)) $ do
-                            liftIO $ putStrLn $ "  Loading dependency: " ++ depKey
+                            logProgress $ "  Loading dependency: " ++ depKey
                             loadFileQuiet depFile
-                liftIO (putStrLn "... successfully loaded.")
-                liftIO (putStrLn $ "Received " ++ show (length (parsedModule st)) ++ " statements.")
-                liftIO (putStrLn $ "Executing pass 0: " ++ TC.as [TC.bold, TC.underlined] "after parser desugaring")
+                -- Restore parsedModule to ONLY this module's expressions for passes
+                modify (\s -> s { parsedModule = thisModuleOnly })
+                logProgress "... successfully loaded."
+                logDetail $ "Received " ++ show (length thisModuleOnly) ++ " statements."
+                logDetail $ "Executing pass 0: " ++ TC.as [TC.bold, TC.underlined] "after parser desugaring"
                 timedPass "Pass 0 (desugar)" afterparserPass
-                showAllLogsWSource
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 0.25: " ++ TC.as [TC.bold, TC.underlined] "string literal desugaring")
+                flushLogs
+                logDetail $ "Executing pass 0.25: " ++ TC.as [TC.bold, TC.underlined] "string literal desugaring"
                 timedPass "Pass 0.25 (string desugar)" stringLiteralDesugarPass
-                showAllLogsWSource
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 0.5: " ++ TC.as [TC.bold, TC.underlined] "action block desugaring")
+                flushLogs
+                logDetail $ "Executing pass 0.5: " ++ TC.as [TC.bold, TC.underlined] "action block desugaring"
                 timedPass "Pass 0.5 (action desugar)" actionDesugarPass
-                showAllLogsWSource
-                clearAllLogs
-                processCommand ([":e"])
-                liftIO (putStrLn $ "Executing pass 1: " ++ TC.as [TC.bold, TC.underlined] "initial top level environment building")
+                flushLogs
+                -- Environment dump only at Verbose level
+                v <- gets (verbosity . currentFlags)
+                when (v >= Verbose) $ processCommand ([":e"])
+                logDetail $ "Executing pass 1: " ++ TC.as [TC.bold, TC.underlined] "initial top level environment building"
                 timedPass "Pass 1 (env build)" buildEnvPass
-                showAllLogsWSource
-                processCommand ([":e"])
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 1.5: " ++ TC.as [TC.bold, TC.underlined] "record desugaring")
+                flushLogs
+                when (v >= Verbose) $ processCommand ([":e"])
+                logDetail $ "Executing pass 1.5: " ++ TC.as [TC.bold, TC.underlined] "record desugaring"
                 timedPass "Pass 1.5 (record desugar)" recordDesugarPass
-                showAllLogsWSource
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 2: " ++ TC.as [TC.bold, TC.underlined] "initial optimizations")
+                flushLogs
+                logDetail $ "Executing pass 2: " ++ TC.as [TC.bold, TC.underlined] "initial optimizations"
                 timedPass "Pass 2 (case opt)" caseOptimizationPass
                 checkSealedExhaustiveness
-                showAllLogsWSource
-                processCommand ([":e"])
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking")
-                timedPass "Pass 3 (typecheck)" typeCheckPass
-                showAllLogsWSource
-                processCommand ([":e"])
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM")
+                flushLogs
+                when (v >= Verbose) $ processCommand ([":e"])
+                -- Check if all imported modules are loaded; defer TC if not
+                stPreTC <- get
+                let importedKeys = [intercalate "." d | d <- deps]
+                    loadedKeys = loadedModules (currentModuleEnv stPreTC)
+                    missingKeys = [k | k <- importedKeys, not (Map.member k loadedKeys)]
+                    thisModuleParsed = parsedModule stPreTC
+                if Prelude.null missingKeys
+                  then do
+                    logDetail $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking"
+                    modify (\s -> s { tcErrorCount = 0 })
+                    timedPass "Pass 3 (typecheck)" typeCheckPass
+                    terminationCheckPass
+                    flushLogs
+                  else do
+                    logProgress $ "  Deferring type check: imports not yet loaded: " ++ intercalate ", " missingKeys
+                    modify (\s -> s { deferredTCModules =
+                        (nm, thisModuleParsed, missingKeys) : deferredTCModules s })
+                when (v >= Verbose) $ processCommand ([":e"])
+                logDetail $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM"
                 timedPass "Pass 4 (CLM)" lamToCLMPass
-                showAllLogsWSource
-                processCommand ([":e"])
-                clearAllLogs
-                liftIO (putStrLn $ "Executing pass 4.5: " ++ TC.as [TC.bold, TC.underlined] "CLM optimization")
+                flushLogs
+                when (v >= Verbose) $ processCommand ([":e"])
+                logDetail $ "Executing pass 4.5: " ++ TC.as [TC.bold, TC.underlined] "CLM optimization"
                 timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
-                showAllLogsWSource
-                clearAllLogs
-                processCommand([":h"])
+                flushLogs
+                -- Restore accumulated parsedModule (this module's + previous)
+                stAfterPasses <- get
+                let allParsed = parsedModule stAfterPasses ++ prevParsedModule
+                put $ stAfterPasses { parsedModule = allParsed }
+                -- Register this module so subsequent loads don't re-load it
+                let modPath = extractModulePath exprs
+                    modKey = case modPath of
+                        [] -> nm
+                        path -> intercalate "." path
+                stFinal <- get
+                let menv = currentModuleEnv stFinal
+                    newNames = allEnvNames (currentEnvironment stFinal)
+                    entry = ModuleEnv modPath newNames Set.empty [] [] Map.empty
+                    menv' = menv { loadedModules = Map.insert modKey entry (loadedModules menv) }
+                put $ stFinal { currentModuleEnv = menv' }
+                -- Run deferred TC for any modules whose deps are now all loaded
+                runDeferredTC
                 -- liftIO (putStrLn $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "javascript code generation")
                 -- compile2JSpass
                 -- showAllLogsWSource
@@ -836,6 +923,62 @@ loadFileNew nm = do
                 -- liftIO (mapM_ (\(ex,_) -> (putStrLn . show) ex ) mod )
 
 
+-- | Run deferred type checking for modules whose imports are now all loaded.
+-- Uses a fixpoint loop: newly registered modules may unblock other deferred modules.
+runDeferredTC :: IntState ()
+runDeferredTC = do
+    st <- get
+    let deferred = deferredTCModules st
+        loaded = loadedModules (currentModuleEnv st)
+        (ready, stillDeferred) = partition
+            (\(_, _, missing) -> Prelude.all (`Map.member` loaded) missing)
+            deferred
+    put $ st { deferredTCModules = stillDeferred }
+    forM_ ready $ \(modNm, modParsed, _) -> do
+        logProgress $ "  Running deferred type check: " ++ modNm
+        -- Temporarily set parsedModule to this module's expressions
+        stBefore <- get
+        let prevPM = parsedModule stBefore
+        put $ stBefore { parsedModule = modParsed }
+        modify (\s -> s { tcErrorCount = 0 })
+        timedPass "Pass 3 (deferred typecheck)" typeCheckPass
+        terminationCheckPass
+        flushLogs
+        -- Restore parsedModule
+        modify (\s -> s { parsedModule = prevPM })
+        -- Register module so other deferred modules can proceed
+        registerModuleByPath modNm
+    -- Fixpoint: re-check if newly registered modules unblock others
+    st' <- get
+    when (not (Prelude.null ready) && not (Prelude.null (deferredTCModules st'))) $
+        runDeferredTC
+
+-- | Register a module in loadedModules by its file path.
+-- Extracts the module key from the file path and registers it.
+registerModuleByPath :: String -> IntState ()
+registerModuleByPath nm = do
+    st <- get
+    let modKey = filePathToModuleKey nm
+        menv = currentModuleEnv st
+        newNames = allEnvNames (currentEnvironment st)
+        entry = ModuleEnv [] newNames Set.empty [] [] Map.empty
+        menv' = menv { loadedModules = Map.insert modKey entry (loadedModules menv) }
+    put $ st { currentModuleEnv = menv' }
+
+-- | Convert a file path to a module key.
+-- e.g. "lib/Reflection.tl" -> "Reflection", "lib/Instances/Nat.tl" -> "Instances.Nat"
+filePathToModuleKey :: String -> String
+filePathToModuleKey path =
+    let stripped = stripPrefix "lib/" path
+        noExt = stripSuffix ".tl" stripped
+    in Prelude.map (\c -> if c == '/' then '.' else c) noExt
+  where
+    stripPrefix pfx s = if pfx `isPrefixOf` s then drop (length pfx) s else s
+    stripSuffix sfx s =
+        let rs = reverse s
+            rsfx = reverse sfx
+        in if rsfx `isPrefixOf` rs then reverse (drop (length sfx) rs) else s
+
 -- Haskeline loop stacked into 3-monad stack
 loop :: InputTState ()
 loop = do
@@ -843,26 +986,33 @@ loop = do
         case minput of
             Nothing -> outputStrLn "Goodbye."
             Just input -> case input of
-                [] -> liftIO showHelp >> loop
+                [] -> loop  -- empty line, just continue
                 -- if starts with ":" - then it's a command
                 (':':_) -> lift (processCommand (words input)) >> loop
                 -- otherwise parsing our language input
                 _ -> lift (processNew $ T.pack input) >> loop
 
-runInterpreter :: InputTState ()
-runInterpreter = do
-    liftIO $ putStrLn "Loading standard library..."
-    lift $ loadModuleTree baseModulePath
-    lift $ installDefaultHandlers
-    liftIO $ putStrLn "Ready."
+runInterpreter :: Bool -> InputTState ()
+runInterpreter noStdlib = do
+    if noStdlib
+        then do
+            liftIO $ putStrLn "Skipping standard library (--nostdlib)."
+            liftIO $ putStrLn "Ready."
+        else do
+            liftIO $ putStrLn "Loading standard library..."
+            lift $ loadModuleTree baseModulePath
+            lift $ installDefaultHandlers
+            liftIO $ putStrLn "Ready."
     loop
 
 main :: IO ()
 main = do
+    args <- getArgs
+    let noStdlib = "--nostdlib" `elem` args
     greetings
     -- setting up Haskeline loop
     -- getting to the right monad in our crazy monad stack
-    initializeInterpreter >>= (runIntState (runInputT defaultSettings {historyFile=Just "./.tulam_history"} runInterpreter))
+    initializeInterpreter >>= (runIntState (runInputT defaultSettings {historyFile=Just "./.tulam_history"} (runInterpreter noStdlib)))
 
 greetings = do
     putStrLn "Welcome to tulam!"

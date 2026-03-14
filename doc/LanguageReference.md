@@ -1398,6 +1398,26 @@ instance Monoid(Nat) = {
 // combine is now available via both Semigroup(Nat) and Monoid(Nat)
 ```
 
+### Named Algebra Synonyms (`as` in `extends`)
+
+A type may need multiple instances of the same algebra (e.g., integers have both additive and multiplicative monoid structure). Named synonyms distinguish them using `as`:
+
+```
+algebra Semiring(a:Type) extends Monoid(a) as Additive, Monoid(a) as Multiplicative = {
+    function (+)(x:a, y:a) : a requires Monoid(a) as Additive = combine(x, y);
+    function (*)(x:a, y:a) : a requires Monoid(a) as Multiplicative = combine(x, y);
+    value zero : a requires Monoid(a) as Additive = empty;
+    value one : a requires Monoid(a) as Multiplicative = empty;
+};
+```
+
+The `as Tag` syntax:
+- In `extends`: declares that the parent algebra is used under a named tag
+- In `requires`: references a specific tagged instance for dispatch
+- Enables the same type to have multiple instances of the same algebra, each with different implementations (e.g., `combine` means addition under `Additive`, multiplication under `Multiplicative`)
+
+The full numeric hierarchy uses this pattern: `Ring` extends `Semiring` + `Group as Additive`, `Field` extends `CommutativeRing` + `Group as Multiplicative`.
+
 ---
 
 ## External Constraints (`requires`)

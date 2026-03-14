@@ -31,11 +31,11 @@ import qualified Data.HashSet as Set
 import qualified Debug.Trace
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 
--- | Wrap a pass with wall-clock timing when verbose is on
+-- | Wrap a pass with wall-clock timing when verbosity >= Verbose
 timedPass :: String -> IntState () -> IntState ()
 timedPass name action = do
-    v <- verbose . currentFlags <$> get
-    if v
+    v <- verbosity . currentFlags <$> get
+    if v >= Verbose
     then do
         t0 <- liftIO getCurrentTime
         action
@@ -430,11 +430,11 @@ processBinding ( st@(Structure lam sinfo), si) env = do
         SGeneral  -> pure ()
 
     -- Resolve extends: inherit parent functions and laws
-    lam' <- resolveExtends env lam (structExtends sinfo)
+    lam' <- resolveExtends env lam (structExtends sinfo) si
 
-    -- Register inheritance
-    let parentNames = [n | ext <- structExtends sinfo, let n = extractStructRefName ext, n /= ""]
-    let env0 = registerInheritance (lamName lam') parentNames env
+    -- Register inheritance (with optional tags from NamedRef)
+    let parentEntries = [(n, extractNamedRefTag ext) | ext <- structExtends sinfo, let n = extractStructRefName ext, n /= ""]
+    let env0 = registerInheritance (lamName lam') parentEntries env
 
     -- Validate requires
     validateRequires env0 (structRequires sinfo) si
@@ -471,7 +471,7 @@ processBinding ( st@(Structure lam sinfo), si) env = do
 
 -- instance declaration processing
 -- instance Eq(Nat) = { function (==)(x:Nat,y:Nat):Bool = eq(x,y) }
-processBinding (Instance structName typeArgs impls reqs, si) env = do
+processBinding (Instance structName mTag typeArgs impls reqs, si) env = do
     -- Validate requires (basic structure existence check)
     validateRequires env reqs si
     -- extract all type names from type args (e.g., [Id "Nat", Id "Bool"] -> ["Nat", "Bool"])
@@ -521,7 +521,7 @@ processBinding (Instance structName typeArgs impls reqs, si) env = do
                                      ++ [name v | Value v _ <- exs]
                         let intrinsicImpls = [Function (mkLambda fn [] Intrinsic UNDEFINED) | fn <- funcNames]
                         let env' = Prelude.foldl (\e fn ->
-                                addInstanceLambda fn typeNames
+                                addInstanceLambda fn typeNames mTag
                                     (mkLambda fn [] Intrinsic UNDEFINED) e
                                 ) env funcNames
                         env'' <- propagateToParent env' structName typeNames intrinsicImpls si
@@ -538,7 +538,7 @@ processBinding (Instance structName typeArgs impls reqs, si) env = do
             -- for each function in the instance, store a specialized lambda
             env' <- foldM (addInstanceFunc typeNames) env impls
             -- validate minimal definition completeness (before default propagation)
-            validateMinimalDefinition structName typeNames env' si
+            validateMinimalDefinition structName typeNames mTag env' si
             -- propagate default methods from the structure itself
             env'a <- propagateDefaults typeNames env' structName
             -- propagate instance functions to parent structures
@@ -549,11 +549,11 @@ processBinding (Instance structName typeArgs impls reqs, si) env = do
     where
         addInstanceFunc typeNms env1 (Function lam) = do
             let funcNm = lamName lam
-            pure $ addInstanceLambda funcNm typeNms lam env1
+            pure $ addInstanceLambda funcNm typeNms mTag lam env1
         -- value declarations are desugared to nullary functions by afterparse
         addInstanceFunc typeNms env1 (Value v ex) = do
             let lam = mkLambda (name v) [] ex (typ v)
-            pure $ addInstanceLambda (name v) typeNms lam env1
+            pure $ addInstanceLambda (name v) typeNms mTag lam env1
         addInstanceFunc _ env1 e = do
             logWarning (mkLogPayload si
                     ("Invalid expression inside instance declaration, expected function: "
@@ -581,8 +581,8 @@ processBinding (Repr userTypeExpr reprTypeExpr isDefault fns maybeInv, si) env =
                     Nothing -> addNamedLambda fromRWrapper env1
                     Just _  -> env1
             -- Register as instance lambdas for type-directed dispatch
-            let env3 = addInstanceLambda "toRepr" [userTypeName] toR env2
-            let env4 = addInstanceLambda "fromRepr" [reprTypeName] fromR env3
+            let env3 = addInstanceLambda "toRepr" [userTypeName] Nothing toR env2
+            let env4 = addInstanceLambda "fromRepr" [reprTypeName] Nothing fromR env3
             -- Store in repr map
             pure $ addRepr userTypeName reprTypeName isDefault toR fromR maybeInv env4
         _ -> do
@@ -652,7 +652,7 @@ processBinding (HandlerDecl handlerName effName isDefault hParams impls, si) env
   where
     registerHandlerImpl eName env0 (Function lam) = do
         let funcNm = lamName lam
-        pure $ addInstanceLambda funcNm [eName] lam env0
+        pure $ addInstanceLambda funcNm [eName] Nothing lam env0
     registerHandlerImpl _ env0 _ = pure env0
 
 processBinding (ex, si) env = do
@@ -668,7 +668,7 @@ processBinding (ex, si) env = do
 -- Instances and handlers are stored in target-qualified maps (not in the main env).
 -- Other declarations inside target blocks are silently ignored.
 processTargetDecl :: Name -> SourceInfo -> Environment -> Expr -> IntState Environment
-processTargetDecl targetName si env (Instance structName typeArgs impls _reqs) = do
+processTargetDecl targetName si env (Instance structName _mTag typeArgs impls _reqs) = do
     let extractTypeName (Id nm) = Just nm
         extractTypeName (App (Id nm) _) = Just nm
         extractTypeName _ = Nothing
@@ -693,10 +693,10 @@ processTargetDecl targetName si env expr = do
 -- | Add a function/value from a target block instance to target-qualified storage.
 addTargetInstanceFunc :: Name -> Name -> [Name] -> SourceInfo -> Environment -> Expr -> IntState Environment
 addTargetInstanceFunc targetName _structName typeNames _si env (Function lam) =
-    pure $ addTargetInstance targetName (lamName lam) typeNames lam env
+    pure $ addTargetInstance targetName (lamName lam) typeNames Nothing lam env
 addTargetInstanceFunc targetName _structName typeNames _si env (Value v ex) =
     let lam = mkLambda (name v) [] ex (typ v)
-    in pure $ addTargetInstance targetName (name v) typeNames lam env
+    in pure $ addTargetInstance targetName (name v) typeNames Nothing lam env
 addTargetInstanceFunc targetName _structName _typeNames si env expr = do
     logWarning (mkLogPayload si
         ("Target " ++ targetName ++ ": invalid expression inside instance, expected function: " ++ ppr expr ++ "\n"))
@@ -720,7 +720,7 @@ generateClassAlgebraInstance className ownMethods si env algebraName = do
             then do
                 -- Register each matched method as an instance lambda
                 let env' = Prelude.foldl (\e (fn, l) ->
-                        addInstanceLambda fn [className] l e
+                        addInstanceLambda fn [className] Nothing l e
                         ) env matchedImpls
                 -- Propagate to parent structures and compose morphisms
                 let implExprs = [Function l | (_, l) <- matchedImpls]
@@ -736,7 +736,7 @@ generateClassAlgebraInstance className ownMethods si env algebraName = do
                 deriveExprs -> do
                     -- Fall back to auto-derive
                     let env' = Prelude.foldl (\e expr -> case expr of
-                            Function l -> addInstanceLambda (lamName l) [className] l e
+                            Function l -> addInstanceLambda (lamName l) [className] Nothing l e
                             _ -> e
                             ) env deriveExprs
                     env'' <- propagateToParent env' algebraName [className] deriveExprs si
@@ -758,14 +758,20 @@ buildPrimitivePass = pure ()
 
 -- Extract structure name from a structure reference (Id "Eq" or App (Id "Eq") [Id "a"])
 extractStructRefName :: Expr -> Name
+extractStructRefName (NamedRef e _) = extractStructRefName e
 extractStructRefName (Id nm)       = nm
 extractStructRefName (App (Id nm) _) = nm
 extractStructRefName _             = ""
 
+-- Extract the optional tag from a NamedRef (e.g., Semigroup(a) as Additive → Just "Additive")
+extractNamedRefTag :: Expr -> Maybe Name
+extractNamedRefTag (NamedRef _ tag) = Just tag
+extractNamedRefTag _                = Nothing
+
 -- Resolve extends: inherit parent functions and laws into child structure
-resolveExtends :: Environment -> Lambda -> [Expr] -> IntState Lambda
-resolveExtends _   lam [] = pure lam
-resolveExtends env lam extends = do
+resolveExtends :: Environment -> Lambda -> [Expr] -> SourceInfo -> IntState Lambda
+resolveExtends _   lam [] _ = pure lam
+resolveExtends env lam extends si = do
     -- Step 2: Validate extends-reference arguments are valid child parameters
     let childParamNames = [name v | v <- params lam]
     mapM_ (validateExtendsArgs childParamNames) extends
@@ -784,7 +790,7 @@ resolveExtends env lam extends = do
         let refArgNames = extractRefArgNames ref
         let invalid = Prelude.filter (`Prelude.notElem` childParamNames) refArgNames
         unless (Prelude.null invalid) $
-            logWarning (mkLogPayload SourceInteractive
+            logWarning (mkLogPayload si
                 ("extends: unknown type params " ++ show invalid
                     ++ " in " ++ ppr ref ++ " for structure " ++ lamName lam ++ "\n"))
     extractRefArgNames (App _ args) = [n | Id n <- args]
@@ -796,7 +802,7 @@ resolveExtends env lam extends = do
                 DeclBlock exs -> pure exs
                 _             -> pure []
             _ -> do
-                logWarning (mkLogPayload SourceInteractive
+                logWarning (mkLogPayload si
                     ("extends: parent structure " ++ parentName ++ " not found in environment\n"))
                 pure []
     notOverridden childNames (Function l) = lamName l `Prelude.notElem` childNames
@@ -807,42 +813,49 @@ resolveExtends env lam extends = do
 -- When instance Child(T) is declared, also register functions for parent structures
 propagateToParent :: Environment -> Name -> [Name] -> [Expr] -> SourceInfo -> IntState Environment
 propagateToParent env structName typeNames impls si = do
-    let allParents = getAllParents structName env
+    let allParentsWithTags = getAllParentsWithTags structName env
     -- filter out the structure itself from parents list
-    let parents = Prelude.filter (/= structName) allParents
+    let parents = Prelude.filter ((/= structName) . fst) allParentsWithTags
     if Prelude.null parents then pure env
     else do
-        -- For each parent, for each impl function, check if function belongs to parent
+        -- For each parent (with tag), for each impl function, check if function belongs to parent
         env' <- foldM (propagateOne impls) env parents
         -- Step 4: Propagate default methods from parent structures
-        env'' <- foldM (propagateDefaults typeNames) env' parents
+        env'' <- foldM (propagateDefaultsTagged typeNames) env' parents
         -- Step 3: Validate parent instances are complete
-        mapM_ (\pn -> validateParentInstance env'' typeNames pn si) parents
+        mapM_ (\(pn, _) -> validateParentInstance env'' typeNames pn si) parents
         pure env''
   where
-    propagateOne impls' env1 parentName = do
+    propagateOne impls' env1 (parentName, parentTag) = do
         -- Look up the parent structure to find its function names
         case lookupType parentName env1 of
             Just (Structure parentLam _) -> case body parentLam of
                 DeclBlock exs -> do
                     let parentFuncNames = [lamName l | Function l <- exs]
                                         ++ [name v | Value v _ <- exs]
-                    -- For each impl that's a parent function, also add to parent
-                    foldM (addIfParent parentFuncNames) env1 impls'
+                    -- For each impl that's a parent function, also add to parent (with tag)
+                    foldM (addIfParent parentFuncNames parentTag) env1 impls'
                 _ -> pure env1
             _ -> pure env1
-    addIfParent parentFuncNames env1 (Function lam)
+    addIfParent parentFuncNames parentTag env1 (Function lam)
       | lamName lam `Prelude.elem` parentFuncNames =
-          pure $ addInstanceLambda (lamName lam) typeNames lam env1
+          pure $ addInstanceLambda (lamName lam) typeNames parentTag lam env1
       | otherwise = pure env1
-    addIfParent _ env1 _ = pure env1
+    addIfParent _ _ env1 _ = pure env1
+    -- Propagate defaults with tag awareness
+    propagateDefaultsTagged tns env1 (parentName, parentTag) = do
+        propagateDefaultsWithTag tns parentTag env1 parentName
 
 -- Propagate default methods from parent structure definitions to instances.
 -- Uses fixpoint resolution: only propagate a default if all the algebra functions
 -- it references are already resolved (provided by instance or by a previously resolved default).
 -- This prevents infinite recursion from mutual defaults (e.g. == and != both defaulting to each other).
 propagateDefaults :: [Name] -> Environment -> Name -> IntState Environment
-propagateDefaults typeNames env1 parentName = do
+propagateDefaults typeNames env1 parentName = propagateDefaultsWithTag typeNames Nothing env1 parentName
+
+-- Tag-aware version: when parent has a tag (e.g., Monoid as Additive), use it in instance keys
+propagateDefaultsWithTag :: [Name] -> Maybe Name -> Environment -> Name -> IntState Environment
+propagateDefaultsWithTag typeNames mTag env1 parentName = do
     case lookupType parentName env1 of
         Just (Structure parentLam _) -> case body parentLam of
             DeclBlock exs -> do
@@ -854,13 +867,13 @@ propagateDefaults typeNames env1 parentName = do
                                    | (n, l) <- allFuncs, body l /= UNDEFINED]
                 -- Start with functions already provided by the instance
                 let provided = Set.fromList [n | (n, _) <- allFuncs,
-                                             not (isNothing (lookupInstanceLambda n typeNames env1))]
+                                             not (isNothing (lookupInstanceLambda n typeNames mTag env1))]
                 -- Fixpoint: repeatedly resolve defaults whose deps are all provided
                 let (finalProvided, resolvedDefaults) = fixpointResolve provided withDefaults
                 -- Register resolved defaults
                 env2 <- foldM (\e (fn, defLam) ->
-                    if isNothing (lookupInstanceLambda fn typeNames e)
-                    then pure $ addInstanceLambda fn typeNames defLam e
+                    if isNothing (lookupInstanceLambda fn typeNames mTag e)
+                    then pure $ addInstanceLambda fn typeNames mTag defLam e
                     else pure e
                     ) env1 resolvedDefaults
                 pure env2
@@ -900,17 +913,24 @@ fixpointResolve provided defaults =
 --   2. Mutual-default cycles where instance provides NONE from the cycle → warning
 --      (might infinite-loop; provide at least one to be safe)
 -- Functions with defaults that have all deps resolved (including self-sufficient groups) are fine.
-validateMinimalDefinition :: Name -> [Name] -> Environment -> SourceInfo -> IntState ()
-validateMinimalDefinition structName typeNames env si = do
+validateMinimalDefinition :: Name -> [Name] -> Maybe Name -> Environment -> SourceInfo -> IntState ()
+validateMinimalDefinition structName typeNames mTag env si = do
     case lookupType structName env of
         Just (Structure structLam _) -> case body structLam of
             DeclBlock exs -> do
-                let allFuncs = [(lamName l, l) | Function l <- exs]
+                let rawFuncs = [(lamName l, l) | Function l <- exs]
                         ++ [(name v, mkLambda (name v) [] ex (typ v)) | Value v ex <- exs]
+                -- Deduplicate: when a function appears twice (declaration + default),
+                -- keep the entry with the non-UNDEFINED body (the default implementation).
+                let allFuncs = Map.toList $ Prelude.foldl (\m (n, l) ->
+                        case Map.lookup n m of
+                            Just existing | body existing /= UNDEFINED -> m  -- keep existing default
+                            _ -> Map.insert n l m
+                        ) Map.empty rawFuncs
                 let allFuncNames = Set.fromList [n | (n, _) <- allFuncs]
                 -- Functions NOT provided by the instance (before default propagation)
                 let instanceProvided = Set.fromList [n | (n, _) <- allFuncs,
-                        not (isNothing (lookupInstanceLambda n typeNames env))]
+                        not (isNothing (lookupInstanceLambda n typeNames mTag env))]
                 -- 1. Functions with no default that the instance didn't provide
                 let noDefault = [n | (n, l) <- allFuncs,
                         body l == UNDEFINED, not (Set.member n instanceProvided)]
@@ -919,19 +939,32 @@ validateMinimalDefinition structName typeNames env si = do
                 let notProvided = [(n, l) | (n, l) <- allFuncs,
                         body l /= UNDEFINED, not (Set.member n instanceProvided)]
                 let notProvidedNames = Set.fromList [n | (n, _) <- notProvided]
-                -- For each not-provided default, find deps within not-provided set
-                let deps = [(n, Set.intersection notProvidedNames
-                            (Set.fromList (Prelude.filter (`Set.member` allFuncNames) (collectIdRefs (body l)))))
+                -- For each not-provided default, find ALL algebra deps
+                let deps = [(n, Set.fromList (Prelude.filter (`Set.member` allFuncNames) (collectIdRefs (body l))))
                            | (n, l) <- notProvided]
-                -- Find pure mutual cycles: functions that ONLY depend on other not-provided defaults
-                -- These are OK if they have base cases (we can't check), but warn if the cycle is "tight"
-                -- (every member references at least one other member — classic Eq == / != pattern)
+                let depsMap = Map.fromList deps
+                -- Find true mutual cycles via transitive reachability analysis.
+                -- A function is safe if its transitive dep chain reaches a function
+                -- outside notProvidedNames (a provided method or a no-default core method).
+                -- Only warn about functions whose ENTIRE transitive closure stays
+                -- within notProvidedNames (true cycle with no escape).
+                let reachesProvided n = go Set.empty n
+                      where
+                        go visited node
+                          | Set.member node visited = False  -- cycle, no escape found
+                          | otherwise =
+                              let nodeDeps = maybe Set.empty id (Map.lookup node depsMap)
+                                  -- Any dep outside notProvidedNames means escape to provided
+                                  escapes = Set.difference nodeDeps notProvidedNames
+                              in if not (Set.null escapes) then True
+                                 else Prelude.any (go (Set.insert node visited))
+                                      (Set.toList (Set.intersection nodeDeps notProvidedNames))
                 let tightCycle = [n | (n, ds) <- deps,
-                        not (Set.null (Set.intersection ds notProvidedNames)),
-                        -- Only warn if deps are within the not-provided set (true cycle)
-                        Set.isSubsetOf ds notProvidedNames,
-                        -- Don't warn about self-recursion only (that's normal recursion)
-                        not (Set.isSubsetOf ds (Set.singleton n))]
+                        not (Set.null ds),
+                        -- Don't warn about self-recursion only
+                        not (Set.isSubsetOf ds (Set.singleton n)),
+                        -- Only warn if NO transitive path reaches a provided function
+                        not (reachesProvided n)]
                 let typeStr = intercalate ", " typeNames
                 -- Only emit warnings if there are actual issues
                 unless (Prelude.null noDefault) $
@@ -976,23 +1009,23 @@ composeMorphismInstances env structName typeNames si = do
     -- Compose M(X, B) from M(X, A) + M(A, B)
     composeXAB funcNm tA tB env1 (tX, _) =
         -- Check no direct instance exists already and no self-loop
-        case lookupInstanceLambda funcNm [tX, tB] env1 of
+        case lookupInstanceLambda funcNm [tX, tB] Nothing env1 of
             Just _ -> pure env1  -- direct instance exists, prefer it
             Nothing | tX == tB -> pure env1  -- avoid identity loops
             Nothing ->
                 -- Generate: function f(x:X) : B = f_AB(f_XA(x))
                 let composedLam = mkLambda funcNm [Var "__x" (Id tX) UNDEFINED]
                         (App (Id funcNm) [App (Id funcNm) [Id "__x"]]) (Id tB)
-                in pure $ addInstanceLambda funcNm [tX, tB] composedLam env1
+                in pure $ addInstanceLambda funcNm [tX, tB] Nothing composedLam env1
     -- Compose M(A, Y) from M(A, B) + M(B, Y)
     composeABY funcNm tA tB env1 (_, tY) =
-        case lookupInstanceLambda funcNm [tA, tY] env1 of
+        case lookupInstanceLambda funcNm [tA, tY] Nothing env1 of
             Just _ -> pure env1
             Nothing | tA == tY -> pure env1
             Nothing ->
                 let composedLam = mkLambda funcNm [Var "__x" (Id tA) UNDEFINED]
                         (App (Id funcNm) [App (Id funcNm) [Id "__x"]]) (Id tY)
-                in pure $ addInstanceLambda funcNm [tA, tY] composedLam env1
+                in pure $ addInstanceLambda funcNm [tA, tY] Nothing composedLam env1
 
 -- Validate that a parent instance has all required functions
 validateParentInstance :: Environment -> [Name] -> Name -> SourceInfo -> IntState ()
@@ -1002,7 +1035,7 @@ validateParentInstance env typeNames parentName si = do
             DeclBlock exs -> do
                 let funcNames = [lamName l | Function l <- exs]
                                 ++ [name v | Value v _ <- exs]
-                let missing = Prelude.filter (\fn -> isNothing (lookupInstanceLambda fn typeNames env)) funcNames
+                let missing = Prelude.filter (\fn -> isNothing (lookupInstanceLambda fn typeNames Nothing env)) funcNames
                 unless (Prelude.null missing) $
                     logWarning (mkLogPayload si
                         ("instance " ++ parentName ++ "(" ++ intercalate ", " typeNames
@@ -1066,7 +1099,7 @@ validateRequiresForInstance env reqs typeNames structName si = do
                     let funcNames = [lamName l | Function l <- exs]
                                  ++ [name v | Value v _ <- exs]
                     case funcNames of
-                        (fn:_) -> case lookupInstanceLambda fn reqTypes env' of
+                        (fn:_) -> case lookupInstanceLambda fn reqTypes Nothing env' of
                             Just _ -> pure ()
                             Nothing -> logWarning (mkLogPayload si
                                 ("requires: instance " ++ reqStructName ++ "("

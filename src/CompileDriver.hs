@@ -193,7 +193,7 @@ collectSurfaceRefs env = go
     go (RecFieldAccess _ e) = go e
     go (ReprCast e _) = go e
     go (ArrayLit es) = concatMap go es
-    go (Instance _ _ impls _) = concatMap go impls
+    go (Instance _ _ _ impls _) = concatMap go impls
     go _ = []  -- Lit, U, UNDEFINED, Intrinsic, Implicit, etc.
 
     goPC (PatternGuard _ e) = go e

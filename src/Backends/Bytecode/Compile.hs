@@ -237,6 +237,28 @@ compileFunctionWithCaptures captures name lam cs0 =
                            , csAllCode = csCode cs5 ++ csAllCode cs5 }
             in (funcIdx, cs6)
 
+-- | Try to extract a tag-switch pattern from case arms.
+-- Returns (scrutinee register, [(tag, body)], Maybe defaultBody) if all arms
+-- are single CLMCheckTag checks on the same CLMID scrutinee that's bound.
+extractBCTagSwitch :: [CLMExpr] -> CompState -> Maybe (Int, [(Int, CLMExpr)], Maybe CLMExpr)
+extractBCTagSwitch cases cs = go cases [] Nothing Nothing
+  where
+    go [] _ Nothing _ = Nothing
+    go [] tagBodies _ (Just r) =
+      Just (r, [(t, b) | (t, b) <- reverse tagBodies], Nothing)
+    go (CLMCASE [] body : rest) tagBodies _ reg =
+      case tagBodies of
+        [] -> Nothing
+        _  -> go rest tagBodies (Just body) reg
+    go (CLMCASE [CLMCheckTag (ConsTag _ tag) (CLMID scrut)] body : rest) tagBodies defBody mReg =
+      case lookupName scrut cs of
+        Nothing -> Nothing
+        Just r -> case mReg of
+          Nothing -> go rest ((tag, body) : tagBodies) defBody (Just r)
+          Just r' | r' == r -> go rest ((tag, body) : tagBodies) defBody mReg
+          _ -> Nothing
+    go _ _ _ _ = Nothing
+
 -- | Compile a chain of CLMCASE expressions (from CLMLamCases).
 --
 -- For each case arm, emits:
@@ -245,6 +267,8 @@ compileFunctionWithCaptures captures name lam cs0 =
 -- then patching the placeholder.
 compileCaseChain :: [CLMExpr] -> CompState -> CompState
 compileCaseChain [] cs = cs
+compileCaseChain cases cs | Just (scrReg, tagCases, mDefault) <- extractBCTagSwitch cases cs =
+    compileCaseChainSwitch scrReg tagCases mDefault cs
 compileCaseChain (CLMCASE checks body : rest) cs =
     let -- Save csEnv before compiling the arm body. Nested case chains in the
         -- body may shadow the scrutinee parameter binding; we must restore env
@@ -269,6 +293,57 @@ compileCaseChain (CLMCASE checks body : rest) cs =
         -- Continue with remaining cases
     in compileCaseChain rest cs5
 compileCaseChain (_:rest) cs = compileCaseChain rest cs
+
+-- | Compile a case chain using SWITCH instruction (O(1) tag dispatch).
+-- Emits: GETTAG dst, scrut; SWITCH dst, tableIdx
+-- Each case body ends with RET. Jump table entries are patched post-compilation.
+compileCaseChainSwitch :: Int -> [(Int, CLMExpr)] -> Maybe CLMExpr -> CompState -> CompState
+compileCaseChainSwitch scrReg tagCases mDefault cs0 =
+    let -- Emit GETTAG
+        (tagReg, cs1) = allocReg cs0
+        cs2 = emit (IGetTag tagReg scrReg) cs1
+        -- Reserve jump table index
+        jtIdx = length (csJumpTables cs2)
+        -- Emit SWITCH with placeholder table index
+        cs3 = emit (ISwitch tagReg jtIdx) cs2
+        -- The absolute position right after SWITCH — this is where bodies start
+        afterSwitch = csInstrCount cs3
+        -- Compile each case body, recording entry points
+        (cs4, bodyEntries) = foldl' (\(s, entries) (tag, body) ->
+            let savedEnv = csEnv s
+                savedNextReg = csNextReg s
+                bodyStart = csInstrCount s
+                (resultReg, s1) = compileCLMExpr body (inTailPos True s)
+                s2 = if lastIsTailCall (csCode s1)
+                     then s1
+                     else emit (IRet resultReg) s1
+                s3 = s2 { csEnv = savedEnv, csNextReg = savedNextReg }
+            in (s3, (tag, bodyStart) : entries)
+            ) (cs3, []) tagCases
+        -- Compile default body (if any)
+        (cs5, defaultOffset) = case mDefault of
+            Just defBody ->
+                let savedEnv = csEnv cs4
+                    savedNextReg = csNextReg cs4
+                    defStart = csInstrCount cs4
+                    (resultReg, s1) = compileCLMExpr defBody (inTailPos True cs4)
+                    s2 = if lastIsTailCall (csCode s1)
+                         then s1
+                         else emit (IRet resultReg) s1
+                    s3 = s2 { csEnv = savedEnv, csNextReg = savedNextReg }
+                in (s3, defStart)
+            Nothing ->
+                let errStart = csInstrCount cs4
+                    (errIdx, s1) = addConstant (KString "Pattern match failure") cs4
+                    s2 = emit (IError errIdx) s1
+                in (s2, errStart)
+        -- Build jump table
+        jt = JumpTable
+            { jtDefault = defaultOffset
+            , jtEntries = V.fromList (reverse bodyEntries)
+            }
+        cs6 = cs5 { csJumpTables = jt : csJumpTables cs5 }
+    in cs6
 
 -- | Patch JMPF instructions in csCode (reversed instruction list).
 -- Each JMPF at absolute position P gets offset = targetPos - P.
@@ -301,6 +376,8 @@ compileInlineCaseChain [] cs =
     let (errIdx, cs1) = addConstant (KString "Pattern match failure") cs
         (r, cs2) = allocReg cs1
     in (r, emit (IError errIdx) cs2)
+compileInlineCaseChain cases cs | Just (scrReg, tagCases, mDefault) <- extractBCTagSwitch cases cs =
+    compileInlineCaseChainSwitch scrReg tagCases mDefault cs
 compileInlineCaseChain cases cs =
     let (dstReg, cs1) = allocReg cs
         -- Compile all arms, collecting JMP-to-merge positions.
@@ -343,6 +420,60 @@ compileInlineCaseChain cases cs =
         mergePos = csInstrCount cs4
         cs5 = patchJmps cs4 jmpToMerge mergePos
     in (dstReg, cs5)
+
+-- | Compile an inline case chain using SWITCH (expression version).
+-- Uses SWITCH + JMP-to-merge instead of JMPF chains.
+compileInlineCaseChainSwitch :: Int -> [(Int, CLMExpr)] -> Maybe CLMExpr -> CompState -> (Int, CompState)
+compileInlineCaseChainSwitch scrReg tagCases mDefault cs0 =
+    let (dstReg, cs1) = allocReg cs0
+        -- Emit GETTAG + SWITCH
+        (tagReg, cs2) = allocReg cs1
+        cs3 = emit (IGetTag tagReg scrReg) cs2
+        jtIdx = length (csJumpTables cs3)
+        cs4 = emit (ISwitch tagReg jtIdx) cs3
+        -- Compile each body, collecting JMP-to-merge positions
+        (cs5, bodyEntries, jmpToMerge) = foldl' (\(s, entries, mergeJmps) (tag, body) ->
+            let savedEnv = csEnv s
+                savedNextReg = csNextReg s
+                bodyStart = csInstrCount s
+                (resultReg, s1) = compileCLMExpr body (inTailPos False s)
+                s2 = if resultReg /= dstReg
+                     then emit (IMov dstReg resultReg) s1
+                     else s1
+                jmpPos = csInstrCount s2
+                s3 = emit (IJmp 0) s2  -- placeholder
+                s4 = s3 { csEnv = savedEnv, csNextReg = savedNextReg }
+            in (s4, (tag, bodyStart) : entries, jmpPos : mergeJmps)
+            ) (cs4, [], []) tagCases
+        -- Default body
+        (cs6, defaultOffset, jmpToMerge2) = case mDefault of
+            Just defBody ->
+                let savedEnv = csEnv cs5
+                    savedNextReg = csNextReg cs5
+                    defStart = csInstrCount cs5
+                    (resultReg, s1) = compileCLMExpr defBody (inTailPos False cs5)
+                    s2 = if resultReg /= dstReg
+                         then emit (IMov dstReg resultReg) s1
+                         else s1
+                    jmpPos = csInstrCount s2
+                    s3 = emit (IJmp 0) s2
+                    s4 = s3 { csEnv = savedEnv, csNextReg = savedNextReg }
+                in (s4, defStart, jmpPos : jmpToMerge)
+            Nothing ->
+                let errStart = csInstrCount cs5
+                    (errIdx, s1) = addConstant (KString "Pattern match failure") cs5
+                    s2 = emit (IError errIdx) s1
+                in (s2, errStart, jmpToMerge)
+        -- Build jump table
+        jt = JumpTable
+            { jtDefault = defaultOffset
+            , jtEntries = V.fromList (reverse bodyEntries)
+            }
+        cs7 = cs6 { csJumpTables = jt : csJumpTables cs6 }
+        -- Patch JMP-to-merge
+        mergePos = csInstrCount cs7
+        cs8 = patchJmps cs7 jmpToMerge2 mergePos
+    in (dstReg, cs8)
 
 -- | Patch JMP instructions (unconditional jumps to merge point).
 patchJmps :: CompState -> [Int] -> Int -> CompState

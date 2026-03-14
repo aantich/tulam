@@ -46,5 +46,5 @@ instance Eq(Pair(a, b)) = {
 
 instance Show(Pair(a, b)) = {
     function show(x:Pair(a, b)) : String = match
-        | Pair(l, r) -> concat("Pair(", concat(show(l), concat(", ", concat(show(r), ")"))))
+        | Pair(l, r) -> "Pair(" ⊕ show(l) ⊕ ", " ⊕ show(r) ⊕ ")"
 };

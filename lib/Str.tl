@@ -6,6 +6,8 @@
 module Str;
 import Core;
 import Algebra;
+import Repr;
+import Reflection;
 import Morphism;
 import Collection;
 
@@ -96,58 +98,71 @@ function decodeAt(bytes:Array(Byte), i:Int) : Maybe(Pair(Int, Int)) =
 
 /// Count the number of code points in a UTF-8 byte array.
 function countCodePoints(bytes:Array(Byte)) : Int =
-    countCodePointsFrom(bytes, 0, 0);
+    countCodePointsImpl(bytes, 0, 0, fromRepr(size(bytes)));
 
-function countCodePointsFrom(bytes:Array(Byte), i:Int, count:Int) : Int =
-    if i >= size(bytes) then count
-    else
-        let seqLen = utf8SeqLen(index(bytes, i)) in
-        if seqLen == 0 then count
-        else countCodePointsFrom(bytes, i + seqLen, count + 1);
+function countCodePointsImpl(bytes:Array(Byte), i:Int, cnt:Int, fuel:Nat) : Int = match
+    | bytes, i, cnt, Z -> cnt
+    | bytes, i, cnt, Succ(f) ->
+        if i >= size(bytes) then cnt
+        else
+            let seqLen = utf8SeqLen(index(bytes, i)) in
+            if seqLen == 0 then cnt
+            else countCodePointsImpl(bytes, i + seqLen, cnt + 1, f);
 
 /// Get the byte offset of the n-th code point (0-indexed).
 function nthByteOffset(bytes:Array(Byte), n:Int) : Maybe(Int) =
-    nthByteOffsetFrom(bytes, 0, n);
+    nthByteOffsetImpl(bytes, 0, n, fromRepr(size(bytes)));
 
-function nthByteOffsetFrom(bytes:Array(Byte), i:Int, n:Int) : Maybe(Int) =
-    if n == 0 then
-        if i <= size(bytes) then Just(i) else Nothing
-    else if i >= size(bytes) then Nothing
-    else
-        let seqLen = utf8SeqLen(index(bytes, i)) in
-        if seqLen == 0 then Nothing
-        else nthByteOffsetFrom(bytes, i + seqLen, n - 1);
+function nthByteOffsetImpl(bytes:Array(Byte), i:Int, n:Int, fuel:Nat) : Maybe(Int) = match
+    | bytes, i, n, Z -> if n == 0 then Just(i) else Nothing
+    | bytes, i, n, Succ(f) ->
+        if n == 0 then
+            if i <= size(bytes) then Just(i) else Nothing
+        else if i >= size(bytes) then Nothing
+        else
+            let seqLen = utf8SeqLen(index(bytes, i)) in
+            if seqLen == 0 then Nothing
+            else nthByteOffsetImpl(bytes, i + seqLen, n - 1, f);
 
 /// Validate that a byte array is well-formed UTF-8.
 function isValidUtf8(bytes:Array(Byte)) : Bool =
-    isValidUtf8From(bytes, 0);
+    isValidUtf8Impl(bytes, 0, fromRepr(size(bytes)));
 
-function isValidUtf8From(bytes:Array(Byte), i:Int) : Bool =
-    if i >= size(bytes) then True
-    else isValidUtf8Check(decodeAt(bytes, i), bytes);
+function isValidUtf8Impl(bytes:Array(Byte), i:Int, fuel:Nat) : Bool = match
+    | bytes, i, Z -> i >= size(bytes)
+    | bytes, i, Succ(f) ->
+        if i >= size(bytes) then True
+        else isValidUtf8Check(decodeAt(bytes, i), bytes, f);
 
-function isValidUtf8Check(result:Maybe(Pair(Int, Int)), bytes:Array(Byte)) : Bool = match
-    | Nothing, bytes -> False
-    | Just(Pair(cp, next)), bytes -> isValidUtf8From(bytes, next);
+function isValidUtf8Check(result:Maybe(Pair(Int, Int)), bytes:Array(Byte), fuel:Nat) : Bool = match
+    | Nothing, bytes, fuel -> False
+    | Just(Pair(cp, next)), bytes, fuel -> isValidUtf8Impl(bytes, next, fuel);
 
 // ============================================================================
 // Str algebra instances
 // ============================================================================
 
 /// Helper: compare byte arrays element-by-element for equality.
-function eqBytes(a:Array(Byte), b:Array(Byte), i:Int, len:Int) : Bool =
-    if i >= len then True
-    else if index(a, i) != index(b, i) then False
-    else eqBytes(a, b, i + 1, len);
+function eqBytes(a:Array(Byte), b:Array(Byte), len:Int) : Bool =
+    eqBytesImpl(a, b, 0, fromRepr(len));
+
+function eqBytesImpl(a:Array(Byte), b:Array(Byte), i:Int, remaining:Nat) : Bool = match
+    | a, b, i, Z -> True
+    | a, b, i, Succ(r) ->
+        if index(a, i) != index(b, i) then False
+        else eqBytesImpl(a, b, i + 1, r);
 
 /// Helper: lexicographic byte array comparison.
-function compareBytes(a:Array(Byte), b:Array(Byte), i:Int, minLen:Int) : Ordering =
-    if i >= minLen then compare(size(a), size(b))
-    else
+function compareBytes(a:Array(Byte), b:Array(Byte), minLen:Int) : Ordering =
+    compareBytesImpl(a, b, 0, fromRepr(minLen));
+
+function compareBytesImpl(a:Array(Byte), b:Array(Byte), i:Int, remaining:Nat) : Ordering = match
+    | a, b, i, Z -> compare(size(a), size(b))
+    | a, b, i, Succ(r) ->
         let { ba = byteToInt(index(a, i)); bb = byteToInt(index(b, i)) } in
         if ba < bb then LessThan
         else if ba > bb then GreaterThan
-        else compareBytes(a, b, i + 1, minLen);
+        else compareBytesImpl(a, b, i + 1, r);
 
 /// Helper: minimum of two Ints.
 function minInt(a:Int, b:Int) : Int =
@@ -156,15 +171,15 @@ function minInt(a:Int, b:Int) : Int =
 instance Eq(Str) = {
     function (==)(a:Str, b:Str) : Bool =
         if a.byteLen != b.byteLen then False
-        else eqBytes(a.bytes, b.bytes, 0, a.byteLen);
+        else eqBytes(a.bytes, b.bytes, a.byteLen);
     function (!=)(a:Str, b:Str) : Bool =
         if a.byteLen != b.byteLen then True
-        else not(eqBytes(a.bytes, b.bytes, 0, a.byteLen))
+        else not(eqBytes(a.bytes, b.bytes, a.byteLen))
 };
 
 instance Ord(Str) = {
     function compare(a:Str, b:Str) : Ordering =
-        compareBytes(a.bytes, b.bytes, 0, minInt(a.byteLen, b.byteLen));
+        compareBytes(a.bytes, b.bytes, minInt(a.byteLen, b.byteLen));
     function (<)(a:Str, b:Str) : Bool = match compare(a, b)
         | LessThan -> True
         | _ -> False;
@@ -191,18 +206,23 @@ instance Monoid(Str) = {
 };
 
 /// Helper: decode all bytes to build a display string.
-function strToDisplayString(bytes:Array(Byte), i:Int, acc:String) : String =
-    if i >= size(bytes) then acc
-    else strToDisplayStep(decodeAt(bytes, i), bytes, i, acc);
+function strToDisplayString(bytes:Array(Byte)) : String =
+    strToDisplayImpl(bytes, 0, "", fromRepr(size(bytes)));
 
-function strToDisplayStep(result:Maybe(Pair(Int, Int)), bytes:Array(Byte), i:Int, acc:String) : String = match
-    | Nothing, bytes, i, acc -> concat(acc, "?")
-    | Just(Pair(cp, next)), bytes, i, acc ->
+function strToDisplayImpl(bytes:Array(Byte), i:Int, acc:String, fuel:Nat) : String = match
+    | bytes, i, acc, Z -> acc
+    | bytes, i, acc, Succ(f) ->
+        if i >= size(bytes) then acc
+        else strToDisplayStep(decodeAt(bytes, i), bytes, acc, f);
+
+function strToDisplayStep(result:Maybe(Pair(Int, Int)), bytes:Array(Byte), acc:String, fuel:Nat) : String = match
+    | Nothing, bytes, acc, fuel -> concat(acc, "?")
+    | Just(Pair(cp, next)), bytes, acc, fuel ->
         let ch = toEnum(cp) in
-        strToDisplayString(bytes, next, concat(acc, show(ch)));
+        strToDisplayImpl(bytes, next, concat(acc, show(ch)), fuel);
 
 instance Show(Str) = {
-    function show(s:Str) : String = strToDisplayString(s.bytes, 0, "")
+    function show(s:Str) : String = strToDisplayString(s.bytes)
 };
 
 // ============================================================================
@@ -210,16 +230,25 @@ instance Show(Str) = {
 // ============================================================================
 
 /// Helper: search for needle bytes in haystack starting at byte offset.
-function findBytes(haystack:Array(Byte), hLen:Int, needle:Array(Byte), nLen:Int, i:Int) : Int =
-    if i + nLen > hLen then 0 - 1
-    else if matchBytesAt(haystack, needle, i, 0, nLen) then i
-    else findBytes(haystack, hLen, needle, nLen, i + 1);
+function findBytes(haystack:Array(Byte), hLen:Int, needle:Array(Byte), nLen:Int) : Int =
+    findBytesImpl(haystack, hLen, needle, nLen, 0, fromRepr(hLen));
+
+function findBytesImpl(haystack:Array(Byte), hLen:Int, needle:Array(Byte), nLen:Int, i:Int, fuel:Nat) : Int = match
+    | haystack, hLen, needle, nLen, i, Z -> 0 - 1
+    | haystack, hLen, needle, nLen, i, Succ(f) ->
+        if i + nLen > hLen then 0 - 1
+        else if matchBytes(haystack, needle, i, nLen) then i
+        else findBytesImpl(haystack, hLen, needle, nLen, i + 1, f);
 
 /// Helper: check if needle matches at position pos in haystack.
-function matchBytesAt(haystack:Array(Byte), needle:Array(Byte), pos:Int, j:Int, nLen:Int) : Bool =
-    if j >= nLen then True
-    else if index(haystack, pos + j) != index(needle, j) then False
-    else matchBytesAt(haystack, needle, pos, j + 1, nLen);
+function matchBytes(haystack:Array(Byte), needle:Array(Byte), pos:Int, nLen:Int) : Bool =
+    matchBytesImpl(haystack, needle, pos, 0, fromRepr(nLen));
+
+function matchBytesImpl(haystack:Array(Byte), needle:Array(Byte), pos:Int, j:Int, remaining:Nat) : Bool = match
+    | haystack, needle, pos, j, Z -> True
+    | haystack, needle, pos, j, Succ(r) ->
+        if index(haystack, pos + j) != index(needle, j) then False
+        else matchBytesImpl(haystack, needle, pos, j + 1, r);
 
 /// Helper: convert a decoded Int pair to a Char pair.
 function decodeIntToChar(result:Maybe(Pair(Int, Int))) : Maybe(Pair(Char, Int)) = match
@@ -238,7 +267,7 @@ instance StringLike(Str) = {
 
     function strIndexOf(haystack:Str, needle:Str) : Int =
         if needle.byteLen == 0 then 0
-        else findBytes(haystack.bytes, haystack.byteLen, needle.bytes, needle.byteLen, 0);
+        else findBytes(haystack.bytes, haystack.byteLen, needle.bytes, needle.byteLen);
 
     function strFromChar(c:Char) : Str =
         let bs = encodeCodePoint(fromEnum(c)) in

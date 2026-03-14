@@ -179,6 +179,11 @@ data LInstr
   | LLoad LOperand Int LType         -- ^ load field from object at index
   | LGetTag LOperand                 -- ^ extract tag (i16) from heap object header
   | LFree LOperand                   -- ^ free heap object (return to free list)
+  | LAlloca LType                    -- ^ stack allocation (alloca) → ptr
+  | LStoreRaw LOperand LOperand LType -- ^ store value to raw pointer (no header offset): store ty val, ptr
+  | LLoadRaw LOperand LType          -- ^ load from raw pointer (no header offset): load ty, ptr
+  | LGepLoad LOperand LOperand LType -- ^ indexed load: load ty, gep(ptr, index) — for array element access
+  | LGepStore LOperand LOperand LOperand LType -- ^ indexed store: store ty val, gep(ptr, index)
   | LIsNull LOperand                 -- ^ null check → i1
   | LIsNotNull LOperand              -- ^ non-null check → i1
 
@@ -246,6 +251,11 @@ instrResultType (LStore _ _ _)  = LTVoid
 instrResultType (LLoad _ _ ty)  = ty
 instrResultType (LGetTag _)     = LTInt16
 instrResultType (LFree _)       = LTVoid
+instrResultType (LAlloca _)     = LTPtr
+instrResultType (LStoreRaw _ _ _) = LTVoid
+instrResultType (LLoadRaw _ ty)   = ty
+instrResultType (LGepLoad _ _ ty) = ty
+instrResultType (LGepStore _ _ _ _) = LTVoid
 instrResultType (LIsNull _)     = LTBool
 instrResultType (LIsNotNull _)  = LTBool
 instrResultType (LCall _ _ ty)  = ty

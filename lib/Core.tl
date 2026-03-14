@@ -144,10 +144,13 @@ function id(x:a) : a = x;
 function const(x:a, y:b) : a = x;
 
 /// Function application.
-function apply(f:a, x:b) : c = f(x);
+function apply(f:a -> b, x:a) : b = f(x);
 
 /// Function composition — (f . g)(x) = f(g(x)).
-function compose(f:b, g:a, x:a) : c = f(g(x));
+function compose(f:b -> c, g:a -> b, x:a) : c = f(g(x));
 
 /// Flips the first two arguments of a function.
-function flip(f:a, x:b, y:c) = f(y, x);
+function flip(f:a -> b -> c, x:b, y:a) : c = f(y, x);
+
+/// Terminate with an error message. Type is forall a. String -> a (bottom/absurd).
+function error(msg:String) : a = intrinsic;

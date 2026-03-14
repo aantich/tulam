@@ -15,3 +15,4 @@ export Instances.Tree;
 export Instances.Numeric;
 export Instances.Conversion;
 export Instances.Utility;
+export Instances.Categorical;

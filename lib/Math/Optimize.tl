@@ -46,7 +46,7 @@ algebra Optimizer(s:Type) requires Floating(s) = {
         f:Array(s) -> s,
         x0:Array(s),
         tol:s
-    ) : {point:Array(s), value:s, converged:Bool};
+    ) : {point:Array(s), val:s, converged:Bool};
 
     /// Minimize f with known gradient. Faster convergence.
     function minimizeGrad(
@@ -54,7 +54,7 @@ algebra Optimizer(s:Type) requires Floating(s) = {
         grad:Array(s) -> Array(s),
         x0:Array(s),
         tol:s
-    ) : {point:Array(s), value:s, converged:Bool}
+    ) : {point:Array(s), val:s, converged:Bool}
 };
 
 // ============================================================================
@@ -68,7 +68,7 @@ algebra OptMethod(s:Type) requires Optimizer(s) = {
         f:Array(s) -> s,
         x0:Array(s),
         tol:s
-    ) : {point:Array(s), value:s, converged:Bool};
+    ) : {point:Array(s), val:s, converged:Bool};
 
     /// BFGS quasi-Newton method. Requires gradient. Superlinear convergence.
     function bfgs(
@@ -76,7 +76,7 @@ algebra OptMethod(s:Type) requires Optimizer(s) = {
         grad:Array(s) -> Array(s),
         x0:Array(s),
         tol:s
-    ) : {point:Array(s), value:s, converged:Bool};
+    ) : {point:Array(s), val:s, converged:Bool};
 
     /// Limited-memory BFGS. For large-scale problems (many variables).
     /// `m` controls memory (number of stored correction pairs, typically 5-20).
@@ -86,7 +86,7 @@ algebra OptMethod(s:Type) requires Optimizer(s) = {
         x0:Array(s),
         tol:s,
         m:Int
-    ) : {point:Array(s), value:s, converged:Bool};
+    ) : {point:Array(s), val:s, converged:Bool};
 
     /// Conjugate gradient method. Requires gradient. Low memory.
     function conjugateGradient(
@@ -94,7 +94,7 @@ algebra OptMethod(s:Type) requires Optimizer(s) = {
         grad:Array(s) -> Array(s),
         x0:Array(s),
         tol:s
-    ) : {point:Array(s), value:s, converged:Bool}
+    ) : {point:Array(s), val:s, converged:Bool}
 };
 
 // ============================================================================
@@ -110,7 +110,7 @@ morphism ConstrainedOpt(m: Type -> Type, s:Type)
         c:Array(s),
         aIneq:m(s), bIneq:Array(s),
         aEq:m(s), bEq:Array(s)
-    ) : {point:Array(s), value:s};
+    ) : {point:Array(s), val:s};
 
     /// Quadratic programming: minimize 0.5 * x^T * Q * x + c^T * x
     /// subject to A_ineq * x <= b_ineq and A_eq * x = b_eq.
@@ -118,7 +118,7 @@ morphism ConstrainedOpt(m: Type -> Type, s:Type)
         q:m(s), c:Array(s),
         aIneq:m(s), bIneq:Array(s),
         aEq:m(s), bEq:Array(s)
-    ) : {point:Array(s), value:s}
+    ) : {point:Array(s), val:s}
 };
 
 // ============================================================================

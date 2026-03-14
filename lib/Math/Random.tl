@@ -27,11 +27,11 @@ import Collection;
 /// Implementations: Xoshiro256**, PCG, SplitMix64, Mersenne Twister.
 algebra RandomGen(g:Type) = {
     /// Generate a random Int and advance the generator state.
-    function next(gen:g) : {value:Int, gen:g};
+    function next(gen:g) : {val:Int, gen:g};
     /// Generate a random Float64 in [0, 1) and advance the generator state.
-    function nextFloat(gen:g) : {value:Float64, gen:g};
+    function nextFloat(gen:g) : {val:Float64, gen:g};
     /// Generate a random Int in [lo, hi] (inclusive) and advance the generator.
-    function nextIntRange(gen:g, lo:Int, hi:Int) : {value:Int, gen:g};
+    function nextIntRange(gen:g, lo:Int, hi:Int) : {val:Int, gen:g};
     /// Split the generator into two independent generators.
     /// Essential for parallel random number generation.
     function split(gen:g) : {left:g, right:g};
@@ -48,14 +48,14 @@ algebra RandomGen(g:Type) = {
 morphism SampleDist(d:Type, s:Type, g:Type)
     requires Distribution(d, s), RandomGen(g) = {
     /// Draw a single sample from the distribution.
-    function sample(dist:d, gen:g) : {value:s, gen:g};
+    function sample(dist:d, gen:g) : {val:s, gen:g};
     /// Draw n independent samples from the distribution.
     function sampleN(dist:d, n:Int, gen:g) : {values:Array(s), gen:g};
 
     // Default: inverse CDF method (works for any distribution with icdf).
-    function sample(dist:d, gen:g) : {value:s, gen:g} =
+    function sample(dist:d, gen:g) : {val:s, gen:g} =
         let r = nextFloat(gen) in
-        {value = icdf(dist, r.value), gen = r.gen}
+        {val = icdf(dist, r.val), gen = r.gen}
 };
 
 // ============================================================================
@@ -67,11 +67,11 @@ morphism SampleDist(d:Type, s:Type, g:Type)
 morphism RandomChoice(c: Type -> Type, g:Type)
     requires Functor(c), RandomGen(g) = {
     /// Fisher-Yates shuffle: uniformly random permutation.
-    function shuffle(xs:c(a), gen:g) : {value:c(a), gen:g};
+    function shuffle(xs:c(a), gen:g) : {val:c(a), gen:g};
     /// Choose a single element uniformly at random.
-    function choice(xs:c(a), gen:g) : {value:a, gen:g};
+    function choice(xs:c(a), gen:g) : {val:a, gen:g};
     /// Choose n elements. With replacement if replace=True, without otherwise.
-    function choiceN(xs:c(a), n:Int, gen:g, replace:Bool) : {value:Array(a), gen:g}
+    function choiceN(xs:c(a), n:Int, gen:g, replace:Bool) : {val:Array(a), gen:g}
 };
 
 // ============================================================================
@@ -109,7 +109,7 @@ morphism SampleDistEff(d:Type, s:Type)
 // ============================================================================
 
 /// Random selection using the Random effect.
-morphism RandomChoiceEff(c: Type -> Type)
+algebra RandomChoiceEff(c: Type -> Type)
     requires Functor(c) = {
     /// Shuffle (effectful).
     function shuffleE(xs:c(a)) : Eff { random: Random | r } c(a);

@@ -55,7 +55,10 @@ emptyDef    = Tok.LanguageDef
             , identStart     = letter <|> char '_'
             , identLetter    = alphaNum <|> oneOf "_'#"
             , opStart        = opLetter emptyDef
-            , opLetter       = oneOf (":!#$%&*+./<=>?@\\^|-~" ++ "•§≠∑®†ø©˙∆˚¬…æ≈ç√∫≤≥÷¿˘¯˜◊∏ˇ‰Œ±·°‡›‹€") -- unicode stuff
+            , opLetter       = oneOf (":!#$%&*+./<=>?@\\^|-~"
+                                  ++ "•§≠∑®†ø©˙∆˚¬…æ≈ç√∫≤≥÷¿˘¯˜◊∏ˇ‰Œ±·°‡›‹€"  -- original unicode
+                                  ++ "∘∧∨⊕×⊗∈∉⊂⊃⊆⊇∪∩⊥⊤≡≅≃⟹⊸▷◁⊞⊟⊠⟨⟩↦⇒⇐⇔←→↔"  -- math/logic/category operators
+                                  ++ "≫⋙⋘") -- categorical unicode: ≫ (bind/seq), ⋙⋘ (category compose)
             , reservedOpNames= []
             , reservedNames  = []
             , caseSensitive  = True

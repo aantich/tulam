@@ -110,7 +110,7 @@ pSumTypeWithDeriving = do
     }
     let sumType = SumType lam
     -- Generate Instance declarations for each derived algebra
-    let deriveInstances = map (\algName -> Instance algName [Id name] [Derive] []) derivingNames
+    let deriveInstances = map (\algName -> Instance algName Nothing [Id name] [Derive] []) derivingNames
     return (sumType : deriveInstances)
 
 -- Parse exists binders or normal type body after '='
@@ -367,7 +367,9 @@ pStructRef :: Parser Expr
 pStructRef = do
     name <- identifier
     args <- try (parens (sepBy1 concreteType (reservedOp ","))) <|> pure []
-    return $ if null args then Id name else App (Id name) args
+    let base = if null args then Id name else App (Id name) args
+    mTag <- optionMaybe (try (reserved "as" >> identifier))
+    return $ maybe base (NamedRef base) mTag
 
 -- RECORDS ----------------------------------------------------------
 -- record Point = { x:Nat, y:Nat };
@@ -524,12 +526,13 @@ pInstance = do
     reserved "instance"
     name <- identifier
     targs <- parens (sepBy1 concreteType (reservedOp ","))
+    mTag <- optionMaybe (reserved "as" >> identifier)
     reqs <- parseRequires
     reservedOp "="
     exs <- try (reserved "intrinsic" >> return [Intrinsic])
            <|> try (reserved "derive" >> return [Derive])
            <|> braces (sepEndBy (try pValue <|> try pFunc) (reservedOp ";"))
-    return $ Instance name targs exs reqs
+    return $ Instance name mTag targs exs reqs
 
 -- FUNCTIONS ---------------------------------------------------------
 pFuncHeader :: Parser Lambda
@@ -608,12 +611,17 @@ pFuncOrDecl = Function <$> pFuncDecl
 -- value empty : a = Z      (concrete with type, in either)
 pValue :: Parser Expr
 pValue = do
+    pos <- getPosition
     reserved "value"
     nm <- identifier
     tp <- typeSignature
+    reqs <- parseRequires
     mval <- optionMaybe (reservedOp "=" >> pExpr)
     let val = maybe UNDEFINED id mval
-    return $ Value (Var nm tp UNDEFINED) val
+    if Prelude.null reqs
+        then return $ Value (Var nm tp UNDEFINED) val
+        -- value with requires desugars to nullary function
+        else return $ Function (Lambda nm [] val tp reqs (mkSrcInfo pos))
 
 -- LAW declarations (inside structures) ---------------------------------
 -- law reflexivity(x:a) = (x == x) === True

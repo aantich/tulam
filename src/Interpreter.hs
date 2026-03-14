@@ -594,57 +594,63 @@ findCLMErr (_:rest) = findCLMErr rest
 -- Instance dispatch: try multi-param key, prefix lookup, single-param fallback
 dispatchInstance :: Environment -> Name -> [Name] -> [CLMExpr] -> IntState CLMExpr
 dispatchInstance env funcNm typeNames exs' = do
-    -- try full multi-param exact key first
-    case lookupCLMInstance funcNm typeNames env of
+    -- try full multi-param exact key first (untagged)
+    case lookupCLMInstance funcNm typeNames Nothing env of
         Just clmLam -> do
             trace $ "Found instance " ++ funcNm ++ " for " ++ show typeNames
             evalCLM 0 $ applyCLMLam clmLam exs'
         Nothing -> do
-            -- try prefix-based lookup (for morphisms where arg types < all type params)
-            case lookupCLMInstancePrefix funcNm typeNames env of
+            -- try any-tag fallback for multi-param key
+            case lookupCLMInstanceAnyTag funcNm typeNames env of
                 Just clmLam -> do
-                    trace $ "Found prefix instance " ++ funcNm ++ " for " ++ show typeNames
+                    trace $ "Found tagged instance " ++ funcNm ++ " for " ++ show typeNames
                     evalCLM 0 $ applyCLMLam clmLam exs'
                 Nothing -> do
-                    -- fall back to single-param: try each arg type until one matches
-                    -- (algebra methods may have non-algebra-type args first, e.g.,
-                    --  charCountStep(r:Maybe(..), count:Int, str:s) — the instance key is ["s"])
-                    let tryKeys [] = Nothing
-                        tryKeys (t:ts) = case lookupCLMInstance funcNm [t] env of
-                            Just clmLam -> Just (clmLam, t)
-                            Nothing -> tryKeys ts
-                    case tryKeys (nub typeNames) of
-                        Just (clmLam, matchedType) -> do
-                            trace $ "Found single-param instance " ++ funcNm ++ " for [\"" ++ matchedType ++ "\"]"
+                    -- try prefix-based lookup (for morphisms where arg types < all type params)
+                    case lookupCLMInstancePrefix funcNm typeNames Nothing env of
+                        Just clmLam -> do
+                            trace $ "Found prefix instance " ++ funcNm ++ " for " ++ show typeNames
                             evalCLM 0 $ applyCLMLam clmLam exs'
                         Nothing -> do
-                            -- UNIVERSAL SHOW FALLBACK: for "show" on CLMCON / CLMARRAY values
-                            case (funcNm, exs') of
-                                ("show", [CLMCON (ConsTag nm _) []]) ->
-                                    pure $ CLMLIT (LString nm)
-                                ("show", [CLMCON (ConsTag nm _) fields]) -> do
-                                    fieldStrs <- mapM (\f -> do
-                                        r <- evalCLM 0 (CLMIAP (CLMID "show") [f])
-                                        _contEval 1 (CLMIAP (CLMID "show") [f]) r) fields
-                                    let showField (CLMLIT (LString s)) = s
-                                        showField other = ppr other
-                                    let fieldStr = intercalate ", " (Prelude.map showField fieldStrs)
-                                    pure $ CLMLIT (LString (nm ++ "(" ++ fieldStr ++ ")"))
-                                ("show", [CLMARRAY xs]) -> do
-                                    elemStrs <- mapM (\x -> do
-                                        r <- evalCLM 0 (CLMIAP (CLMID "show") [x])
-                                        _contEval 1 (CLMIAP (CLMID "show") [x]) r) xs
-                                    let showField (CLMLIT (LString s)) = s
-                                        showField other = ppr other
-                                    let inner = intercalate ", " (Prelude.map showField elemStrs)
-                                    pure $ CLMLIT (LString ("[" ++ inner ++ "]"))
-                                _ -> do
-                                    trace $ "No instance found for " ++ funcNm ++ ", using default"
-                                    case Map.lookup funcNm (clmLambdas env) of
-                                        Just clmLam -> case typeNames of
-                                            (t:_) -> pure $ applyCLMLam clmLam [CLMID t]
-                                            []    -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
-                                        Nothing -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
+                            -- fall back to single-param: try each arg type until one matches
+                            let tryKeys [] = Nothing
+                                tryKeys (t:ts) = case lookupCLMInstance funcNm [t] Nothing env of
+                                    Just clmLam -> Just (clmLam, t)
+                                    Nothing -> case lookupCLMInstanceAnyTag funcNm [t] env of
+                                        Just clmLam -> Just (clmLam, t)
+                                        Nothing -> tryKeys ts
+                            case tryKeys (nub typeNames) of
+                                Just (clmLam, matchedType) -> do
+                                    trace $ "Found single-param instance " ++ funcNm ++ " for [\"" ++ matchedType ++ "\"]"
+                                    evalCLM 0 $ applyCLMLam clmLam exs'
+                                Nothing -> do
+                                    -- UNIVERSAL SHOW FALLBACK: for "show" on CLMCON / CLMARRAY values
+                                    case (funcNm, exs') of
+                                        ("show", [CLMCON (ConsTag nm _) []]) ->
+                                            pure $ CLMLIT (LString nm)
+                                        ("show", [CLMCON (ConsTag nm _) fields]) -> do
+                                            fieldStrs <- mapM (\f -> do
+                                                r <- evalCLM 0 (CLMIAP (CLMID "show") [f])
+                                                _contEval 1 (CLMIAP (CLMID "show") [f]) r) fields
+                                            let showField (CLMLIT (LString s)) = s
+                                                showField other = ppr other
+                                            let fieldStr = intercalate ", " (Prelude.map showField fieldStrs)
+                                            pure $ CLMLIT (LString (nm ++ "(" ++ fieldStr ++ ")"))
+                                        ("show", [CLMARRAY xs]) -> do
+                                            elemStrs <- mapM (\x -> do
+                                                r <- evalCLM 0 (CLMIAP (CLMID "show") [x])
+                                                _contEval 1 (CLMIAP (CLMID "show") [x]) r) xs
+                                            let showField (CLMLIT (LString s)) = s
+                                                showField other = ppr other
+                                            let inner = intercalate ", " (Prelude.map showField elemStrs)
+                                            pure $ CLMLIT (LString ("[" ++ inner ++ "]"))
+                                        _ -> do
+                                            trace $ "No instance found for " ++ funcNm ++ ", using default"
+                                            case Map.lookup funcNm (clmLambdas env) of
+                                                Just clmLam -> case typeNames of
+                                                    (t:_) -> pure $ applyCLMLam clmLam [CLMID t]
+                                                    []    -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
+                                                Nothing -> pure $ CLMERR ("[RT] No function or instance found for " ++ funcNm) SourceInteractive
 
 -- Infer the type name from a CLM expression by looking at constructor tags
 inferTypeFromExpr :: Environment -> CLMExpr -> Maybe Name
@@ -696,7 +702,7 @@ resultMatchesHint env expr typeName =
 -- | Try hint-type instance dispatch with error recovery
 tryHintInstance :: Environment -> Name -> Name -> [CLMExpr] -> CLMExpr -> IntState CLMExpr
 tryHintInstance env funcNm typeName exs' fallbackResult = do
-    let hintKey = mkInstanceKey funcNm [typeName]
+    let hintKey = mkInstanceKey funcNm [typeName] Nothing
     case Map.lookup hintKey (clmInstances env) of
         Just clmLam | not (isPrimCallLam clmLam) ->
             let r = applyCLMLam clmLam exs'

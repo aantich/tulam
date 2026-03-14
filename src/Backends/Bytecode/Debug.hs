@@ -61,25 +61,20 @@ formatStackTrace bm frames = unlines $
             Nothing -> "<unknown>"
     ]
 
--- | Show a Val for debugging.
+-- | Show a Val for debugging (NaN-boxed representation).
+-- Note: cannot display heap objects or strings without table access;
+-- shows the tag/index only.
 showVal :: Val -> String
-showVal (VInt n)    = show n
-showVal (VFloat d)  = show d
-showVal (VBool b)   = if b then "True" else "False"
-showVal (VChar c)   = show c
-showVal (VString s) = T.unpack s
-showVal VUnit       = "()"
-showVal VEmpty      = "<empty>"
-showVal (VObj (HCon tag _ fields)) =
-    "Con(" ++ show tag ++ ", [" ++ concatMap (\v -> showVal v ++ ", ") (V.toList fields) ++ "])"
-showVal (VObj (HClosure fi upvals)) =
-    "Closure(f" ++ show fi ++ ", " ++ show (V.length upvals) ++ " upvals)"
-showVal (VObj (HPAP fi expected args)) =
-    "PAP(f" ++ show fi ++ ", " ++ show (V.length args) ++ "/" ++ show expected ++ ")"
-showVal (VObj (HArray xs)) =
-    "[" ++ concatMap (\v -> showVal v ++ ", ") (V.toList xs) ++ "]"
-showVal (VObj (HRef _))      = "<ref>"
-showVal (VObj (HMutArray _)) = "<mutarray>"
+showVal (Val w)
+    | isIntW w    = show (getIntW w)
+    | isFloatW w  = show (getFloatW w)
+    | isBoolW w   = if getBoolW w then "True" else "False"
+    | isCharW w   = show (getCharW w)
+    | isUnitW w   = "()"
+    | isEmptyW w  = "<empty>"
+    | isStrW w    = "<str:" ++ show (getStrIdxW w) ++ ">"
+    | isHeapW w   = "<heap:" ++ show (getHeapIdxW w) ++ ">"
+    | otherwise   = "<unknown:" ++ show w ++ ">"
 
 -- Helper
 showConst :: Constant -> String

@@ -23,7 +23,7 @@ import Math.Numeric;
 /// `v` is a vector type constructor (e.g. DenseVector), `s` is the scalar type.
 /// Maps to BLAS Level 1 routines: dscal, daxpy, ddot, dnrm2, dasum, idamax.
 morphism VectorSpace(v: Type -> Type, s:Type)
-    requires AdditiveGroup(v(s)), Field(s) = {
+    requires Group(v(s)) as Additive, Field(s) = {
     /// Scale a vector by a scalar (BLAS: xSCAL).
     function vscale(alpha:s, x:v(s)) : v(s);
     /// alpha*x + y (BLAS: xAXPY). Fused multiply-add on vectors.

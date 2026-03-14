@@ -202,7 +202,10 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
         PatternMatches cases ->
             PatternMatches (map go cases)
         CaseOf cv ex si ->
-            CaseOf (map (\v -> v { val = go (val v) }) cv) (go ex) si
+            let patTypes = extractPatternTypes env typeEnv cv
+                innerTypeEnv = Map.union patTypes typeEnv
+                goInner = resolveImplicitCalls env tInstances handlerOps innerTypeEnv
+            in CaseOf (map (\v -> v { val = goInner (val v) }) cv) (goInner ex) si
         ConTuple ct args -> ConTuple ct (map go args)
         NTuple fields -> NTuple (map (\(mn, e) -> (mn, go e)) fields)
         DeclBlock exprs -> DeclBlock (map go exprs)
@@ -212,7 +215,7 @@ resolveImplicitCalls env tInstances handlerOps typeEnv = go
         RecFieldAccess ac e -> RecFieldAccess ac (go e)
         ReprCast e t -> ReprCast (go e) t
         ArrayLit es -> ArrayLit (map go es)
-        Instance sn ta impls reqs -> Instance sn ta (map go impls) reqs
+        Instance sn mTag ta impls reqs -> Instance sn mTag ta (map go impls) reqs
         _ -> expr  -- Lit, Id (non-implicit), U, UNDEFINED, Intrinsic, etc.
 
     goPatternCheck (PatternGuard pc e) = PatternGuard pc (go e)
@@ -237,6 +240,59 @@ buildTypeEnvFromLetPairs env outerTypeEnv = foldl' addBinding Map.empty
                 in case inferExprTypeName env currentEnv rhs of
                     Just tn -> Map.insert n tn acc
                     Nothing -> acc
+
+-- | Extract concrete type names for pattern-bound variables from CaseOf vars.
+-- For a CaseOf like [Var "p" (App (Id "Pair") [Id "Int", Id "Int"]) (App (Id "Pair") [Id "a", Id "b"])],
+-- this extracts {a → "Int", b → "Int"} by looking up the constructor's field types
+-- and substituting the concrete type arguments.
+extractPatternTypes :: Environment -> TypeEnv -> [Var] -> TypeEnv
+extractPatternTypes env outerTypeEnv caseVars =
+    Map.fromList $ concatMap extractFromVar caseVars
+  where
+    extractFromVar (Var _scrutName varTypExpr pattern) =
+        -- Get the concrete type expression for the scrutinee
+        let concreteTypeExpr = case varTypExpr of
+                UNDEFINED -> Nothing
+                other     -> Just other
+        in case pattern of
+            App (Id consName) patArgs ->
+                extractConsPattern concreteTypeExpr consName patArgs
+            -- Nullary constructor or literal — no variable bindings
+            _ -> []
+
+    extractConsPattern mConcreteType consName patArgs =
+        case lookupConstructor consName env of
+            Just (consLam, _) ->
+                let implParams = filter isImplicitParam (params consLam)
+                    valParams  = filter (not . isImplicitParam) (params consLam)
+                    -- Extract concrete type args from the scrutinee's type expression
+                    typeArgs = case mConcreteType of
+                        Just (App _ args) -> args  -- e.g., Pair(Int, Int) → [Int, Int]
+                        _ -> []
+                    -- Build substitution: type param name → concrete type expression
+                    typeSubst = Map.fromList $ zip (map name implParams) typeArgs
+                in catMaybes
+                    [ case patArg of
+                        Id varName | isLowerCase varName ->
+                            -- Pattern variable binding — resolve its type
+                            let fieldType = substTypeExpr typeSubst (typ fieldParam)
+                            in case exprToTypeName fieldType of
+                                Just tn -> Just (varName, tn)
+                                Nothing -> Nothing
+                        _ -> Nothing  -- nested pattern or literal, skip for now
+                    | (patArg, fieldParam) <- zip patArgs valParams
+                    ]
+            Nothing -> []
+
+    isImplicitParam (Var _ (Implicit _) _) = True
+    isImplicitParam _ = False
+
+    isLowerCase n = not (null n) && head n >= 'a' && head n <= 'z'
+
+    -- Substitute type parameter names in a type expression
+    substTypeExpr subst (Id n) = fromMaybe (Id n) (Map.lookup n subst)
+    substTypeExpr subst (App f args) = App (substTypeExpr subst f) (map (substTypeExpr subst) args)
+    substTypeExpr _ e = e
 
 -- | Infer the concrete type name of a Surface expression.
 -- Uses the type environment (param types), literal types, and constructor info.
@@ -299,16 +355,16 @@ lookupExternRetType fname env =
 resolveTargetInstanceMulti :: NameMap Lambda -> Name -> [Name] -> Maybe Lambda
 resolveTargetInstanceMulti tInstances funcName types =
     -- 1. Try exact multi-param key: funcName\0type1\0type2
-    case Map.lookup (mkInstanceKey funcName types) tInstances of
+    case Map.lookup (mkInstanceKey funcName types Nothing) tInstances of
         Just lam -> Just lam
         Nothing ->
             -- 2. Try deduped: funcName\0Int (for +(Int,Int) → key is +\0Int)
             let uniqueTypes = nub' types
-            in case Map.lookup (mkInstanceKey funcName uniqueTypes) tInstances of
+            in case Map.lookup (mkInstanceKey funcName uniqueTypes Nothing) tInstances of
                 Just lam -> Just lam
                 Nothing ->
                     -- 3. Try single-param for each unique type
-                    firstJust [Map.lookup (mkInstanceKey funcName [t]) tInstances | t <- uniqueTypes]
+                    firstJust [Map.lookup (mkInstanceKey funcName [t] Nothing) tInstances | t <- uniqueTypes]
 
 -- | Like nub but simple (preserves order, removes duplicates)
 nub' :: Eq a => [a] -> [a]
