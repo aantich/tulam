@@ -125,6 +125,8 @@ mergeEnvironment base overlay = Environment
     , clmBindings = Map.union (clmBindings overlay) (clmBindings base)
     , instanceLambdas = Map.union (instanceLambdas overlay) (instanceLambdas base)
     , clmInstances = Map.union (clmInstances overlay) (clmInstances base)
+    , topLambdasElab = Map.union (topLambdasElab overlay) (topLambdasElab base)
+    , instanceLambdasElab = Map.union (instanceLambdasElab overlay) (instanceLambdasElab base)
     , structInheritance = Map.union (structInheritance overlay) (structInheritance base)
     , reprMap = Map.union (reprMap overlay) (reprMap base)
     , effectDecls = Map.union (effectDecls overlay) (effectDecls base)
@@ -173,6 +175,13 @@ data Environment = Environment {
     -- instance-specialized functions: key is "funcName\0typeName"
     instanceLambdas :: NameMap Lambda,
     clmInstances    :: NameMap CLMLam,
+    -- Elaborated views of topLambdas/instanceLambdas.
+    -- Invariant: same logical lambdas as raw maps, but body/params/ret may contain
+    -- Typed wrappers from TC elaboration and type elaboration passes.
+    -- Consumers that want type evidence (Monomorphize, Specialize) use these;
+    -- consumers that need raw Surface syntax (normalizeTy, exprToCLMTC) use raw maps.
+    topLambdasElab      :: NameMap Lambda,
+    instanceLambdasElab :: NameMap Lambda,
     -- structure inheritance: maps child structure name to list of (parent name, optional tag)
     structInheritance :: NameMap [(Name, Maybe Name)],
     -- repr map: user type -> list of (reprTypeName, isDefault, toReprLam, fromReprLam, maybeInvariant)
@@ -252,6 +261,8 @@ instance Binary Environment where
         putHashMap (clmBindings env)
         putHashMap (instanceLambdas env)
         putHashMap (clmInstances env)
+        putHashMap (topLambdasElab env)
+        putHashMap (instanceLambdasElab env)
         putHashMap (structInheritance env)
         putHashMap (reprMap env)
         putHashMap (effectDecls env)
@@ -270,6 +281,7 @@ instance Binary Environment where
         putNestedHashMap (targetExterns env)
     get = Environment <$> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap  -- topLambdasElab, instanceLambdasElab
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap  -- effectOps, defaultHandlers
                       <*> getHashMap <*> Bin.get <*> Bin.get <*> getHashMap
@@ -285,6 +297,8 @@ initialEnvironment = Environment {
     clmBindings = Map.empty,
     instanceLambdas = Map.empty,
     clmInstances = Map.empty,
+    topLambdasElab = Map.empty,
+    instanceLambdasElab = Map.empty,
     structInheritance = Map.empty,
     reprMap = Map.empty,
     effectDecls = Map.empty,
@@ -430,6 +444,8 @@ defaultFlags = CurrentFlags
     , checkCoverage = True
     , checkPurity = False
     , monomorphLevel = MonoFull  -- full monomorphization by default (all instance dispatch resolved)
+    , specLevel = SpecFull      -- full specialization by default (for bytecode/native)
+    , debugTrace = False
     }
 
 -- | Compiler output verbosity levels (ordered: Silent < Errors < ... < Verbose)
@@ -447,6 +463,16 @@ data MonomorphLevel
     | MonoFull        -- ^ Also resolve instanceLambdas (for native/bytecode backends)
     deriving (Show, Eq)
 
+-- | How aggressively to specialize generic instance functions.
+-- Runs after monomorphization. Controls whether generic instance bodies
+-- (e.g., show\0List with inner show(head) where head:a) get cloned and
+-- specialized for concrete type arguments at each call site.
+data SpecLevel
+    = SpecNone        -- ^ No specialization (dynamic dispatch for generic instances)
+    | SpecFull        -- ^ Full specialization: recursive fixed-point cloning
+    -- Future: SpecSmart — selective specialization based on call frequency/code size
+    deriving (Show, Eq)
+
 data CurrentFlags = CurrentFlags {
     strict    :: Bool -- true if strict, false if lazy
   , pretty    :: Bool -- pretty print or raw output
@@ -462,6 +488,8 @@ data CurrentFlags = CurrentFlags {
   , checkCoverage     :: Bool -- pattern match coverage checking
   , checkPurity       :: Bool -- effect purity checking (warn when effect ops called outside action blocks)
   , monomorphLevel :: MonomorphLevel -- how aggressively to monomorphize (MonoNone for interpreter)
+  , specLevel :: SpecLevel -- how aggressively to specialize generic instances (SpecFull for native/bytecode)
+  , debugTrace :: Bool -- emit debug trace output (monomorphizer, instance resolution, etc.)
 } deriving Show
 
 -- Safety limits for evaluation
@@ -507,6 +535,111 @@ transformLambdaMaps f env = env
     { topLambdas = Map.map f (topLambdas env)
     , instanceLambdas = Map.map f (instanceLambdas env)
     }
+
+-- | Lambda representation tag: raw Surface vs elaborated (with Typed wrappers).
+data LambdaRep = RawLambdaRep | ElabLambdaRep
+    deriving (Eq, Show)
+
+-- | Lookup a top-level lambda by representation.
+-- ElabLambdaRep falls back to raw if no elaborated version exists.
+lookupLambdaRep :: LambdaRep -> Name -> Environment -> Maybe Lambda
+lookupLambdaRep RawLambdaRep n env = Map.lookup n (topLambdas env)
+lookupLambdaRep ElabLambdaRep n env =
+    case Map.lookup n (topLambdasElab env) of
+        Just lam -> Just lam
+        Nothing  -> Map.lookup n (topLambdas env)
+
+-- | Lookup an instance lambda by representation.
+-- ElabLambdaRep falls back to raw if no elaborated version exists.
+lookupInstanceLambdaByKeyRep :: LambdaRep -> Name -> Environment -> Maybe Lambda
+lookupInstanceLambdaByKeyRep RawLambdaRep key env = Map.lookup key (instanceLambdas env)
+lookupInstanceLambdaByKeyRep ElabLambdaRep key env =
+    case Map.lookup key (instanceLambdasElab env) of
+        Just lam -> Just lam
+        Nothing  -> Map.lookup key (instanceLambdas env)
+
+-- | Get all top-level lambdas for a given representation.
+-- ElabLambdaRep returns elaborated where available, raw as fallback.
+topLambdasByRep :: LambdaRep -> Environment -> NameMap Lambda
+topLambdasByRep RawLambdaRep env = topLambdas env
+topLambdasByRep ElabLambdaRep env =
+    Map.union (topLambdasElab env) (topLambdas env)
+
+-- | Get all instance lambdas for a given representation.
+-- ElabLambdaRep returns elaborated where available, raw as fallback.
+instanceLambdasByRep :: LambdaRep -> Environment -> NameMap Lambda
+instanceLambdasByRep RawLambdaRep env = instanceLambdas env
+instanceLambdasByRep ElabLambdaRep env =
+    Map.union (instanceLambdasElab env) (instanceLambdas env)
+
+-- | Clear all elaborated lambda caches.
+-- Use after raw-mutating passes to prevent stale elaboration data.
+clearElaboratedLambdas :: Environment -> Environment
+clearElaboratedLambdas env = env
+    { topLambdasElab = Map.empty
+    , instanceLambdasElab = Map.empty
+    }
+
+-- | Store an elaborated lambda, routing to the correct elab map based on
+-- whether the name exists in topLambdas or instanceLambdas.
+storeElaboratedLambda :: Name -> Lambda -> Environment -> Environment
+storeElaboratedLambda n lam env
+    | Map.member n (topLambdas env) =
+        env { topLambdasElab = Map.insert n lam (topLambdasElab env) }
+    | Map.member n (instanceLambdas env) =
+        env { instanceLambdasElab = Map.insert n lam (instanceLambdasElab env) }
+    | otherwise = env
+
+-- | Deep-erase all Typed wrappers from an expression.
+-- Use at boundaries where raw Surface syntax is required (e.g. normalizeTy).
+stripAllTypedExpr :: Expr -> Expr
+stripAllTypedExpr expr = case expr of
+    Typed e _               -> stripAllTypedExpr e
+    App f args              -> App (stripAllTypedExpr f) (Prelude.map stripAllTypedExpr args)
+    Function lam            -> Function (stripAllTypedLambda lam)
+    PatternMatches exs      -> PatternMatches (Prelude.map stripAllTypedExpr exs)
+    ExpandedCase pcs e si   -> ExpandedCase (Prelude.map stripAllTypedExpr pcs) (stripAllTypedExpr e) si
+    CaseOf vars e si        -> CaseOf (Prelude.map stripVar vars) (stripAllTypedExpr e) si
+    IfThenElse c t e        -> IfThenElse (stripAllTypedExpr c) (stripAllTypedExpr t) (stripAllTypedExpr e)
+    LetIn binds bd          -> LetIn [ (v { typ = stripAllTypedExpr (typ v), val = stripAllTypedExpr (val v) }, stripAllTypedExpr e) | (v, e) <- binds ] (stripAllTypedExpr bd)
+    Binding v               -> Binding (stripVar v)
+    Value v e               -> Value (stripVar v) (stripAllTypedExpr e)
+    ConTuple ct es          -> ConTuple ct (Prelude.map stripAllTypedExpr es)
+    NTuple fields           -> NTuple [ (mn, stripAllTypedExpr e) | (mn, e) <- fields ]
+    RowExtend n t r         -> RowExtend n (stripAllTypedExpr t) (stripAllTypedExpr r)
+    EffType row t           -> EffType (stripAllTypedExpr row) (stripAllTypedExpr t)
+    Pi mn a b               -> Pi mn (stripAllTypedExpr a) (stripAllTypedExpr b)
+    Sigma mn a b            -> Sigma mn (stripAllTypedExpr a) (stripAllTypedExpr b)
+    Implicit e              -> Implicit (stripAllTypedExpr e)
+    RecFieldAccess ac e     -> RecFieldAccess ac (stripAllTypedExpr e)
+    ReprCast e t            -> ReprCast (stripAllTypedExpr e) (stripAllTypedExpr t)
+    HandleWith a h          -> HandleWith (stripAllTypedExpr a) (stripAllTypedExpr h)
+    OverrideApp f ovs args  -> OverrideApp (stripAllTypedExpr f)
+                                           [ (n, stripAllTypedExpr e) | (n, e) <- ovs ]
+                                           (Prelude.map stripAllTypedExpr args)
+    ArrayLit es             -> ArrayLit (Prelude.map stripAllTypedExpr es)
+    ActionBlock stmts       -> ActionBlock (Prelude.map stripActionStmt stmts)
+    Statements es           -> Statements (Prelude.map stripAllTypedExpr es)
+    PatternGuard p e        -> PatternGuard p (stripAllTypedExpr e)
+    RecordConstruct n fs    -> RecordConstruct n [ (f, stripAllTypedExpr e) | (f,e) <- fs ]
+    RecordUpdate e fs       -> RecordUpdate (stripAllTypedExpr e) [ (f, stripAllTypedExpr v) | (f,v) <- fs ]
+    RecordPattern n fs      -> RecordPattern n [ (f, stripAllTypedExpr e) | (f,e) <- fs ]
+    _                       -> expr
+  where
+    stripVar v = v { typ = stripAllTypedExpr (typ v), val = stripAllTypedExpr (val v) }
+    stripActionStmt (ActionExpr e) = ActionExpr (stripAllTypedExpr e)
+    stripActionStmt (ActionBind n e) = ActionBind n (stripAllTypedExpr e)
+    stripActionStmt (ActionLet n e) = ActionLet n (stripAllTypedExpr e)
+
+-- | Deep-erase all Typed wrappers from a Lambda.
+stripAllTypedLambda :: Lambda -> Lambda
+stripAllTypedLambda lam = lam
+    { params  = Prelude.map stripVar (params lam)
+    , body    = stripAllTypedExpr (body lam)
+    , lamType = stripAllTypedExpr (lamType lam)
+    }
+  where
+    stripVar v = v { typ = stripAllTypedExpr (typ v), val = stripAllTypedExpr (val v) }
 
 ------------------ Monadic traversal of the Expr tree ---------------------
 -- needed for optimizations, error checking etc
@@ -937,6 +1070,18 @@ verboseLog :: String -> IntState ()
 verboseLog msg = do
     v <- verbosity . currentFlags <$> get
     if v >= Verbose then liftIO (putStrLn msg) else pure ()
+
+-- | Output a debug trace message (only when :s debug on).
+-- Pure variant for use outside IntState (e.g. in monomorphizer).
+debugLogPure :: CurrentFlags -> String -> IO ()
+debugLogPure flags msg =
+    if debugTrace flags then putStrLn ("[debug] " ++ msg) else pure ()
+
+-- | Output a debug trace message (only when :s debug on). IntState variant.
+debugLog :: String -> IntState ()
+debugLog msg = do
+    flags <- currentFlags <$> get
+    liftIO $ debugLogPure flags msg
 
 -- | Display accumulated logs respecting verbosity + independent error/warning flags, then clear.
 -- Replaces clearAllLogs everywhere in the pipeline.

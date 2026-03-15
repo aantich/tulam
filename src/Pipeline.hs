@@ -514,18 +514,25 @@ processBinding (Instance structName mTag typeArgs impls reqs, si) env = do
                             ++ " not found in environment\n"))
                     pure env
         [Intrinsic] -> do
-            -- Intrinsic instance: generate placeholder lambdas for all structure functions
+            -- Intrinsic instance: generate placeholder lambdas for functions WITHOUT defaults.
+            -- Functions with default bodies (e.g., ⊕(x,y) = combine(x,y)) are handled by
+            -- propagateDefaults which substitutes concrete types into the default body.
             case lookupType structName env of
                 Just (Structure structLam _) -> case body structLam of
                     DeclBlock exs -> do
-                        let funcNames = [lamName l | Function l <- exs]
-                                     ++ [name v | Value v _ <- exs]
-                        let intrinsicImpls = [Function (mkLambda fn [] Intrinsic UNDEFINED) | fn <- funcNames]
+                        -- Only register intrinsic placeholders for functions without defaults
+                        let noDefaultFuncs = [lamName l | Function l <- exs, body l == UNDEFINED]
+                                          ++ [name v | Value v ex <- exs, ex == UNDEFINED]
+                        let allFuncNames = [lamName l | Function l <- exs]
+                                        ++ [name v | Value v _ <- exs]
+                        let intrinsicImpls = [Function (mkLambda fn [] Intrinsic UNDEFINED) | fn <- noDefaultFuncs]
                         let env' = Prelude.foldl (\e fn ->
                                 addInstanceLambda fn typeNames mTag
                                     (mkLambda fn [] Intrinsic UNDEFINED) e
-                                ) env funcNames
-                        env'' <- propagateToParent env' structName typeNames intrinsicImpls si
+                                ) env noDefaultFuncs
+                        -- Propagate defaults for functions WITH default bodies (⊕, <>, etc.)
+                        env'a <- propagateDefaultsWithTag typeNames mTag env' structName
+                        env'' <- propagateToParent env'a structName typeNames intrinsicImpls si
                         pure env''
                     _ -> do
                         logWarning (mkLogPayload si
@@ -860,6 +867,13 @@ propagateDefaultsWithTag typeNames mTag env1 parentName = do
     case lookupType parentName env1 of
         Just (Structure parentLam _) -> case body parentLam of
             DeclBlock exs -> do
+                -- Build type substitution: map structure type params to concrete instance types
+                -- e.g., for `structure Semigroup(a:Type)` with `instance Semigroup(Str)`:
+                --   implicitParams = [a], typeNames = ["Str"] → subst = {a → Id "Str"}
+                let implicitParams = Prelude.filter isImplicitVar (params parentLam)
+                    typeSubst = Map.fromList $ Prelude.zip
+                        (Prelude.map name implicitParams)
+                        (Prelude.map Id typeNames)
                 let allFuncs = [(lamName l, l) | Function l <- exs]
                         ++ [(name v, mkLambda (name v) [] ex (typ v)) | Value v ex <- exs]
                 let allFuncNames = Set.fromList [n | (n, _) <- allFuncs]
@@ -871,15 +885,85 @@ propagateDefaultsWithTag typeNames mTag env1 parentName = do
                                              not (isNothing (lookupInstanceLambda n typeNames mTag env1))]
                 -- Fixpoint: repeatedly resolve defaults whose deps are all provided
                 let (finalProvided, resolvedDefaults) = fixpointResolve provided withDefaults
-                -- Register resolved defaults
+                -- Register resolved defaults with type params substituted
+                dbgOn <- debugTrace . currentFlags <$> get
                 env2 <- foldM (\e (fn, defLam) ->
                     if isNothing (lookupInstanceLambda fn typeNames mTag e)
-                    then pure $ addInstanceLambda fn typeNames mTag defLam e
+                    then let defLam' = substDefaultLambda typeSubst defLam
+                         in (if dbgOn
+                             then Debug.Trace.trace ("[propdef] " ++ fn ++ " for "
+                                ++ show typeNames ++ " tag=" ++ show mTag
+                                ++ " subst=" ++ show (Map.toList typeSubst))
+                             else id) $
+                             pure $ addInstanceLambda fn typeNames mTag defLam' e
                     else pure e
                     ) env1 resolvedDefaults
                 pure env2
             _ -> pure env1
         _ -> pure env1
+
+-- | Substitute type variables in a default method lambda's params, body, and return type.
+-- E.g., for default `⊕(x:a, y:a):a = combine(x,y)` with subst {a → Str}:
+--   → `⊕(x:Str, y:Str):Str = combine(x,y)`
+substDefaultLambda :: HashMap Name Expr -> Lambda -> Lambda
+substDefaultLambda subst lam
+    | Map.null subst = lam
+    | otherwise = lam
+        { params = Prelude.map substVar (params lam)
+        , body = substExprTypes subst (body lam)
+        , lamType = substExprTypes subst (lamType lam)
+        }
+  where
+    substVar v = v { typ = substExprTypes subst (typ v) }
+
+-- | Substitute type variable references in type positions throughout an expression.
+substExprTypes :: HashMap Name Expr -> Expr -> Expr
+substExprTypes subst = go
+  where
+    go (Id n) = case Map.lookup n subst of
+        Just t  -> t
+        Nothing -> Id n
+    go (Typed e t) = Typed (go e) (substInType t)
+    go (App f args) = App (go f) (Prelude.map go args)
+    go (Function lam) = Function $ lam
+        { body = go (body lam)
+        , params = Prelude.map (\v -> v { typ = substInType (typ v) }) (params lam)
+        , lamType = substInType (lamType lam)
+        }
+    go (LetIn binds bodyExpr) =
+        LetIn (Prelude.map (\(v, e) -> (v { typ = substInType (typ v) }, go e)) binds) (go bodyExpr)
+    go (ExpandedCase checks bodyExpr si) =
+        ExpandedCase (Prelude.map goPC checks) (go bodyExpr) si
+    go (CaseOf cv ex si) =
+        CaseOf (Prelude.map (\v -> v { typ = substInType (typ v), val = go (val v) }) cv) (go ex) si
+    go (PatternMatches cases) = PatternMatches (Prelude.map go cases)
+    go (ConTuple ct args) = ConTuple ct (Prelude.map go args)
+    go (NTuple fields) = NTuple (Prelude.map (\(mn, e) -> (mn, go e)) fields)
+    go (ActionBlock stmts) = ActionBlock (Prelude.map goAS stmts)
+    go (IfThenElse c t e) = IfThenElse (go c) (go t) (go e)
+    go (BinaryOp op l r) = BinaryOp op (go l) (go r)
+    go (RecFieldAccess ac e) = RecFieldAccess ac (go e)
+    go (ReprCast e t) = ReprCast (go e) (substInType t)
+    go (ArrayLit es) = ArrayLit (Prelude.map go es)
+    go (Pi mn a b) = Pi mn (substInType a) (substInType b)
+    go (Implicit e) = Implicit (substInType e)
+    go e = e
+
+    goPC (PatternGuard pc e) = PatternGuard pc (go e)
+    goPC other = other
+
+    goAS (ActionExpr e) = ActionExpr (go e)
+    goAS (ActionBind n e) = ActionBind n (go e)
+    goAS (ActionLet n e) = ActionLet n (go e)
+
+    -- Substitute only in type-position expressions (same logic, just clearer name)
+    substInType (Id n) = case Map.lookup n subst of
+        Just t  -> t
+        Nothing -> Id n
+    substInType (App f args) = App (substInType f) (Prelude.map substInType args)
+    substInType (Pi mn a b) = Pi mn (substInType a) (substInType b)
+    substInType (Implicit e) = Implicit (substInType e)
+    substInType e = e
 
 -- Fixpoint resolution for default methods.
 -- Returns (set of all resolved names, list of (name, lambda) defaults that were resolved)

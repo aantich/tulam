@@ -34,6 +34,10 @@ module TypeCheck
   , freeRigidVars
     -- * GADT support
   , gadtRefine, gadtExprToTy, extractTypeName, applyGADTRefinements
+    -- * Elaboration (TC produces typed AST)
+  , inferElab, checkElab, inferAppElab, inferLambdaElab
+  , inferLetBindsElabAndBody, inferActionStmtElab
+  , zonkExpr, checkTopLevelElab
     -- * Pipeline integration
   , typeCheckPass
   , typeAnnotatePass
@@ -918,13 +922,19 @@ normalizeTy env = go
         | otherwise = App (Id name) argTys
 
 -- | Convert a Surface Lambda to CLMLam (pure, on-the-fly).
+-- NOTE: This operates on raw Surface representation. Deep-strips any Typed
+-- wrappers as defense-in-depth (primary protection is that normalizeTy
+-- reads from raw topLambdas/instanceLambdas, not elaborated maps).
 lambdaToCLMLam :: Environment -> Lambda -> CLMLam
 lambdaToCLMLam env (Lambda _ ps Intrinsic _ _ _) = CLMLam [] CLMPRIMCALL
 lambdaToCLMLam env (Lambda _ ps Derive _ _ _) = CLMLam [] CLMPRIMCALL
-lambdaToCLMLam env (Lambda _ ps (PatternMatches exs) _ _ _) =
-    CLMLamCases (varsToCLMVarsTC env ps) (Prelude.map (exprToCLMTC env) exs)
-lambdaToCLMLam env (Lambda _ ps bdy _ _ _) =
-    CLMLam (varsToCLMVarsTC env ps) (exprToCLMTC env bdy)
+lambdaToCLMLam env lam =
+    let lam' = stripAllTypedLambda lam
+        bdy = body lam'
+        ps = params lam'
+    in case bdy of
+        PatternMatches exs -> CLMLamCases (varsToCLMVarsTC env ps) (Prelude.map (exprToCLMTC env) exs)
+        _ -> CLMLam (varsToCLMVarsTC env ps) (exprToCLMTC env bdy)
 
 -- | Minimal Expr → CLMExpr conversion for type-level normalization.
 exprToCLMTC :: Environment -> Expr -> CLMExpr
@@ -933,12 +943,18 @@ exprToCLMTC env (Id name) =
     case lookupConstructor name env of
         Just (_, idx) -> CLMCON (ConsTag name idx) []
         Nothing -> CLMID name
-exprToCLMTC env (App (Id name) args) =
-    case lookupConstructor name env of
-        Just (lam, idx) | Prelude.length args == arity lam ->
-            CLMCON (ConsTag name idx) (Prelude.map (exprToCLMTC env) args)
-        _ -> CLMAPP (CLMID name) (Prelude.map (exprToCLMTC env) args)
-exprToCLMTC env (App e args) = CLMAPP (exprToCLMTC env e) (Prelude.map (exprToCLMTC env) args)
+exprToCLMTC env (App f args) =
+    let f' = stripTypedExpr f
+        args' = Prelude.map stripTypedExpr args
+    in case f' of
+        Id name -> case lookupConstructor name env of
+            Just (lam, idx) | Prelude.length args' == arity lam ->
+                CLMCON (ConsTag name idx) (Prelude.map (exprToCLMTC env) args')
+            _ -> CLMAPP (CLMID name) (Prelude.map (exprToCLMTC env) args')
+        _ -> CLMAPP (exprToCLMTC env f') (Prelude.map (exprToCLMTC env) args')
+  where
+    stripTypedExpr (Typed e _) = stripTypedExpr e
+    stripTypedExpr e = e
 exprToCLMTC env (ConTuple ct fields) = CLMCON ct (Prelude.map (exprToCLMTC env) fields)
 exprToCLMTC env (Function lam) = CLMLAM (lambdaToCLMLam env lam)
 exprToCLMTC env (PatternMatches exs) = CLMAPP CLMEMPTY (Prelude.map (exprToCLMTC env) exs)
@@ -947,10 +963,12 @@ exprToCLMTC _ (Lit l) = CLMLIT l
 exprToCLMTC _ (U l) = CLMU l
 exprToCLMTC env (RecFieldAccess ac e) = CLMFieldAccess ac (exprToCLMTC env e)
 exprToCLMTC _ Intrinsic = CLMPRIMCALL
+exprToCLMTC env (Typed e _) = exprToCLMTC env e  -- strip Typed wrapper
 exprToCLMTC _ (Pi _ _ _) = CLMEMPTY
 exprToCLMTC _ _ = CLMEMPTY
 
 pcToCLM :: Environment -> Expr -> CLMPatternCheck
+pcToCLM env (Typed e _) = pcToCLM env e  -- strip Typed wrapper
 pcToCLM env (PatternGuard (PCheckTag ct) ex) = CLMCheckTag ct (exprToCLMTC env ex)
 pcToCLM env (PatternGuard (PCheckLit lit) ex) = CLMCheckLit lit (exprToCLMTC env ex)
 pcToCLM _ _ = CLMCheckTag (ConsTag "ERROR" (-1)) CLMEMPTY
@@ -1607,6 +1625,514 @@ check expr expectedTy =
               Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy)
 
 -- ============================================================================
+-- Elaboration: TC produces Typed-wrapped AST
+-- ============================================================================
+
+-- | Infer the type of an expression and return the elaborated (Typed-wrapped) expression.
+-- Returns (elaboratedExpr, inferredType).
+inferElab :: Expr -> TC (Expr, Expr)
+
+-- Literals: wrap with concrete type
+inferElab e@(Lit _) =
+  infer e `tcBind` \ty -> tcPure (Typed e ty, ty)
+
+-- Variables: wrap with looked-up type
+inferElab e@(Id _) =
+  infer e `tcBind` \ty -> tcPure (Typed e ty, ty)
+
+-- Already-typed: elaborate inner, preserve annotation
+inferElab (Typed e tExpr) =
+  normalizeTypeExpr tExpr `tcBind` \ty ->
+    checkElab e ty `tcBind` \e' ->
+      tcPure (Typed e' ty, ty)
+
+-- Class constructor: ClassName.new(args)
+inferElab e@(App (RecFieldAccess ("new", _) (Id _)) _) =
+  infer e `tcBind` \ty ->
+    tcPure (Typed e ty, ty)
+
+-- Function application: f(args)
+inferElab (App f args) =
+  inferElab f `tcBind` \(f', fTy) ->
+    applySubst fTy `tcBind` \fTy' ->
+      inferAppElab f' fTy' args
+
+-- Constructor tuple: Tag(args)
+inferElab (ConTuple ct@(ConsTag cname _tag) args) =
+  tcMapM inferElab args `tcBind` \elabPairs ->
+    let args' = Prelude.map fst elabPairs
+    in infer (ConTuple ct args) `tcBind` \ty ->
+      tcPure (Typed (ConTuple ct args') ty, ty)
+
+-- NTuple: positional or named
+inferElab (NTuple fields) =
+  tcMapM (\(mn, e) -> inferElab e `tcBind` \(e', _) -> tcPure (mn, e')) fields `tcBind` \elabFields ->
+    infer (NTuple fields) `tcBind` \ty ->
+      tcPure (Typed (NTuple elabFields) ty, ty)
+
+-- Function definition
+inferElab (Function lam) = inferLambdaElab lam
+
+-- Pattern matches: infer ALL branches and unify their types
+inferElab (PatternMatches cases) =
+  case cases of
+    [] -> freshMeta `tcBind` \ty -> tcPure (Typed (PatternMatches []) ty, ty)
+    (c:cs) ->
+      inferElab c `tcBind` \(c', firstTy) ->
+        tcMapM (\ci ->
+          inferElab ci `tcBind` \(ci', branchTy) ->
+            applySubst firstTy `tcBind` \firstTy' ->
+              applySubst branchTy `tcBind` \branchTy' ->
+                tcWithContext "pattern match branches must have same type"
+                  (tcTry (unify branchTy' firstTy') `tcBind` \result ->
+                    case result of
+                      Just _  -> tcPure ()
+                      Nothing -> tcHardWarn (Mismatch firstTy' branchTy'))
+                `tcBind` \_ -> tcPure ci'
+        ) cs `tcBind` \cs' ->
+          applySubst firstTy `tcBind` \resTy ->
+            tcPure (Typed (PatternMatches (c':cs')) resTy, resTy)
+
+-- CaseOf: bind pattern variables before inferring body
+inferElab (CaseOf pats bodyExpr si) =
+  let bindings = [(Surface.name v, typ v) | v <- pats, Surface.name v /= "", Surface.name v /= "_"]
+  in tcMapM (\(n, tpExpr) -> normalizeTypeExpr tpExpr `tcBind` \ty -> tcPure (n, ty)) bindings `tcBind` \typedBindings ->
+       let extendEnv env = env { varTypes = Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) typedBindings }
+       in tcLocal extendEnv (inferElab bodyExpr) `tcBind` \(body', bodyTy) ->
+            tcPure (Typed (CaseOf pats body' si) bodyTy, bodyTy)
+
+-- ExpandedCase: apply GADT refinements
+inferElab (ExpandedCase checks bodyExpr si) =
+  let updateSi env = case si of
+        SourceInteractive -> env
+        _                 -> env { tcSourceInfo = Just si }
+  in tcLocal updateSi $
+    gadtRefine checks `tcBind` \refinements ->
+      if Prelude.null refinements
+      then inferElab bodyExpr `tcBind` \(body', bodyTy) ->
+             tcPure (Typed (ExpandedCase checks body' si) bodyTy, bodyTy)
+      else tcLocal (applyGADTRefinements refinements)
+             (inferElab bodyExpr) `tcBind` \(body', bodyTy) ->
+               tcPure (Typed (ExpandedCase checks body' si) bodyTy, bodyTy)
+
+-- Statements
+inferElab (Statements stmts) =
+  case stmts of
+    [] -> tcPure (Typed (Statements []) (Id "Unit"), Id "Unit")
+    _ -> tcMapM inferElab stmts `tcBind` \elabPairs ->
+           let stmts' = Prelude.map fst elabPairs
+               lastTy = snd (Prelude.last elabPairs)
+           in tcPure (Typed (Statements stmts') lastTy, lastTy)
+
+-- Unary/Binary ops: delegate to App elaboration
+inferElab (UnaryOp opName e) = inferElab (App (Id opName) [e])
+inferElab (BinaryOp opName e1 e2) = inferElab (App (Id opName) [e1, e2])
+
+-- Universe
+inferElab e@(U l) = tcPure (Typed e (U (levelSucc l)), U (levelSucc l))
+
+-- If-then-else
+inferElab (IfThenElse cond thenE elseE) =
+  checkElab cond (Id "Bool") `tcBind` \cond' ->
+    inferElab thenE `tcBind` \(then', tTy) ->
+      checkElab elseE tTy `tcBind` \else' ->
+        tcPure (Typed (IfThenElse cond' then' else') tTy, tTy)
+
+-- Let-in
+inferElab (LetIn binds bodyExpr) = inferLetBindsElabAndBody binds bodyExpr
+
+-- Field access
+inferElab (RecFieldAccess fa@(fieldName, idx) e) =
+  inferElab e `tcBind` \(e', eTy) ->
+    applySubst eTy `tcBind` \eTy' ->
+      (case eTy' of
+        RowExtend _ _ _ ->
+          tcTry (rowExtract fieldName eTy') `tcBind` \result ->
+            case result of
+              Just (ty, _) -> tcPure ty
+              Nothing -> resolveConstructorField fieldName idx eTy'
+        _ -> resolveConstructorField fieldName idx eTy') `tcBind` \resTy ->
+        tcPure (Typed (RecFieldAccess fa e') resTy, resTy)
+
+-- Array literal
+inferElab (ArrayLit es) =
+  tcMapM inferElab es `tcBind` \elabPairs ->
+    let es' = Prelude.map fst elabPairs
+    in infer (ArrayLit es) `tcBind` \ty ->
+      tcPure (Typed (ArrayLit es') ty, ty)
+
+-- ActionBlock
+inferElab (ActionBlock stmts) =
+  case stmts of
+    [] -> tcPure (Typed (ActionBlock []) (Id "Unit"), Id "Unit")
+    _ -> tcMapM inferActionStmtElab stmts `tcBind` \elabPairs ->
+           let stmts' = Prelude.map fst elabPairs
+               lastTy = snd (Prelude.last elabPairs)
+           in tcPure (Typed (ActionBlock stmts') lastTy, lastTy)
+
+-- ReprCast
+inferElab (ReprCast e tp) =
+  inferElab e `tcBind` \(e', _) ->
+    infer (ReprCast e tp) `tcBind` \ty ->
+      tcPure (Typed (ReprCast e' tp) ty, ty)
+
+-- HandleWith
+inferElab (HandleWith comp handler) =
+  inferElab comp `tcBind` \(comp', compTy) ->
+    inferElab handler `tcBind` \(handler', _) ->
+      applySubst compTy `tcBind` \compTy' ->
+        let resTy = case compTy' of
+              EffType _row resTy' -> resTy'
+              _ -> compTy'
+        in tcPure (Typed (HandleWith comp' handler') resTy, resTy)
+
+-- OverrideApp: infer the inner call
+inferElab (OverrideApp func overrides args) =
+  inferElab (App func args) `tcBind` \(elab, ty) ->
+    -- Rewrap with overrides (keep the original structure)
+    tcPure (Typed (OverrideApp func overrides args) ty, ty)
+
+-- Implicit
+inferElab (Implicit e) =
+  inferElab e `tcBind` \(e', ty) -> tcPure (Typed (Implicit e') ty, ty)
+
+-- Value
+inferElab (Value v e) =
+  normalizeTypeExpr (typ v) `tcBind` \ty ->
+    tcPure (Typed (Value v e) ty, ty)
+
+-- PropEq, Implies, Law
+inferElab e@(PropEq _ _) = tcPure (e, U (LConst 0))
+inferElab e@(Implies _ _) = tcPure (e, U (LConst 0))
+inferElab e@(Law _ _) = tcPure (e, Id "Unit")
+
+-- For non-value expressions (Structure, SumType, Instance, Module nodes, etc.)
+-- just delegate to existing `infer` and don't wrap
+inferElab e@(SumType _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Structure _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Instance _ _ _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Primitive _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(ClassDecl _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@Intrinsic = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@Derive = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@UNDEFINED = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(ModuleDecl _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Import _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Open _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Export _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(PrivateDecl _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(OpaqueTy _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(TargetBlock _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(TargetSwitch _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(EffectDecl _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(HandlerDecl _ _ _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(EffType _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Repr _ _ _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(FixityDecl _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Constructors _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Binding _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Pi _ _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(RecordType _ _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(DeclBlock _) = infer e `tcBind` \ty -> tcPure (e, ty)
+inferElab e@(Action _) = infer e `tcBind` \ty -> tcPure (e, ty)
+
+-- Catch-all: delegate to infer
+inferElab e = infer e `tcBind` \ty -> tcPure (e, ty)
+
+-- | Check an expression against an expected type and return the elaborated expression.
+checkElab :: Expr -> Expr -> TC Expr
+
+-- Pattern matches: check each case
+checkElab (PatternMatches cases) expectedTy =
+  tcMapM (\c -> checkElab c expectedTy) cases `tcBind` \cases' ->
+    tcPure (Typed (PatternMatches cases') expectedTy)
+
+-- CaseOf: bind patterns, check body
+checkElab (CaseOf pats bodyExpr si) expectedTy =
+  let bindings = [(Surface.name v, typ v) | v <- pats, Surface.name v /= "", Surface.name v /= "_"]
+  in tcMapM (\(n, tpExpr) -> normalizeTypeExpr tpExpr `tcBind` \ty -> tcPure (n, ty)) bindings `tcBind` \typedBindings ->
+       let extendEnv env = env { varTypes = Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) typedBindings }
+       in tcLocal extendEnv (checkElab bodyExpr expectedTy) `tcBind` \body' ->
+            tcPure (Typed (CaseOf pats body' si) expectedTy)
+
+-- ExpandedCase: GADT refinements
+checkElab (ExpandedCase checks bodyExpr si) expectedTy =
+  gadtRefine checks `tcBind` \refinements ->
+    if Prelude.null refinements
+    then checkElab bodyExpr expectedTy `tcBind` \body' ->
+           tcPure (Typed (ExpandedCase checks body' si) expectedTy)
+    else
+      let refinedExpected = Prelude.foldl (\t (n, r) -> substTyVar n r t) expectedTy refinements
+      in tcLocal (applyGADTRefinements refinements)
+           (checkElab bodyExpr refinedExpected) `tcBind` \body' ->
+             tcPure (Typed (ExpandedCase checks body' si) expectedTy)
+
+-- Subsumption fallback: infer then unify
+checkElab expr expectedTy =
+  inferElab expr `tcBind` \(elab, inferredTy) ->
+    tcTry (unify inferredTy expectedTy) `tcBind` \result ->
+      case result of
+        Just _  -> tcPure (Typed elab expectedTy)
+        Nothing ->
+          tcTry (subtype inferredTy expectedTy) `tcBind` \subResult ->
+            case subResult of
+              Just _  -> tcPure (Typed elab expectedTy)
+              Nothing -> tcWarnOrFail (Mismatch expectedTy inferredTy) `tcBind` \_ ->
+                tcPure elab  -- keep untyped on error
+
+-- | Apply a function type to arguments, producing elaborated output.
+-- Takes elaborated f, its type, and raw args.
+-- Returns (Typed (App f' args') retTy, retTy).
+inferAppElab :: Expr -> Expr -> [Expr] -> TC (Expr, Expr)
+inferAppElab f' fTy args = goApp fTy args [] `tcBind` \(elabArgs, retTy) ->
+    let result = if Prelude.null args then f' else Typed (App f' (Prelude.reverse elabArgs)) retTy
+    in tcPure (result, retTy)
+  where
+    goApp ty [] acc = tcPure (acc, ty)
+    -- Non-dependent arrow
+    goApp (Pi Nothing paramTy retTy) (arg:rest) acc =
+      checkElab arg paramTy `tcBind` \arg' ->
+        applySubst retTy `tcBind` \retTy' -> goApp retTy' rest (arg':acc)
+    -- Dependent Pi
+    goApp (Pi (Just pname) paramTy retTy) (arg:rest) acc =
+      inferElab arg `tcBind` \(arg', argTy) ->
+        tcWithContext "argument of dependent application" (unify argTy paramTy) `tcBind` \_ ->
+          withCompilerEnv (tcPure (substTyVar pname argTy retTy)) (\env ->
+            let retTy' = normalizeTy env (substTyVar pname argTy retTy)
+            in tcPure retTy') `tcBind` \retTy'' ->
+              applySubst retTy'' `tcBind` \retTy''' ->
+                goApp retTy''' rest (arg':acc)
+    -- Unknown function type: create fresh vars
+    goApp (Meta v) remaining acc =
+      tcMapM inferElab remaining `tcBind` \pairs ->
+        let args' = Prelude.map fst pairs
+            argTys = Prelude.map snd pairs
+        in freshMeta `tcBind` \retTy ->
+          let fnTy = Prelude.foldr (\a b -> Pi Nothing a b) retTy argTys
+          in bind v fnTy `tcBind` \_ ->
+            tcPure (Prelude.reverse acc ++ args', retTy)
+    -- Type variable (Id "a") — might be a function type
+    goApp ty@(Id n) remaining acc | not (Prelude.null n) && Prelude.head n >= 'a' && Prelude.head n <= 'z' =
+      tcMapM inferElab remaining `tcBind` \pairs ->
+        let args' = Prelude.map fst pairs
+            argTys = Prelude.map snd pairs
+        in freshMeta `tcBind` \retTy ->
+          let fnTy = Prelude.foldr (\a b -> Pi Nothing a b) retTy argTys
+          in tcTry (unify ty fnTy) `tcBind` \_ ->
+            tcPure (Prelude.reverse acc ++ args', retTy)
+    -- Not an arrow type — error
+    goApp ty remaining acc =
+      let isConcrete = case ty of
+            Id n -> not (Prelude.null n) && (Prelude.head n >= 'A' && Prelude.head n <= 'Z')
+            App (Id n) _ -> not (Prelude.null n) && (Prelude.head n >= 'A' && Prelude.head n <= 'Z')
+            U _ -> True
+            _ -> False
+          errMsg = OtherError $ "Cannot apply non-function type '" ++ showTy ty ++ "' to " ++ show (Prelude.length remaining) ++ " argument(s)"
+          reportErr = if isConcrete then tcHardWarn errMsg else tcWarnOrFail errMsg
+      in tcMapM inferElab remaining `tcBind` \pairs ->
+           let args' = Prelude.map fst pairs
+           in reportErr `tcBind` \_ ->
+             freshMeta `tcBind` \retTy ->
+               tcPure (Prelude.reverse acc ++ args', retTy)
+
+-- | Infer type of a Lambda definition and return elaborated form.
+-- Returns (Function elaboratedLam, funcType).
+inferLambdaElab :: Lambda -> TC (Expr, Expr)
+inferLambdaElab lam =
+  let ps = case params lam of
+        (Var _ (Implicit _) _):rest -> rest
+        p -> p
+      selfName = lamName lam
+      ctx = if selfName /= "" then "function '" ++ selfName ++ "'" else "anonymous lambda"
+      setSrcInfo env = case lamSrcInfo lam of
+        SourceInteractive -> env
+        si -> env { tcSourceInfo = Just si }
+  in tcLocal setSrcInfo $ tcWithContext ctx (
+    tcMapM (\(Var n tp _) ->
+       normalizeTypeExpr tp `tcBind` \ty -> tcPure (n, ty)) ps `tcBind` \paramBindings ->
+     normalizeTypeExpr (lamType lam) `tcBind` \retTy ->
+     let paramTys0 = Prelude.map snd paramBindings
+         paramNames = Prelude.map fst paramBindings
+     in tcAsk `tcBind` \tcEnv ->
+     let nameInGlobalEnv = case envCompiler tcEnv of
+           Nothing -> False
+           Just cenv -> case lookupLambda selfName cenv of
+             Just _ -> True
+             Nothing -> case lookupConstructor selfName cenv of
+               Just _ -> True
+               Nothing -> False
+     in (case retTy of
+           Meta _ -> freshMeta
+           _      -> tcPure (Prelude.foldr (\a b -> Pi Nothing a b) retTy paramTys0)
+        ) `tcBind` \selfTy ->
+     let extendEnv env = env { varTypes =
+           (if selfName /= "" && selfName `Prelude.notElem` paramNames && not nameInGlobalEnv
+            then Map.insert selfName selfTy else id) $
+           Prelude.foldl (\m (n,t) -> Map.insert n t m) (varTypes env) paramBindings }
+     in tcLocal extendEnv (
+            case retTy of
+              Meta _ -> inferElab (body lam)
+              _      -> checkElab (body lam) retTy `tcBind` \body' -> tcPure (body', retTy)
+          ) `tcBind` \(elabBody, bodyTy) ->
+            let paramTys = Prelude.map snd paramBindings
+                funcTy = Prelude.foldr (\a b -> Pi Nothing a b) bodyTy paramTys
+                elabLam = lam { body = elabBody, lamType = bodyTy }
+            in tcPure (Function elabLam, funcTy)
+    )
+
+-- | Infer let bindings with elaboration and body.
+inferLetBindsElabAndBody :: [(Var, Expr)] -> Expr -> TC (Expr, Expr)
+inferLetBindsElabAndBody binds bodyExpr = goLet binds [] `tcBind` \(elabBinds, body', bodyTy) ->
+  tcPure (Typed (LetIn (Prelude.reverse elabBinds) body') bodyTy, bodyTy)
+  where
+    goLet [] acc = inferElab bodyExpr `tcBind` \(body', bodyTy) -> tcPure (acc, body', bodyTy)
+    goLet ((v, e):rest) acc =
+      inferElab e `tcBind` \(e', ty) ->
+        tcLocal (\env -> env { varTypes = Map.insert (Surface.name v) ty (varTypes env) })
+          (goLet rest ((v, e'):acc))
+
+-- | Infer the type of an action statement with elaboration.
+inferActionStmtElab :: ActionStmt -> TC (ActionStmt, Expr)
+inferActionStmtElab (ActionBind n expr) =
+  inferElab expr `tcBind` \(e', ty) -> tcPure (ActionBind n e', ty)
+inferActionStmtElab (ActionLet n expr) =
+  inferElab expr `tcBind` \(e', ty) -> tcPure (ActionLet n e', ty)
+inferActionStmtElab (ActionExpr expr) =
+  inferElab expr `tcBind` \(e', ty) -> tcPure (ActionExpr e', ty)
+
+-- | Zonk an elaborated AST: resolve all Meta variables in Typed wrappers.
+zonkExpr :: Expr -> TC Expr
+zonkExpr (Typed e t) =
+  zonkExpr e `tcBind` \e' ->
+    zonk t `tcBind` \t' ->
+      tcPure (Typed e' t')
+zonkExpr (App f args) =
+  zonkExpr f `tcBind` \f' ->
+    tcMapM zonkExpr args `tcBind` \args' ->
+      tcPure (App f' args')
+zonkExpr (Function lam) =
+  zonkExpr (body lam) `tcBind` \body' ->
+    zonk (lamType lam) `tcBind` \lt' ->
+      tcMapM (\v -> zonk (typ v) `tcBind` \t' -> tcPure (v { typ = t' })) (params lam) `tcBind` \ps' ->
+        tcPure (Function (lam { body = body', params = ps', lamType = lt' }))
+zonkExpr (LetIn binds bodyExpr) =
+  tcMapM (\(v, e) -> zonkExpr e `tcBind` \e' -> tcPure (v, e')) binds `tcBind` \binds' ->
+    zonkExpr bodyExpr `tcBind` \body' ->
+      tcPure (LetIn binds' body')
+zonkExpr (IfThenElse c t e) =
+  zonkExpr c `tcBind` \c' ->
+    zonkExpr t `tcBind` \t' ->
+      zonkExpr e `tcBind` \e' ->
+        tcPure (IfThenElse c' t' e')
+zonkExpr (CaseOf cv ex si) =
+  tcMapM (\v -> zonkExpr (val v) `tcBind` \v' -> tcPure (v { val = v' })) cv `tcBind` \cv' ->
+    zonkExpr ex `tcBind` \ex' ->
+      tcPure (CaseOf cv' ex' si)
+zonkExpr (ExpandedCase checks bodyExpr si) =
+  tcMapM zonkCheck checks `tcBind` \checks' ->
+    zonkExpr bodyExpr `tcBind` \body' ->
+      tcPure (ExpandedCase checks' body' si)
+zonkExpr (PatternMatches cases) =
+  tcMapM zonkExpr cases `tcBind` \cases' ->
+    tcPure (PatternMatches cases')
+zonkExpr (ConTuple ct args) =
+  tcMapM zonkExpr args `tcBind` \args' ->
+    tcPure (ConTuple ct args')
+zonkExpr (NTuple fields) =
+  tcMapM (\(mn, e) -> zonkExpr e `tcBind` \e' -> tcPure (mn, e')) fields `tcBind` \fs' ->
+    tcPure (NTuple fs')
+zonkExpr (ActionBlock stmts) =
+  tcMapM zonkActionStmt stmts `tcBind` \stmts' ->
+    tcPure (ActionBlock stmts')
+zonkExpr (BinaryOp op l r) =
+  zonkExpr l `tcBind` \l' ->
+    zonkExpr r `tcBind` \r' ->
+      tcPure (BinaryOp op l' r')
+zonkExpr (UnaryOp op e) =
+  zonkExpr e `tcBind` \e' ->
+    tcPure (UnaryOp op e')
+zonkExpr (ArrayLit es) =
+  tcMapM zonkExpr es `tcBind` \es' ->
+    tcPure (ArrayLit es')
+zonkExpr (RecFieldAccess ac e) =
+  zonkExpr e `tcBind` \e' ->
+    tcPure (RecFieldAccess ac e')
+zonkExpr (ReprCast e t) =
+  zonkExpr e `tcBind` \e' ->
+    tcPure (ReprCast e' t)
+zonkExpr (HandleWith c h) =
+  zonkExpr c `tcBind` \c' ->
+    zonkExpr h `tcBind` \h' ->
+      tcPure (HandleWith c' h')
+zonkExpr (Statements stmts) =
+  tcMapM zonkExpr stmts `tcBind` \stmts' ->
+    tcPure (Statements stmts')
+zonkExpr (Implicit e) =
+  zonkExpr e `tcBind` \e' ->
+    tcPure (Implicit e')
+-- Atoms and non-value exprs: return as-is
+zonkExpr e = tcPure e
+
+-- | Zonk a pattern check expression
+zonkCheck :: Expr -> TC Expr
+zonkCheck (PatternGuard pc e) =
+  zonkExpr e `tcBind` \e' -> tcPure (PatternGuard pc e')
+zonkCheck other = tcPure other
+
+-- | Zonk an action statement
+zonkActionStmt :: ActionStmt -> TC ActionStmt
+zonkActionStmt (ActionExpr e) =
+  zonkExpr e `tcBind` \e' -> tcPure (ActionExpr e')
+zonkActionStmt (ActionBind n e) =
+  zonkExpr e `tcBind` \e' -> tcPure (ActionBind n e')
+zonkActionStmt (ActionLet n e) =
+  zonkExpr e `tcBind` \e' -> tcPure (ActionLet n e')
+
+-- | Elaborate a top-level declaration and return elaborated Lambdas.
+-- Returns a list of (name, elaboratedLambda) pairs.
+-- For Function: returns [(lamName, elabLam)]
+-- For Instance: returns [(instanceKey, elabLam)] for each impl
+-- For others: returns []
+checkTopLevelElab :: Expr -> TC [(Name, Lambda)]
+checkTopLevelElab (Function lam) =
+  let setSrcInfo env = case lamSrcInfo lam of
+        SourceInteractive -> env
+        si -> env { tcSourceInfo = Just si }
+  in tcLocal setSrcInfo (
+    inferLambdaElab lam `tcBind` \(elabExpr, _funcTy) ->
+      resolveConstraints `tcBind` \_ ->
+        case elabExpr of
+          Function elabLam ->
+            zonkExpr (body elabLam) `tcBind` \zonkedBody ->
+              tcMapM (\v -> zonk (typ v) `tcBind` \t -> tcPure (v { typ = t })) (params elabLam) `tcBind` \zonkedParams ->
+                zonk (lamType elabLam) `tcBind` \zonkedRetTy ->
+                  let finalLam = elabLam { body = zonkedBody, params = zonkedParams, lamType = zonkedRetTy }
+                  in tcPure [(lamName finalLam, finalLam)]
+          _ -> tcPure []
+    )
+
+checkTopLevelElab (Instance structName mTag targs impls reqs) =
+  -- First run the existing checkTopLevel logic for validation
+  checkTopLevel (Instance structName mTag targs impls reqs) `tcBind` \_ ->
+    -- Then elaborate each Function impl body
+    tcMapM (\impl -> case impl of
+      Function implLam ->
+        tcTry (inferLambdaElab implLam) `tcBind` \mResult ->
+          case mResult of
+            Just (Function elabLam, _) ->
+              zonkExpr (body elabLam) `tcBind` \zonkedBody ->
+                tcMapM (\v -> zonk (typ v) `tcBind` \t -> tcPure (v { typ = t })) (params elabLam) `tcBind` \zonkedParams ->
+                  zonk (lamType elabLam) `tcBind` \zonkedRetTy ->
+                    tcPure [(lamName elabLam, elabLam { body = zonkedBody, params = zonkedParams, lamType = zonkedRetTy })]
+            _ -> tcPure []
+      _ -> tcPure []
+    ) impls `tcBind` \results ->
+      tcPure (Prelude.concat results)
+
+-- For non-function top-level exprs, delegate to existing checkTopLevel
+checkTopLevelElab expr = checkTopLevel expr `tcBind` \_ -> tcPure []
+
+-- ============================================================================
 -- Pipeline Integration
 -- ============================================================================
 
@@ -1647,24 +2173,27 @@ typeCheckPass = do
         exprToName (App (Id n) _) = n
         exprToName e = showExprBrief e
         md' = Prelude.map useOptimized md
-    _ <- foldM (\accSt (expr, srcInfo) ->
-        case runTC (checkTopLevel expr) tcEnv accSt of
+    (_, allElabLams) <- foldM (\(accSt, accLams) (expr, srcInfo) ->
+        case runTC (checkTopLevelElab expr) tcEnv accSt of
             Left errs -> do
                 forM_ errs $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                -- Count errors
                 modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length errs })
-                return accSt
-            Right (_, tcSt') -> do
+                return (accSt, accLams)
+            Right (elabLams, tcSt') -> do
                 let newErrors = tcErrors tcSt'
                 forM_ newErrors $ \err ->
                     logFn (mkTCLogPayload srcInfo err)
-                -- Count errors
                 unless (Prelude.null newErrors) $
                     modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length newErrors })
-                return (tcSt' { tcErrors = [] })
-      ) tcSt md'
-    pure ()
+                return (tcSt' { tcErrors = [] }, elabLams ++ accLams)
+      ) (tcSt, []) md'
+    -- Write elaborated lambdas into separate elab maps (not overwriting raw canonical maps).
+    -- normalizeTy and exprToCLMTC consume raw maps; Monomorphize/Specialize use elab maps.
+    st2 <- get
+    let env2 = currentEnvironment st2
+        env3 = Prelude.foldl (\e (n, lam) -> storeElaboratedLambda n lam e) env2 allElabLams
+    modify (\s -> s { currentEnvironment = env3 })
 
 -- | Build a TCEnv from the compiler's Environment
 buildTCEnvFromEnvironment :: Environment -> TCEnv

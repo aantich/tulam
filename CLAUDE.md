@@ -31,6 +31,7 @@ Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
   → Pass 1: Environment Building (types, constructors, lambdas, primitives, instances, intrinsics)
   → Pass 2: Case Optimization (beta reduction, pattern expansion)
   → Pass 3: Type Checking (bidirectional type checker with row polymorphism, permissive by default)
+  → Pass 3.2: Type Elaboration (wraps sub-expressions with Typed annotations for downstream passes)
   → Pass 4: CLM Conversion (Surface AST → Core List Machine IR, intrinsic → CLMPRIMCALL)
   → Pass 5: Code Generation (target-specific output)
 ```
@@ -47,6 +48,7 @@ Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
 | `src/State.hs` | Interpreter state and monad stack. Environment maps (types, constructors, topLambdas, clmLambdas, classDecls). `ClassMeta` stores class hierarchy. |
 | `src/Interpreter.hs` | CLM evaluator. Pattern matching resolution, expression evaluation, intrinsic dispatch. |
 | `src/Intrinsics.hs` | Intrinsic function registry. Maps `(funcName, typeName)` to Haskell evaluation functions for Int/Float64 arithmetic and comparison. |
+| `src/TypeElaborate.hs` | Pass 3.2: Type elaboration. Wraps sub-expressions with `Typed expr type` after TC. Bottom-up walk using ElabEnv (var→type map). Resolves constructor type params from arg types. Downstream mono/spec reads from Typed wrappers. |
 | `src/TypeCheck.hs` | Bidirectional type checker with row polymorphism. Internal types (`Ty`: TVar, TRigid, TCon, TApp, TPi, TSigma, TId, TForall, TRecord, TU), row types (REmpty, RExtend, RVar, RRigid), unification engine, structure constraint resolution. Permissive mode by default (errors are warnings). |
 | `src/Logs.hs` | Error handling with source location tracking. |
 | `src/MetadataResolver.hs` | Stub interface for codegen-time extern class metadata resolution (.NET/JS/native). No-op in interpreter. |

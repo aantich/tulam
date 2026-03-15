@@ -23,6 +23,7 @@ import Surface
 import Pipeline
 import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass)
 import TypeCheck (typeCheckPass, typeAnnotatePass)
+import TypeElaborate (typeElaboratePass)
 -- addBinding, traceExpr, installDefaultHandlers are in Pipeline (imported unqualified)
 import CLM (pprSummary)
 import Backends.Bytecode.Runner (runBytecode, evalInteractive, compileToBytecode, BytecodeResult(..))
@@ -737,6 +738,14 @@ processSet "stricttypes" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = False } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "strict type checking off"
 
+processSet "debug" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { debugTrace = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "debug tracing on"
+processSet "debug" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { debugTrace = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "debug tracing off"
+processSet "debug" _ = liftIO $ putStrLn "Usage: :s debug on|off"
+
 processSet "mono" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { monomorphLevel = MonoNone } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "monomorphization off" ++ " (dynamic dispatch)"
@@ -747,6 +756,14 @@ processSet "mono" ("full":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { monomorphLevel = MonoFull } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "monomorphization full" ++ " (all instance dispatch resolved)"
 processSet "mono" _ = liftIO $ putStrLn "Usage: :s mono off|target|full"
+
+processSet "spec" ("none":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { specLevel = SpecNone } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "specialization off" ++ " (generic instances stay generic)"
+processSet "spec" ("full":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { specLevel = SpecFull } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "specialization full" ++ " (all generic instances specialized)"
+processSet "spec" _ = liftIO $ putStrLn "Usage: :s spec none|full"
 
 processSet "newstrings" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { newStrings = True} } )
@@ -901,6 +918,7 @@ loadFileNewImpl nm = do
                     modify (\s -> s { tcErrorCount = 0 })
                     timedPass "Pass 3 (typecheck)" typeCheckPass
                     timedPass "Pass 3.1 (type annotate)" typeAnnotatePass
+                    timedPass "Pass 3.2 (type elaborate)" typeElaboratePass
                     terminationCheckPass
                     flushLogs
                   else do
@@ -959,6 +977,7 @@ runDeferredTC = do
         modify (\s -> s { tcErrorCount = 0 })
         timedPass "Pass 3 (deferred typecheck)" typeCheckPass
         timedPass "Pass 3.1 (deferred type annotate)" typeAnnotatePass
+        timedPass "Pass 3.2 (deferred type elaborate)" typeElaboratePass
         terminationCheckPass
         flushLogs
         -- Restore parsedModule

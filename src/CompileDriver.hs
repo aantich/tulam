@@ -30,8 +30,8 @@ import Data.List (nub)
 
 import Surface
 import State
-import Monomorphize (monomorphizeLambdas)
--- import qualified Debug.Trace as DT
+import Monomorphize (monomorphizeLambdas, buildHandlerOpsMap)
+import Specialize (specializeLambdas)
 
 -- | A compilation plan: the minimal set of functions, instances, externs,
 -- and types needed to compile the given entry points.
@@ -49,45 +49,70 @@ data CompilationPlan = CompilationPlan
 
 -- | Build a compilation plan for the given entry points and target.
 -- This is the main entry point for any backend.
-buildCompilationPlan :: [Name]             -- ^ Entry point function names
+buildCompilationPlan :: Bool                -- ^ Debug tracing enabled
+                     -> [Name]             -- ^ Entry point function names
                      -> Name               -- ^ Target name (e.g. "native")
                      -> MonomorphLevel     -- ^ How aggressively to resolve instances
+                     -> SpecLevel          -- ^ How aggressively to specialize generic instances
                      -> Environment        -- ^ Full loaded environment
                      -> InterpreterState   -- ^ For module provenance
                      -> CompilationPlan
-buildCompilationPlan entryPoints targetName monoLevel env state =
+buildCompilationPlan debug entryPoints targetName monoLevel specLvl env state =
     let -- Phase A: Reachability analysis (pre-monomorphization)
         -- Pass target name so reachability prefers target instances over interpreter instances
         (reachFuncs, reachInsts, reachCons, reachTypes) =
             computeReachableSet entryPoints targetName monoLevel env
 
-        -- Filter to only reachable names
-        reachableLams = Map.filterWithKey (\k _ -> HSet.member k reachFuncs) (topLambdas env)
-        reachableInsts = Map.filterWithKey (\k _ -> HSet.member k reachInsts) (instanceLambdas env)
+        -- Project reachable raw keys into the elaborated view explicitly.
+        -- Reachability is computed over canonical/raw names, while mono/spec work
+        -- best on elaborated lambdas when available.
+        reachableLams = Map.fromList
+            [ (k, lam)
+            | k <- HSet.toList reachFuncs
+            , Just lam <- [lookupLambdaRep ElabLambdaRep k env]
+            ]
+        reachableInsts = Map.fromList
+            [ (k, lam)
+            | k <- HSet.toList reachInsts
+            , Just lam <- [lookupInstanceLambdaByKeyRep ElabLambdaRep k env]
+            ]
 
-        -- Monomorphize only reachable functions, using FULL env for lookups.
+        -- Phase A.2: Monomorphize only reachable functions, using FULL env for lookups.
         -- The full env is needed so lookupLambda can find dispatch templates like "+"
-        (monoLams, monoInsts) = monomorphizeLambdas monoLevel targetName env reachableLams reachableInsts
+        (monoLams, monoInsts) = monomorphizeLambdas debug monoLevel targetName env reachableLams reachableInsts
 
-        -- Phase B: Collect extern refs from monomorphized bodies
+        -- Phase A.3: Specialize generic instance functions for concrete type args.
+        -- Creates specialized copies (e.g., show\0List\0$Int) and rewrites call sites.
+        (specLams, specInsts) = case specLvl of
+            SpecNone -> (monoLams, monoInsts)
+            SpecFull -> specializeLambdas debug targetName env monoLams monoInsts
+
+        -- Phase B: Collect extern refs from specialized bodies
         targetExts = case Map.lookup targetName (targetExterns env) of
             Just te -> te
             Nothing -> Map.empty
-        externRefs = collectExternRefs monoLams monoInsts targetExts
+        externRefs = collectExternRefs specLams specInsts targetExts
 
         -- Module provenance
         allReachableNames = Map.keys reachableLams ++ Map.keys reachableInsts
         origin = buildOriginMap allReachableNames
                     (loadedModules (currentModuleEnv state))
 
-        -- Phase C: Detect unresolved implicit dispatch after monomorphization
-        compiledFuncs = Map.filter (not . hasImplicit) monoLams
-        unresolved = nub $ concatMap (collectUnresolvedCalls env) (Map.elems compiledFuncs)
-                        ++ concatMap (collectUnresolvedCalls env) (Map.elems monoInsts)
+        -- Phase C: Detect unresolved implicit dispatch after specialization
+        -- After SpecFull, user functions and specialized instances (keys with $)
+        -- should have zero unresolved calls. Generic instances may still have
+        -- some if specialization couldn't resolve all type params.
+        compiledFuncs = Map.filter (not . hasImplicit) specLams
+        specializedInsts = Map.filterWithKey (\k _ -> '$' `elem` k) specInsts
+        checkSet = Map.union compiledFuncs specializedInsts
+        unresolvedWithSource = [(fname ++ " (" ++ show (lamSrcInfo lam) ++ ")", u)
+                               | (fname, lam) <- Map.toList checkSet
+                               , u <- collectUnresolvedCalls targetName env lam]
+        unresolved = nub [u ++ " in " ++ src | (src, u) <- unresolvedWithSource]
 
     in CompilationPlan
         { cpFunctions    = compiledFuncs
-        , cpInstances    = monoInsts
+        , cpInstances    = specInsts
         , cpExternRefs   = externRefs
         , cpConstructors = reachCons
         , cpTypes        = reachTypes
@@ -278,16 +303,21 @@ buildOriginMap names modules =
         , Set.member n (publicNames menv) || Set.member n (privateNames menv)
         ]
 
--- | Collect names of functions that still have implicit params (i.e., monomorphization
--- failed to resolve them). These will become CLMIAP in CLM and crash at runtime
--- in compiled backends.
-collectUnresolvedCalls :: Environment -> Lambda -> [Name]
-collectUnresolvedCalls env lam = go (body lam)
+-- | Collect names of dispatch calls that remain unresolved after monomorphization /
+-- specialization. This must be target-aware: some dispatch heads (like effectSeq)
+-- are provided by target handlers rather than top-level implicit functions.
+collectUnresolvedCalls :: Name -> Environment -> Lambda -> [Name]
+collectUnresolvedCalls targetName env lam = go (body lam)
   where
+    handlerOps = buildHandlerOpsMap targetName env
+
+    isUnresolvedDispatchHead n =
+        case lookupLambda n env of
+            Just fun | hasImplicit fun -> True
+            _ -> Map.member n handlerOps
+
     go (App (Id n) args) =
-        let self = case lookupLambda n env of
-                Just fun | hasImplicit fun -> [n]
-                _ -> []
+        let self = if isUnresolvedDispatchHead n then [n] else []
         in self ++ concatMap go args
     go (App f args) = go f ++ concatMap go args
     go (Function inner) = go (body inner)

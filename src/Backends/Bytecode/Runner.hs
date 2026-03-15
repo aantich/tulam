@@ -20,7 +20,7 @@ import qualified Data.Text as T
 import Data.List (nub)
 
 import Surface (Name, Lambda(..), Expr(..), Var(..), hasImplicit, mkLambda)
-import State (Environment(..), InterpreterState(..), MonomorphLevel(..))
+import State (Environment(..), InterpreterState(..), MonomorphLevel(..), CurrentFlags(..))
 import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import CLM (CLMLam)
@@ -69,7 +69,9 @@ compileToBytecodeWith env state funcNames =
             "Native target not loaded. Load lib/Backend/LLVM/Native.tl first."
         Just _allTexterns -> do
             -- Step 1: Build compilation plan (reachability + monomorphization)
-            let plan = buildCompilationPlan funcNames "native" MonoFull env state
+            let flags = currentFlags state
+                plan = buildCompilationPlan (debugTrace flags) funcNames "native"
+                         (monomorphLevel flags) (specLevel flags) env state
 
             -- Check for unresolved implicit dispatch (fatal for compiled backends)
             case cpUnresolved plan of

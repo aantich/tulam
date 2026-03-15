@@ -24,6 +24,7 @@ import qualified Data.Sequence as Seq
 import System.Directory (doesFileExist)
 import CaseOptimization (positivityCheckPass, terminationCheckPass, coverageCheckPass)
 import Pipeline (installDefaultHandlers)
+import TypeElaborate (elaborateExpr, elaborateLambda, typeOfExpr)
 import LLVMSpec (llvmTests)
 import BytecodeSpec (bytecodeTests)
 -- Helper: load all modules from lib/ into state, return the state
@@ -3686,3 +3687,72 @@ main = do
                     -- x has no explicit type but is unused; TC gives it a fresh meta → zonked to ?t0
                     -- The param type should be filled in (even if it's a metavar name)
                     typ (head (params result)) `shouldNotBe` UNDEFINED
+
+        describe "TypeElaborate" $ do
+            describe "elaborateExpr" $ do
+                let emptyEnv = initialEnvironment
+
+                it "wraps literals with Typed" $ do
+                    let result = elaborateExpr emptyEnv Map.empty (Lit (LInt 42))
+                    result `shouldBe` Typed (Lit (LInt 42)) (Id "Int")
+
+                it "wraps float literals with Typed" $ do
+                    let result = elaborateExpr emptyEnv Map.empty (Lit (LFloat 3.14))
+                    result `shouldBe` Typed (Lit (LFloat 3.14)) (Id "Float64")
+
+                it "wraps string literals with Typed" $ do
+                    let result = elaborateExpr emptyEnv Map.empty (Lit (LString "hello"))
+                    result `shouldBe` Typed (Lit (LString "hello")) (Id "String")
+
+                it "wraps char literals with Typed" $ do
+                    let result = elaborateExpr emptyEnv Map.empty (Lit (LChar 'a'))
+                    result `shouldBe` Typed (Lit (LChar 'a')) (Id "Char")
+
+                it "wraps variables from ElabEnv" $ do
+                    let elabEnv = Map.fromList [("x", Id "Int")]
+                        result = elaborateExpr emptyEnv elabEnv (Id "x")
+                    result `shouldBe` Typed (Id "x") (Id "Int")
+
+                it "leaves unknown variables unwrapped" $ do
+                    let result = elaborateExpr emptyEnv Map.empty (Id "unknown")
+                    result `shouldBe` Id "unknown"
+
+                it "preserves existing Typed wrappers" $ do
+                    let input = Typed (Id "x") (Id "Bool")
+                        result = elaborateExpr emptyEnv Map.empty input
+                    result `shouldBe` Typed (Id "x") (Id "Bool")
+
+                it "wraps action blocks as Unit" $ do
+                    let input = ActionBlock [ActionExpr (Lit (LInt 1))]
+                        result = elaborateExpr emptyEnv Map.empty input
+                    case result of
+                        Typed (ActionBlock _) (Id "Unit") -> return ()
+                        _ -> expectationFailure $ "Expected Typed ActionBlock Unit, got: " ++ show result
+
+                it "wraps if-then-else with then-branch type" $ do
+                    let input = IfThenElse (Lit (LInt 1)) (Lit (LInt 2)) (Lit (LInt 3))
+                        result = elaborateExpr emptyEnv Map.empty input
+                    case result of
+                        Typed (IfThenElse _ _ _) (Id "Int") -> return ()
+                        _ -> expectationFailure $ "Expected Typed IfThenElse Int, got: " ++ show result
+
+                it "elaborates let-in body type" $ do
+                    let input = LetIn [(Var "x" (Id "Int") UNDEFINED, Lit (LInt 42))] (Id "x")
+                        result = elaborateExpr emptyEnv Map.empty input
+                    case result of
+                        Typed (LetIn _ (Typed (Id "x") (Id "Int"))) (Id "Int") -> return ()
+                        _ -> expectationFailure $ "Expected Typed LetIn with body type Int, got: " ++ show result
+
+            describe "typeOfExpr" $ do
+                it "extracts type from Typed" $ do
+                    typeOfExpr (Typed (Id "x") (Id "Int")) `shouldBe` Just (Id "Int")
+
+                it "returns Nothing for non-Typed" $ do
+                    typeOfExpr (Id "x") `shouldBe` Nothing
+
+            describe "elaborateLambda" $ do
+                it "elaborates lambda body with param types" $ do
+                    let env0 = initialEnvironment
+                        lam = mkLambda "test" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int")
+                        result = elaborateLambda env0 lam
+                    body result `shouldBe` Typed (Id "x") (Id "Int")

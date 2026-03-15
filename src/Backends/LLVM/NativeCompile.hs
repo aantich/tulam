@@ -23,7 +23,7 @@ import System.Exit (ExitCode(..))
 import System.Directory (doesFileExist)
 
 import Surface (Name, Lambda(..), Var(..), Expr(..), hasImplicit)
-import State (Environment(..), InterpreterState(..), lookupLambda, MonomorphLevel(..))
+import State (Environment(..), InterpreterState(..), lookupLambda, MonomorphLevel(..), CurrentFlags(..))
 import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import Backends.LLVM.LIR
@@ -70,7 +70,9 @@ compileNative env state config funcNames = do
             "Native target not loaded. Load lib/Backend/LLVM/Native.tl first."
         Just allTexterns -> do
             -- Step 1: Build compilation plan (reachability + monomorphization)
-            let plan = buildCompilationPlan funcNames "native" MonoFull env state
+            let flags = currentFlags state
+                plan = buildCompilationPlan (debugTrace flags) funcNames "native"
+                         (monomorphLevel flags) (specLevel flags) env state
             -- Include non-intrinsic instance functions (MonoFull rewrites
             -- implicit-param calls to direct instance function references)
             let compilableInsts = Map.filter (\l -> body l /= Intrinsic) (cpInstances plan)
