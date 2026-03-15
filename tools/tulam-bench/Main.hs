@@ -11,15 +11,15 @@ import System.IO (hFlush, stdout)
 import Text.Printf (printf)
 
 import Surface
-import CLM
 import State
 import Pipeline
 import ModuleSystem
 import Parser (parseExpr)
 import CLMOptimize (runCLMOptPasses)
-import Interpreter (_contEval, evalCLM)
+import Monomorphize (monomorphizePass)
+import Backends.Bytecode.Runner (evalInteractive, BytecodeResult(..))
+import Backends.Bytecode.Value (valToString)
 import Logs (SourceInfo(..))
-import Util.PrettyPrinting (ppr)
 import Util.IOLogger (initLogState)
 
 -- | A benchmark configuration
@@ -88,11 +88,7 @@ passConfigs =
 runIntStateS :: IntState () -> InterpreterState -> IO InterpreterState
 runIntStateS act s = evalStateT (execStateT act s) initLogState
 
--- | Run an IntState action, returning the result value
-runIntStateV :: IntState a -> InterpreterState -> IO a
-runIntStateV act s = evalStateT (evalStateT act s) initLogState
-
--- | Load stdlib, return base state
+-- | Load stdlib + install handlers + monomorphize, return base state
 loadBase :: IO InterpreterState
 loadBase = runIntStateS setup emptyIntState
   where
@@ -101,10 +97,12 @@ loadBase = runIntStateS setup emptyIntState
         let searchPaths = ["lib/"]
         allModules <- liftIO $ resolveAllDeps searchPaths Set.empty [baseModulePath]
         mapM_ (\(_, filePath) -> loadFileQuiet filePath) allModules
+        installDefaultHandlers
+        monomorphizePass
 
 -- | Load a benchmark file on top of base state
 loadBench :: InterpreterState -> FilePath -> IO InterpreterState
-loadBench st filePath = runIntStateS (loadFileQuiet filePath) st
+loadBench st filePath = runIntStateS (loadFileQuiet filePath >> monomorphizePass) st
 
 -- | Re-optimize with different flags (restore raw CLM, apply new flags, re-run passes)
 reoptimize :: InterpreterState -> OptFlags -> IO InterpreterState
@@ -121,28 +119,46 @@ reoptimize st flags = runIntStateS reopt st
         -- Re-run optimization passes
         runCLMOptPasses
 
--- | Evaluate an expression string and return (result, time_ms)
-timedEval :: InterpreterState -> String -> IO (CLMExpr, Double)
+-- | Evaluate an expression string via bytecode VM and return (result_str, time_ms)
+timedEval :: InterpreterState -> String -> IO (String, Double)
 timedEval st input = do
-    t0 <- getCurrentTime
-    result <- runIntStateV (evalExprBench input) st
-    t1 <- getCurrentTime
-    let ms = realToFrac (diffUTCTime t1 t0) * 1000.0
-    return (result, ms)
-
--- | Evaluate a tulam expression (simplified from Interpreter.hs processInteractive)
-evalExprBench :: String -> IntState CLMExpr
-evalExprBench input = do
-    parsed <- parseExpr (T.pack input)
+    -- Parse and desugar the expression
+    let parsed = parseExprPure (T.pack input)
     case parsed of
-        Left err -> return $ CLMERR ("Parse error: " ++ show err) SourceInteractive
+        Left err -> return ("Parse error: " ++ show err, 0)
         Right ex0 -> do
             let ex = desugarActions . afterparse $ traverseExpr afterparse ex0
-            s <- get
-            let env = currentEnvironment s
-            let clmex = exprToCLM env ex
-            ex1' <- evalCLM 0 clmex
-            _contEval 1 clmex ex1'
+            let env = currentEnvironment st
+            -- Time the bytecode compilation + execution
+            t0 <- getCurrentTime
+            result <- evalInteractive env st ex
+            t1 <- getCurrentTime
+            let ms = realToFrac (diffUTCTime t1 t0) * 1000.0
+            case result of
+                BCRunOK val -> return (T.unpack (valToString val), ms)
+                BCCompileError e -> return ("Compile error: " ++ e, ms)
+                BCRuntimeError e -> return ("Runtime error: " ++ e, ms)
+                _ -> return ("Unknown result", ms)
+
+-- | Pure expression parsing (no monadic state needed)
+parseExprPure :: T.Text -> Either String Expr
+parseExprPure input =
+    case unsafeParseExpr input of
+        Left err -> Left (show err)
+        Right ex -> Right ex
+
+-- | Parse an expression without state (used for benchmark expressions).
+-- This is a simplified wrapper.
+unsafeParseExpr :: T.Text -> Either String Expr
+unsafeParseExpr input =
+    -- We need to use the parser in IO since it uses our monad stack.
+    -- For benchmarks, expressions are simple function calls like "benchArith()".
+    -- Parse them as Id + App.
+    let s = T.unpack input
+    in case break (== '(') s of
+        (name, "()") -> Right (App (Id name) [])
+        (name, "")   -> Right (Id name)
+        _            -> Left $ "Cannot parse benchmark expression: " ++ s
 
 -- | Run a single benchmark with a specific pass config
 runSingle :: InterpreterState -> Bench -> PassConfig -> IO BenchResult
@@ -154,16 +170,15 @@ runSingle baseSt bench pc = do
     st2 <- reoptimize st1 (pcFlags pc)
     t1 <- getCurrentTime
     let loadMs = realToFrac (diffUTCTime t1 t0) * 1000.0
-    -- Evaluate the expression
-    (result, evalMs) <- timedEval st2 (benchExpr bench)
-    let resultStr = take 40 (ppr result)
+    -- Evaluate the expression via bytecode VM
+    (resultStr, evalMs) <- timedEval st2 (benchExpr bench)
     return BenchResult
         { brBench = benchName bench
         , brConfig = pcName pc
         , brLoadMs = loadMs
         , brEvalMs = evalMs
         , brTotalMs = loadMs + evalMs
-        , brResult = resultStr
+        , brResult = take 40 resultStr
         }
 
 --------------------------------------------------------------------------------

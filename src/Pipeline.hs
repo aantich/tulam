@@ -17,8 +17,9 @@ import Control.Monad.Trans.Class
 import Data.Text as T hiding (intercalate, map)
 import qualified Data.Text.Lazy as TL
 import Data.List.Index
-import Data.List (intercalate, partition)
-import Data.Maybe (isNothing, listToMaybe)
+import Data.List (intercalate, partition, nub)
+import qualified Data.List
+import Data.Maybe (isNothing, listToMaybe, catMaybes)
 import Data.Char (ord)
 import Data.Word (Word8)
 import Data.Bits ((.&.), (.|.), shiftR)
@@ -1318,7 +1319,6 @@ varToCLMChecks env scope (Var nm _ val) = case val of
     _ -> []
 
 -- | Public API: convert Surface Expr to CLM with empty local scope.
--- Used by Interpreter.hs and other callers that don't track scope.
 exprToCLM :: Environment -> Expr -> CLMExpr
 exprToCLM env = exprToCLM' env Set.empty
 
@@ -1673,4 +1673,56 @@ exprOnlyToString (CaseOf args ex _) = caseToIf args ++ " return "
           
 exprOnlyToString e = "/* NOT IMPLEMENTED: " ++ ppr e ++ "*/"
 
-    
+-- ============================================================================
+-- REPL Helpers
+-- ============================================================================
+
+-- | Add a top-level binding to the CLM environment (for REPL definitions).
+addBinding :: Expr -> IntState ()
+addBinding ex@(Binding _) = do
+    s <- get
+    let env = currentEnvironment s
+    let clmex@(CLMBIND nm expr) = exprToCLM env ex
+    let bnd = Map.insert nm (nm, expr) (clmBindings env)
+    let s' = s { currentEnvironment = env { clmBindings = bnd } }
+    liftIO $ putStrLn $ "Added binding " ++ ppr ex
+    put s'
+addBinding e = liftIO $ putStrLn $ "Cant add binding for expr " ++ ppr e
+
+-- | Show CLM representation of an expression (for debug tracing).
+traceExpr :: Expr -> IntState ()
+traceExpr ex = do
+    s <- get
+    let env = currentEnvironment s
+    let clmex = exprToCLM env ex
+    liftIO $ putStrLn $ "CLM:\n" ++ show clmex
+
+-- ============================================================================
+-- Effect Handler Installation
+-- ============================================================================
+
+-- | Install default handlers for all effects that have a default handler declared.
+-- Default handlers are appended to the BOTTOM of the handler stack so that
+-- explicit handle...with blocks (pushed on top) override them.
+installDefaultHandlers :: IntState ()
+installDefaultHandlers = do
+    s <- get
+    let env = currentEnvironment s
+    let defaults = Map.toList (defaultHandlers env)
+    newEntries <- catMaybes <$> mapM (buildDefaultEntry env) defaults
+    let stack = handlerStack s
+    put $ s { handlerStack = stack ++ newEntries
+            , defaultHandlerCount = Prelude.length newEntries }
+  where
+    buildDefaultEntry env (effName, handlerName) =
+        case Map.lookup handlerName (effectHandlers env) of
+            Just (_eff, _isDef, hParams, impls) | Prelude.null hParams -> do
+                let opNames = effectOpNames env effName
+                let ops = [(lamName l, opToCLM env l) | Function l <- impls, lamName l `Prelude.elem` opNames]
+                let opMap = Map.fromList ops
+                pure $ Just (effName, opMap)
+            _ -> pure Nothing
+    opToCLM _env lam | body lam == Intrinsic = CLMPRIMCALL
+    opToCLM _env lam | body lam == UNDEFINED = CLMPRIMCALL
+    opToCLM env lam = CLMLAM (lambdaToCLMLambda env lam)
+

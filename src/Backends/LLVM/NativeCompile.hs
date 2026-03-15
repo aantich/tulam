@@ -23,9 +23,9 @@ import System.Exit (ExitCode(..))
 import System.Directory (doesFileExist)
 
 import Surface (Name, Lambda(..), Var(..), Expr(..), hasImplicit)
-import State (Environment(..), InterpreterState(..), lookupLambda)
+import State (Environment(..), InterpreterState(..), lookupLambda, MonomorphLevel(..))
 import Pipeline (lambdaToCLMLambda)
-import CompileDriver (CompilationPlan(..), buildCompilationPlan, MonomorphLevel(..))
+import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import Backends.LLVM.LIR
 import qualified Data.HashSet as HSet
 import CLM (CLMLam(..), CLMExpr(..))

@@ -23,7 +23,7 @@ import Util.IOLogger (initLogState, LogState(..), LogMessage(..), LogLevel(..))
 import qualified Data.Sequence as Seq
 import System.Directory (doesFileExist)
 import CaseOptimization (positivityCheckPass, terminationCheckPass, coverageCheckPass)
-import Interpreter (installDefaultHandlers)
+import Pipeline (installDefaultHandlers)
 import LLVMSpec (llvmTests)
 import BytecodeSpec (bytecodeTests)
 -- Helper: load all modules from lib/ into state, return the state
@@ -1500,6 +1500,28 @@ main = do
                     s `shouldSatisfy` ("foo" `isInfixOf`)
                     s `shouldSatisfy` ("Bar" `isInfixOf`)
                     s `shouldSatisfy` ("Int" `isInfixOf`)
+
+                it "Mismatch between two metas hints about missing annotations" $ do
+                    let err = Mismatch (Meta 0) (Meta 1)
+                    let s = showTCError err
+                    s `shouldSatisfy` ("Hint" `isInfixOf`)
+                    s `shouldSatisfy` ("annotation" `isInfixOf`)
+
+                it "Mismatch with one meta hints about annotation" $ do
+                    let err = Mismatch (Meta 0) (Id "Int")
+                    let s = showTCError err
+                    s `shouldSatisfy` ("Hint" `isInfixOf`)
+                    s `shouldSatisfy` ("annotation" `isInfixOf`)
+
+                it "Mismatch between concrete types has no hint" $ do
+                    let err = Mismatch (Id "Int") (Id "Bool")
+                    let s = showTCError err
+                    s `shouldSatisfy` (not . ("Hint" `isInfixOf`))
+
+                it "Meta in compound type hints about annotation" $ do
+                    let err = Mismatch (App (Id "Maybe") [Meta 0]) (Id "Int")
+                    let s = showTCError err
+                    s `shouldSatisfy` ("Hint" `isInfixOf`)
 
             describe "Numeric literal types" $ do
                 it "infers Int8 literal" $ do
@@ -3614,3 +3636,53 @@ main = do
 
                 it "substitutes inside Implicit" $ do
                     substTyVar "a" (Id "Int") (Implicit (Id "a")) `shouldBe` Implicit (Id "Int")
+
+            describe "decomposePi" $ do
+                it "decomposes simple arrow type" $ do
+                    let ty = Pi Nothing (Id "Int") (Pi Nothing (Id "Int") (Id "Int"))
+                    decomposePi ty `shouldBe` ([Id "Int", Id "Int"], Id "Int")
+
+                it "decomposes single-arg arrow" $ do
+                    decomposePi (Pi Nothing (Id "Bool") (Id "Int")) `shouldBe` ([Id "Bool"], Id "Int")
+
+                it "handles non-arrow type" $ do
+                    decomposePi (Id "Int") `shouldBe` ([], Id "Int")
+
+                it "skips type-level Pi binders (forall)" $ do
+                    -- forall a:Type. a -> a   →   params=[a], ret=a
+                    let ty = Pi (Just "a") (U (LConst 0)) (Pi Nothing (Id "a") (Id "a"))
+                    decomposePi ty `shouldBe` ([Id "a"], Id "a")
+
+                it "skips nested forall binders" $ do
+                    -- forall a:Type. forall b:Type. a -> b   →   params=[a], ret=b
+                    let ty = Pi (Just "a") (U (LConst 0)) (Pi (Just "b") (U (LConst 0)) (Pi Nothing (Id "a") (Id "b")))
+                    decomposePi ty `shouldBe` ([Id "a"], Id "b")
+
+            describe "annotateLambdaTypes" $ do
+                it "fills in UNDEFINED lamType from inference" $ do
+                    let lam = mkLambda "test" [Var "x" (Id "Int") UNDEFINED] (Id "x") UNDEFINED
+                        tcEnv = emptyTCEnv
+                        result = annotateLambdaTypes tcEnv lam
+                    -- The body is just (Id "x") which is a variable of type Int
+                    -- So the return type should be inferred as Int
+                    lamType result `shouldBe` Id "Int"
+
+                it "preserves explicit lamType" $ do
+                    let lam = mkLambda "test" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Bool")
+                        tcEnv = emptyTCEnv
+                        result = annotateLambdaTypes tcEnv lam
+                    lamType result `shouldBe` Id "Bool"
+
+                it "skips intrinsic bodies" $ do
+                    let lam = mkLambda "test" [Var "x" UNDEFINED UNDEFINED] Intrinsic UNDEFINED
+                        tcEnv = emptyTCEnv
+                        result = annotateLambdaTypes tcEnv lam
+                    lamType result `shouldBe` UNDEFINED  -- unchanged
+
+                it "fills in UNDEFINED param types from inference" $ do
+                    let lam = mkLambda "test" [Var "x" UNDEFINED UNDEFINED] (Lit (LInt 42)) (Id "Int")
+                        tcEnv = emptyTCEnv
+                        result = annotateLambdaTypes tcEnv lam
+                    -- x has no explicit type but is unused; TC gives it a fresh meta → zonked to ?t0
+                    -- The param type should be filled in (even if it's a metavar name)
+                    typ (head (params result)) `shouldNotBe` UNDEFINED

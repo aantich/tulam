@@ -7,23 +7,22 @@
 --   3. Compiles CLM → BytecodeModule
 --   4. Runs the BytecodeModule in the VM
 --
--- Shares infrastructure with the LLVM native backend:
---   - CompileDriver (reachability + monomorphization)
---   - Pipeline (lambdaToCLMLambda)
---   - Target declarations from lib/Backend/LLVM/Native.tl
+-- Also provides `evalInteractive` for REPL expression evaluation via bytecode.
 module Backends.Bytecode.Runner
     ( runBytecode
+    , evalInteractive
     , compileToBytecode
     , BytecodeResult(..)
     ) where
 
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as T
+import Data.List (nub)
 
-import Surface (Name, Lambda(..), hasImplicit)
-import State (Environment(..), InterpreterState(..))
+import Surface (Name, Lambda(..), Expr(..), Var(..), hasImplicit, mkLambda)
+import State (Environment(..), InterpreterState(..), MonomorphLevel(..))
 import Pipeline (lambdaToCLMLambda)
-import CompileDriver (CompilationPlan(..), buildCompilationPlan, MonomorphLevel(..))
+import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import CLM (CLMLam)
 import Backends.Bytecode.Compile (compileCLMModule)
 import Backends.Bytecode.Module (BytecodeModule(..), dumpModule)
@@ -38,34 +37,63 @@ data BytecodeResult
     | BCDisassembly String     -- ^ Disassembly output
     deriving (Show)
 
+-- | Evaluate an interactive REPL expression via bytecode VM.
+-- Wraps the expression as a temporary nullary function, compiles, and runs it.
+evalInteractive :: Environment -> InterpreterState -> Expr -> IO BytecodeResult
+evalInteractive env state expr = do
+    let replName = "__repl_eval__"
+        -- Wrap expression as a nullary function: function __repl_eval__() = <expr>
+        replLam = mkLambda replName [] expr UNDEFINED
+        -- Temporarily add to topLambdas
+        env' = env { topLambdas = Map.insert replName replLam (topLambdas env) }
+    -- Compile and run using the augmented environment
+    case compileToBytecodeWith env' state [replName] of
+        Left err -> return $ BCCompileError err
+        Right bm -> do
+            vm <- initVM bm
+            result <- runFunctionByName vm (T.pack replName) []
+            case result of
+                Left vmErr -> return $ BCRuntimeError (show vmErr)
+                Right val  -> return $ BCRunOK val
+
 -- | Compile tulam functions to a BytecodeModule.
 -- This is the compilation half — shared with disassembly and other tools.
 compileToBytecode :: Environment -> InterpreterState -> [Name] -> Either String BytecodeModule
-compileToBytecode env state funcNames =
-    -- Check target declarations are loaded
+compileToBytecode = compileToBytecodeWith
+
+-- | Internal: compile with a given environment (allows temp function injection).
+compileToBytecodeWith :: Environment -> InterpreterState -> [Name] -> Either String BytecodeModule
+compileToBytecodeWith env state funcNames =
     case Map.lookup "native" (targetExterns env) of
         Nothing -> Left
             "Native target not loaded. Load lib/Backend/LLVM/Native.tl first."
         Just _allTexterns -> do
             -- Step 1: Build compilation plan (reachability + monomorphization)
             let plan = buildCompilationPlan funcNames "native" MonoFull env state
-            let compilable = cpFunctions plan
-            let compilableInsts = cpInstances plan
 
-            if Map.null compilable
-                then Left
-                    "No compilable functions found. Check that the function exists and has concrete types."
-                else do
-                    -- Step 2: Convert plan functions to CLM
-                    -- Include both top-level functions and instance functions
-                    let clmFuncs = Map.map (lambdaToCLMLambda env) compilable
-                    let clmInsts = Map.map (lambdaToCLMLambda env) compilableInsts
-                    let allCLM = Map.union clmFuncs clmInsts
+            -- Check for unresolved implicit dispatch (fatal for compiled backends)
+            case cpUnresolved plan of
+                xs@(_:_) -> Left $ "Monomorphization failed — " ++ show (length xs)
+                    ++ " unresolved implicit dispatch call(s):\n"
+                    ++ unlines (map ("  - " ++) (nub xs))
+                    ++ "Add type annotations or check that instances exist for these functions."
+                [] -> do
+                    let compilable = cpFunctions plan
+                    let compilableInsts = cpInstances plan
 
-                    -- Step 3: Compile CLM → BytecodeModule
-                    case compileCLMModule "tulam_bytecode" allCLM of
-                        Left err -> Left $ "Bytecode compilation error: " ++ show err
-                        Right bm -> Right bm
+                    if Map.null compilable
+                        then Left
+                            "No compilable functions found. Check that the function exists and has concrete types."
+                        else do
+                            -- Step 2: Convert plan functions to CLM
+                            let clmFuncs = Map.map (lambdaToCLMLambda env) compilable
+                            let clmInsts = Map.map (lambdaToCLMLambda env) compilableInsts
+                            let allCLM = Map.union clmFuncs clmInsts
+
+                            -- Step 3: Compile CLM → BytecodeModule
+                            case compileCLMModule "tulam_bytecode" allCLM of
+                                Left err -> Left $ "Bytecode compilation error: " ++ show err
+                                Right bm -> Right bm
 
 -- | Compile and run tulam functions via bytecode VM.
 -- Entry point is the last function in the list (or "main" if present).
@@ -74,11 +102,9 @@ runBytecode env state funcNames = do
     case compileToBytecode env state funcNames of
         Left err -> return $ BCCompileError err
         Right bm -> do
-            -- Determine entry point: prefer "main", otherwise last function
             let entryPoint = if "main" `elem` funcNames
                     then "main"
                     else last funcNames
-            -- Initialize VM and run
             vm <- initVM bm
             result <- runFunctionByName vm (T.pack entryPoint) []
             case result of

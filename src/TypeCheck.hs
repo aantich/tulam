@@ -36,6 +36,9 @@ module TypeCheck
   , gadtRefine, gadtExprToTy, extractTypeName, applyGADTRefinements
     -- * Pipeline integration
   , typeCheckPass
+  , typeAnnotatePass
+  , annotateLambdaTypes
+  , decomposePi
   ) where
 
 import Surface
@@ -1974,6 +1977,85 @@ checkTopLevel (PrivateDecl e) = checkTopLevel e
 checkTopLevel expr = infer expr `tcBind` \_ -> resolveConstraints
 
 -- ============================================================================
+-- Type Annotation Pass (Pass 3.1)
+-- ============================================================================
+-- After type checking (Pass 3), this pass fills in UNDEFINED types in Lambdas
+-- by running inference and zonking the results. This gives downstream passes
+-- (monomorphization, CLM conversion) access to concrete types without
+-- re-inventing type inference.
+
+-- | Post-type-check annotation pass: walks all topLambdas and instanceLambdas,
+-- runs TC inference on each, and writes resolved types back into the Lambda.
+-- Only re-infers lambdas that have UNDEFINED types (most have explicit annotations).
+typeAnnotatePass :: IntState ()
+typeAnnotatePass = do
+    st <- get
+    let env = currentEnvironment st
+        tcEnv = buildTCEnvFromEnvironment env
+        -- Annotate topLambdas (skip implicit-param dispatch templates —
+        -- they are polymorphic and should stay that way)
+        topLams' = Map.map (annotateLambdaTypes tcEnv) (topLambdas env)
+        -- Annotate instanceLambdas
+        instLams' = Map.map (annotateLambdaTypes tcEnv) (instanceLambdas env)
+        env' = env { topLambdas = topLams', instanceLambdas = instLams' }
+    modify (\s -> s { currentEnvironment = env' })
+    verboseLog "  Pass 3.1: type annotation complete"
+
+-- | Annotate a single Lambda with inferred types where they are UNDEFINED.
+-- Uses TCRelaxed so inference failures don't crash — we just keep the original.
+annotateLambdaTypes :: TCEnv -> Lambda -> Lambda
+annotateLambdaTypes tcEnv lam
+    -- Skip intrinsic/derive bodies — nothing to infer
+    | body lam == Intrinsic = lam
+    | body lam == Derive = lam
+    -- Skip if already fully annotated
+    | not (needsAnnotation lam) = lam
+    | otherwise =
+        let tcSt = initTCState TCRelaxed
+        in case runTC (inferAndZonkLambda lam) tcEnv tcSt of
+            Left _ -> lam  -- inference failed, keep original
+            Right (annotated, _) -> annotated
+
+-- | Check if a Lambda has any UNDEFINED types that need filling in.
+needsAnnotation :: Lambda -> Bool
+needsAnnotation lam =
+    lamType lam == UNDEFINED
+    || Prelude.any (\v -> typ v == UNDEFINED && not (isImplicitVar v)) (params lam)
+
+-- | Infer a Lambda's types and produce an annotated copy with resolved types.
+inferAndZonkLambda :: Lambda -> TC Lambda
+inferAndZonkLambda lam =
+    inferLambda lam `tcBind` \funcTy ->
+        zonk funcTy `tcBind` \zonkedTy ->
+            let (paramTys, retTy) = decomposePi zonkedTy
+                valueParams = Prelude.filter (not . isImplicitVar) (params lam)
+                implParams = Prelude.filter isImplicitVar (params lam)
+                annotatedParams = zipWithFallback annotateVar valueParams paramTys
+                newLamType = if lamType lam == UNDEFINED then retTy else lamType lam
+            in tcPure (lam { params = implParams ++ annotatedParams, lamType = newLamType })
+
+-- | Decompose a Pi chain into parameter types and a return type.
+-- Skips type-level Pi binders (those with universe domains).
+decomposePi :: Expr -> ([Expr], Expr)
+decomposePi (Pi Nothing a b) = let (ps, ret) = decomposePi b in (a:ps, ret)
+decomposePi (Pi (Just _) dom b)
+    | isUniverseLike dom = decomposePi b  -- skip type params (forall a:Type. ...)
+    | otherwise = let (ps, ret) = decomposePi b in (dom:ps, ret)
+decomposePi t = ([], t)
+
+-- | Fill in a Var's type if it is UNDEFINED.
+annotateVar :: Var -> Expr -> Var
+annotateVar v inferredTy
+    | typ v == UNDEFINED = v { typ = inferredTy }
+    | otherwise = v  -- keep explicit annotation
+
+-- | Like zipWith but keeps leftover vars unchanged when types are exhausted.
+zipWithFallback :: (Var -> Expr -> Var) -> [Var] -> [Expr] -> [Var]
+zipWithFallback f (v:vs) (t:ts) = f v t : zipWithFallback f vs ts
+zipWithFallback _ vs [] = vs  -- more vars than types: keep originals
+zipWithFallback _ [] _ = []   -- more types than vars: ignore extras
+
+-- ============================================================================
 -- Pretty Printing
 -- ============================================================================
 
@@ -1991,8 +2073,11 @@ mkTCLogPayload si err =
 -- Phase 4: uses zonkRemaining to show resolved types instead of raw metas.
 showTCError :: TCError -> String
 showTCError (Mismatch t1 t2) =
-    "[TC] Type mismatch: expected " ++ showTyZonked t1 ++ " but got " ++ showTyZonked t2
-    ++ mismatchHint t1 t2
+    let hint = mismatchHint t1 t2
+    in case hint of
+      "" -> "[TC] Type mismatch: expected " ++ showTyZonked t1 ++ " but got " ++ showTyZonked t2
+      _  -> "[TC] Type mismatch: expected " ++ showTyZonked t1 ++ " but got " ++ showTyZonked t2
+             ++ "\n    " ++ hint
 showTCError (OccursCheck v t) = "[TC] Infinite type: ?" ++ show v ++ " occurs in " ++ showTyZonked t
     ++ "\n    Hint: This usually means a recursive type needs an explicit annotation"
 showTCError (UnboundVar n) = "[TC] Unbound variable: " ++ n
@@ -2006,29 +2091,48 @@ showTCError (WithContext ctx inner) = showTCError inner ++ "\n    in " ++ ctx
 showTCError (WithSource si inner) = showSourceLoc si ++ showTCError inner
 showTCError (SubtypeMismatch t1 t2) = "[TC] Subtype mismatch: " ++ showTyZonked t1 ++ " is not a subtype of " ++ showTyZonked t2
 
--- | Generate a hint for type mismatches when patterns are recognizable
+-- | Generate a hint for type mismatches when patterns are recognizable.
+-- Detects common cases and suggests fixes in plain language.
 mismatchHint :: Expr -> Expr -> String
-mismatchHint _ _ = ""
+mismatchHint t1 t2
+    -- Both sides are unresolved metas: the TC has no type info at all
+    | isAllMetas t1 && isAllMetas t2 =
+        "Hint: Both types are unknown — add type annotations to the function parameters and return type."
+    -- One side is an unresolved meta, other is concrete
+    | isAllMetas t1 =
+        "Hint: Expected type is unknown — add a type annotation to the parameter or return type."
+    | isAllMetas t2 =
+        "Hint: Actual type could not be inferred — add a type annotation to the expression or parameter."
+    -- Meta mixed with concrete (e.g. "expected _a -> Maybe(_b)" vs "Int")
+    | hasMetas t1 || hasMetas t2 =
+        "Hint: Type could not be fully inferred — add explicit type annotations to function parameters."
+    | otherwise = ""
+  where
+    isAllMetas (Meta _) = True
+    isAllMetas _ = False
+    hasMetas (Meta _) = True
+    hasMetas e = Prelude.any hasMetas (typeChildren e)
 
 -- | Show a type with remaining metas replaced by readable names (Phase 4).
--- Assigns sequential letter names (_a, _b, _c, ...) instead of raw meta IDs.
+-- Uses "?" prefix to clearly indicate unresolved/unknown types.
+-- A single meta becomes "?", multiple get "?1", "?2", etc.
 showTyZonked :: Expr -> String
 showTyZonked expr =
-    let metas = collectMetas expr
-        -- Assign unique letter names: _a, _b, _c, ...
-        metaNames = Prelude.zip (nub metas) (Prelude.map metaLetter [0..])
-        metaLetter i
-            | i < 26   = '_' : [toEnum (fromEnum 'a' + i)]
-            | otherwise = "_t" ++ show i
-        nameMap = Map.fromList [(m, n) | (m, n) <- metaNames]
+    let metas = nub (collectMetas expr)
+        -- If there's only one unique meta, show as "?" (clean).
+        -- Multiple distinct metas get "?1", "?2", etc. to show they differ.
+        metaNames = case metas of
+            [m] -> [(m, "?")]
+            _   -> Prelude.zip metas (Prelude.map (\i -> "?" ++ show i) [(1::Int)..])
+        nameMap = Map.fromList metaNames
         zonkReadable (Meta n) = case Map.lookup n nameMap of
             Just nm -> Id nm
-            Nothing -> Id ("_?" ++ show n)
+            Nothing -> Id "?"
         zonkReadable e = mapTypeChildren zonkReadable e
     in showTy (zonkReadable expr)
   where
     collectMetas (Meta n) = [n]
-    collectMetas e = concatMap collectMetas (typeChildren e)
+    collectMetas e = Prelude.concatMap collectMetas (typeChildren e)
 
 -- | Format source location for error messages (Phase 5).
 showSourceLoc :: SourceInfo -> String

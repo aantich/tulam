@@ -5,13 +5,13 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           tulam
-version:        0.1.0.0
+version:        0.9.4
 description:    Please see the README on GitHub at <https://github.com/githubuser/fool#readme>
 homepage:       https://github.com/githubuser/fool#readme
 bug-reports:    https://github.com/githubuser/fool/issues
 author:         Anton Antich
 maintainer:     anton.antich@gmail.com
-copyright:      2016-2023 Anton Antich
+copyright:      2016-2026 Anton Antich
 license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
@@ -42,7 +42,6 @@ library
       CLMOptimize
       CompileDriver
       Interface
-      Interpreter
       Intrinsics
       Lexer
       Logs

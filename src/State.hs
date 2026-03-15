@@ -429,6 +429,7 @@ defaultFlags = CurrentFlags
     , checkTermination = True
     , checkCoverage = True
     , checkPurity = False
+    , monomorphLevel = MonoFull  -- full monomorphization by default (all instance dispatch resolved)
     }
 
 -- | Compiler output verbosity levels (ordered: Silent < Errors < ... < Verbose)
@@ -438,6 +439,13 @@ data Verbosity = Silent    -- ^ No output (for tests)
                | Normal    -- ^ Errors + warnings + progress (default)
                | Verbose   -- ^ All above + per-pass timing
                deriving (Show, Eq, Ord)
+
+-- | How aggressively to monomorphize instance dispatch.
+data MonomorphLevel
+    = MonoNone        -- ^ No monomorphization (interpreter, dynamic dispatch backends)
+    | MonoTargetOnly  -- ^ Only resolve target instances (e.g. target "native" externs)
+    | MonoFull        -- ^ Also resolve instanceLambdas (for native/bytecode backends)
+    deriving (Show, Eq)
 
 data CurrentFlags = CurrentFlags {
     strict    :: Bool -- true if strict, false if lazy
@@ -453,6 +461,7 @@ data CurrentFlags = CurrentFlags {
   , checkTermination  :: Bool -- termination checking for recursive functions
   , checkCoverage     :: Bool -- pattern match coverage checking
   , checkPurity       :: Bool -- effect purity checking (warn when effect ops called outside action blocks)
+  , monomorphLevel :: MonomorphLevel -- how aggressively to monomorphize (MonoNone for interpreter)
 } deriving Show
 
 -- Safety limits for evaluation

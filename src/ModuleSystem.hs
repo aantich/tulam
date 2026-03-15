@@ -38,7 +38,7 @@ import Pipeline (afterparserPass, actionDesugarPass, stringLiteralDesugarPass, b
 import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, positivityCheckPass, terminationCheckPass, coverageCheckPass)
 import CLMOptimize (runCLMOptPasses)
 import Parser (parseWholeFile)
-import TypeCheck (typeCheckPass)
+import TypeCheck (typeCheckPass, typeAnnotatePass)
 
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.State.Strict (get, put, modify, evalStateT, execStateT)
@@ -280,6 +280,7 @@ runPhase2Passes = do
     -- Reset TC error count before type checking this module
     modify (\s -> s { tcErrorCount = 0 })
     timedPass "Pass 3 (typecheck)" typeCheckPass
+    timedPass "Pass 3.1 (type annotate)" typeAnnotatePass
     terminationCheckPass
     flushLogs
     -- In strict mode, halt pipeline if type errors were found in this module

@@ -18,7 +18,6 @@ module CompileDriver
     , collectSurfaceRefs
     , collectExternRefs
     , buildOriginMap
-    , MonomorphLevel(..)
     ) where
 
 import qualified Data.HashMap.Strict as Map
@@ -27,9 +26,11 @@ import qualified Data.HashSet as HSet
 import Data.HashSet (HashSet)
 import qualified Data.Set as Set
 
+import Data.List (nub)
+
 import Surface
 import State
-import Monomorphize (monomorphizeLambdas, MonomorphLevel(..))
+import Monomorphize (monomorphizeLambdas)
 -- import qualified Debug.Trace as DT
 
 -- | A compilation plan: the minimal set of functions, instances, externs,
@@ -43,6 +44,7 @@ data CompilationPlan = CompilationPlan
     , cpTypes        :: HashSet Name         -- ^ Types needed
     , cpEntryPoints  :: [Name]              -- ^ User-specified entry points
     , cpModuleOrigin :: HashMap Name String  -- ^ Function name → source module key
+    , cpUnresolved   :: [Name]              -- ^ Unresolved implicit dispatch after mono (should be empty)
     } deriving (Show)
 
 -- | Build a compilation plan for the given entry points and target.
@@ -78,14 +80,20 @@ buildCompilationPlan entryPoints targetName monoLevel env state =
         origin = buildOriginMap allReachableNames
                     (loadedModules (currentModuleEnv state))
 
+        -- Phase C: Detect unresolved implicit dispatch after monomorphization
+        compiledFuncs = Map.filter (not . hasImplicit) monoLams
+        unresolved = nub $ concatMap (collectUnresolvedCalls env) (Map.elems compiledFuncs)
+                        ++ concatMap (collectUnresolvedCalls env) (Map.elems monoInsts)
+
     in CompilationPlan
-        { cpFunctions    = Map.filter (not . hasImplicit) monoLams
+        { cpFunctions    = compiledFuncs
         , cpInstances    = monoInsts
         , cpExternRefs   = externRefs
         , cpConstructors = reachCons
         , cpTypes        = reachTypes
         , cpEntryPoints  = entryPoints
         , cpModuleOrigin = origin
+        , cpUnresolved   = unresolved
         }
 
 -- | Compute the transitive closure of names reachable from entry points.
@@ -269,3 +277,38 @@ buildOriginMap names modules =
         , (modKey, menv) <- Map.toList modules
         , Set.member n (publicNames menv) || Set.member n (privateNames menv)
         ]
+
+-- | Collect names of functions that still have implicit params (i.e., monomorphization
+-- failed to resolve them). These will become CLMIAP in CLM and crash at runtime
+-- in compiled backends.
+collectUnresolvedCalls :: Environment -> Lambda -> [Name]
+collectUnresolvedCalls env lam = go (body lam)
+  where
+    go (App (Id n) args) =
+        let self = case lookupLambda n env of
+                Just fun | hasImplicit fun -> [n]
+                _ -> []
+        in self ++ concatMap go args
+    go (App f args) = go f ++ concatMap go args
+    go (Function inner) = go (body inner)
+    go (LetIn binds bodyExpr) = concatMap (go . snd) binds ++ go bodyExpr
+    go (ExpandedCase checks bodyExpr _) = concatMap goPC checks ++ go bodyExpr
+    go (PatternMatches cases) = concatMap go cases
+    go (CaseOf cv ex _) = concatMap (go . val) cv ++ go ex
+    go (ConTuple _ args) = concatMap go args
+    go (NTuple fields) = concatMap (go . snd) fields
+    go (IfThenElse c t e) = go c ++ go t ++ go e
+    go (BinaryOp _ l r) = go l ++ go r
+    go (ActionBlock stmts) = concatMap goAS stmts
+    go (RecFieldAccess _ e) = go e
+    go (ArrayLit es) = concatMap go es
+    go (Typed e _) = go e
+    go (ReprCast e _) = go e
+    go _ = []
+
+    goPC (PatternGuard _ e) = go e
+    goPC _ = []
+
+    goAS (ActionExpr e) = go e
+    goAS (ActionBind _ e) = go e
+    goAS (ActionLet _ e) = go e

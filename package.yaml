@@ -1,10 +1,10 @@
 name:                tulam
-version:             0.1.0.0
+version:             0.9.5
 github:              "githubuser/fool"
 license:             BSD3
 author:              "Anton Antich"
 maintainer:          "anton.antich@gmail.com"
-copyright:           "2016-2023 Anton Antich"
+copyright:           "2016-2026 Anton Antich"
 
 extra-source-files:
 - README.md

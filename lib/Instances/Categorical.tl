@@ -8,12 +8,12 @@ import Categorical;
 
 /// Map a Maybe-returning function over a list, collecting results.
 /// Short-circuits on the first Nothing.
-function mapMMaybe(f, xs:List(a)) = match
+function mapMMaybe [a:Type, b:Type] (f: a -> Maybe(b), xs:List(a)) : Maybe(List(b)) = match
     | f, Nil -> Just(Nil)
     | f, Cons(h, t) -> bind(f(h), fn(bh) = bind(mapMMaybe(f, t), fn(bt) = Just(Cons(bh, bt))));
 
 /// Fold a list with a Maybe-returning accumulator.
-function foldMMaybe(f, acc, xs:List(a)) = match
+function foldMMaybe [a:Type, b:Type] (f: a -> b -> Maybe(a), acc:a, xs:List(b)) : Maybe(a) = match
     | f, acc, Nil -> Just(acc)
     | f, acc, Cons(h, t) -> bind(f(acc, h), fn(acc2) = foldMMaybe(f, acc2, t));
 
@@ -23,7 +23,7 @@ function sequenceMaybe(xs:List(Maybe(a))) = match
     | Cons(h, t) -> bind(h, fn(v) = bind(sequenceMaybe(t), fn(vs) = Just(Cons(v, vs))));
 
 /// mapMMaybe with arguments flipped.
-function forMMaybe(xs:List(a), f) = mapMMaybe(f, xs);
+function forMMaybe [a:Type, b:Type] (xs:List(a), f: a -> Maybe(b)) : Maybe(List(b)) = mapMMaybe(f, xs);
 
 /// Map a monadic function over a list, discarding results.
 function mapM_(f, xs:List(a)) = match

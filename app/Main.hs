@@ -4,6 +4,8 @@ module Main where
 import System.Console.Haskeline
 import System.Directory
 import System.Environment (getArgs)
+import Data.Version (showVersion)
+import Paths_tulam (version)
 import System.FilePath (takeDirectory)
 import System.Exit
 import Control.Monad.IO.Class (liftIO)
@@ -20,9 +22,10 @@ import qualified Data.Text.Lazy as TL
 import Surface
 import Pipeline
 import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass)
-import TypeCheck (typeCheckPass)
+import TypeCheck (typeCheckPass, typeAnnotatePass)
+-- addBinding, traceExpr, installDefaultHandlers are in Pipeline (imported unqualified)
 import CLM (pprSummary)
-import Interpreter
+import Backends.Bytecode.Runner (runBytecode, evalInteractive, compileToBytecode, BytecodeResult(..))
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
 import ModuleSystem (loadModuleTree, loadFileQuiet, baseModulePath, preludeModulePath, runModulePasses, extractDependencies, resolveModulePath, extractModulePath)
@@ -30,8 +33,8 @@ import qualified Data.Set as Set
 import Interface (cacheVersion, toCachePath, ensureCacheDir)
 import CLMOptimize (runCLMOptPasses, allCLMPasses, CLMOptPass(..))
 import Backends.LLVM.NativeCompile (compileNative, CompileResult(..), NativeConfig(..), defaultNativeConfig)
-import Backends.Bytecode.Runner (runBytecode, compileToBytecode, BytecodeResult(..))
 import Backends.Bytecode.Module (dumpModule)
+import Backends.Bytecode.Value (valToString)
 
 import Text.Pretty.Simple (pPrint, pShow)
 
@@ -72,19 +75,21 @@ processNew line = do
             -- processSurfaceExpr ex -- processing expressions one by one
         Left err -> do
             -- it's not a top level expression, trying interactive expression
-            liftIO $ putStrLn $ "trying interactive expression"
             res1 <- parseExpr line
             case res1 of
                 Left err1 -> liftIO (print err) >> liftIO (print err1)
                 Right ex1 -> do
-                    trace $ TC.as [TC.bold, TC.underlined] "Received interactive expression: " -- ++ (show $ length ex)
-                    trace (show ex1) -- show what was parsed first
-                    showAllLogs
-                    clearAllLogs
-                    processInteractive ex1
-                    
-
-                    
+                    -- Desugar the expression (BinaryOp → App, IfThenElse → match, etc.)
+                    let ex = desugarActions . desugarStringLiterals . afterparse $ traverseExpr afterparse ex1
+                    -- Evaluate via bytecode VM
+                    st <- get
+                    let env = currentEnvironment st
+                    result <- liftIO $ evalInteractive env st ex
+                    case result of
+                        BCRunOK val -> liftIO $ putStrLn $ T.unpack (valToString val)
+                        BCCompileError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Error: " ++ e
+                        BCRuntimeError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Runtime error: " ++ e
+                        _ -> pure ()
 
 
 showHelp :: IO ()
@@ -732,6 +737,17 @@ processSet "stricttypes" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = False } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "strict type checking off"
 
+processSet "mono" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { monomorphLevel = MonoNone } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "monomorphization off" ++ " (dynamic dispatch)"
+processSet "mono" ("target":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { monomorphLevel = MonoTargetOnly } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "monomorphization target-only"
+processSet "mono" ("full":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { monomorphLevel = MonoFull } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "monomorphization full" ++ " (all instance dispatch resolved)"
+processSet "mono" _ = liftIO $ putStrLn "Usage: :s mono off|target|full"
+
 processSet "newstrings" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { newStrings = True} } )
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "newstrings on" ++ " (string literals desugar to fromStringLiteral)"
@@ -884,6 +900,7 @@ loadFileNewImpl nm = do
                     logDetail $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking"
                     modify (\s -> s { tcErrorCount = 0 })
                     timedPass "Pass 3 (typecheck)" typeCheckPass
+                    timedPass "Pass 3.1 (type annotate)" typeAnnotatePass
                     terminationCheckPass
                     flushLogs
                   else do
@@ -915,7 +932,6 @@ loadFileNewImpl nm = do
                 put $ stFinal { currentModuleEnv = menv' }
                 -- Run deferred TC for any modules whose deps are now all loaded
                 runDeferredTC
-                -- liftIO (putStrLn $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "javascript code generation")
                 -- compile2JSpass
                 -- showAllLogsWSource
                 -- clearAllLogs
@@ -942,6 +958,7 @@ runDeferredTC = do
         put $ stBefore { parsedModule = modParsed }
         modify (\s -> s { tcErrorCount = 0 })
         timedPass "Pass 3 (deferred typecheck)" typeCheckPass
+        timedPass "Pass 3.1 (deferred type annotate)" typeAnnotatePass
         terminationCheckPass
         flushLogs
         -- Restore parsedModule
@@ -1016,7 +1033,7 @@ main = do
 
 greetings = do
     putStrLn "Welcome to tulam!"
-    putStrLn "Version 0.0.9"
-    putStrLn "(c) Copyright 2016-2023 by Anton Antich (a@s3.ag)\n"
+    putStrLn $ "Version " ++ showVersion version
+    putStrLn "(c) Copyright 2016-2026 by Anton Antich (anton@everworker.ai)\n"
     putStrLn "Type :help for help on commands or :load a file.\n"
     
