@@ -21,16 +21,23 @@ module Monomorphize
     , resolveImplicitCalls
     , inferExprTypeName
     , buildHandlerOpsMap
+    , lowerStageRExpr
     ) where
 
 import qualified Data.HashMap.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import Data.Maybe (mapMaybe, fromMaybe, catMaybes)
+import Control.Applicative ((<|>))
 import Data.List (foldl', partition, sortOn)
 import Control.Monad.Trans.State.Strict (get, modify)
 
 import Surface
+import Logs (SourceInfo(..))
 import State
+import qualified ElabMetadata as EM
+import ElabMetadata (binderRole, binderVisibility, defaultExplicitBinderInfo, isSemanticRole)
+import ElabCore
+import ElabObligation
 import qualified Debug.Trace as DT
 
 -- | Type environment: maps variable names to their concrete type names.
@@ -123,7 +130,14 @@ resolveInLambda :: Bool -> MonomorphLevel -> Environment -> NameMap Lambda -> Ha
 resolveInLambda debug monoLevel env tInstances handlerOps lam =
     let typeEnv = buildTypeEnv (params lam)
         mRetType = exprToTypeName (lamType lam)
-        body' = resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mRetType (body lam)
+        -- Phase 2.3: Check both topLambdasR and instanceLambdasR for StageR representation.
+        -- This ensures obligation info from TC is used for instance lambdas too.
+        mRLam = case Map.lookup (lamName lam) (topLambdasR env) of
+            Just rlam -> Just rlam
+            Nothing   -> Map.lookup (lamName lam) (instanceLambdasR env)
+        body' = case mRLam of
+            Just rlam -> lowerStageRExpr debug monoLevel env tInstances handlerOps typeEnv mRetType (elabLamBody rlam)
+            Nothing -> resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mRetType (body lam)
     in lam { body = body' }
 
 -- | Build a type environment from function parameters.
@@ -137,20 +151,108 @@ buildTypeEnv = Map.fromList . mapMaybe extractVarType
         Nothing -> Nothing
 
 -- | Extract a concrete type name from a Surface type expression.
+-- Phase 5.1: Extended to handle more forms — Pi types, universes, and
+-- resolved metas (Id "?tN" from Phase 1.2 resolution are not concrete).
 exprToTypeName :: Expr -> Maybe Name
 exprToTypeName (Typed _ t) = exprToTypeName t
 exprToTypeName (Id n)
     | not (null n) && head n >= 'A' && head n <= 'Z' = Just n
+    | n == "Int" || n == "Float64" || n == "String" || n == "Char" || n == "Bool"
+      || n == "Unit" || n == "Nat" || n == "Byte" || n == "Array" = Just n
 exprToTypeName (App f _)
     | Just n <- calleeHeadName f
     , not (null n)
     , head n >= 'A' && head n <= 'Z' = Just n
+-- Pi types: extract the return type name (for morphism dispatch)
+exprToTypeName (Pi _ _ ret) = exprToTypeName ret
+-- Concrete primitive types at universe level
+exprToTypeName (U _) = Nothing  -- universes are not dispatchable
+-- Unsolved meta — not concrete
+exprToTypeName (Meta _) = Nothing
 exprToTypeName _ = Nothing
 
 calleeHeadName :: Expr -> Maybe Name
 calleeHeadName (Id n) = Just n
 calleeHeadName (Typed e _) = calleeHeadName e
 calleeHeadName _ = Nothing
+
+lowerStageRExpr :: Bool -> MonomorphLevel -> Environment -> NameMap Lambda -> HashMap Name Lambda -> TypeEnv -> Maybe Name -> ElabExpr -> Expr
+lowerStageRExpr debug monoLevel env tInstances handlerOps typeEnv mLamRet = lower
+  where
+    lower (EVar n) = Id n
+    lower (EGlobal n) = Id n
+    lower (ELit l) = Lit l
+    lower (EType e) = e
+    lower (EAnn e ty) = Typed (lower e) ty
+    lower (ELam binders bodyExpr retTy) =
+        let vars = [Var (elabBinderName b) (elabBinderType b) UNDEFINED | b <- binders]
+            innerTypeEnv = Map.union (Map.fromList [(name v, tn) | v <- vars, Just tn <- [exprToTypeName (typ v)]]) typeEnv
+            loweredBody = lowerStageRExpr debug monoLevel env tInstances handlerOps innerTypeEnv (exprToTypeName retTy <|> mLamRet) bodyExpr
+        in Function (mkLambda "<stage-r-lam>" vars loweredBody retTy)
+    lower (ELet binds bodyExpr) =
+        let binds' = [(Var n UNDEFINED UNDEFINED, lower e) | (n, e) <- binds]
+            inferredEnv = buildTypeEnvFromLetPairs env typeEnv binds'
+            letTypeEnv = Map.union inferredEnv typeEnv
+        in LetIn binds' (lowerStageRExpr debug monoLevel env tInstances handlerOps letTypeEnv mLamRet bodyExpr)
+    lower (EProject fa base retTy) =
+        let projected = RecFieldAccess fa (lower base)
+        in case retTy of
+            UNDEFINED -> projected
+            _ -> Typed projected retTy
+    lower (EIf c t f retTy) =
+        let e = IfThenElse (lower c) (lower t) (lower f)
+        in case retTy of
+            UNDEFINED -> e
+            _ -> Typed e retTy
+    lower (ECase alts retTy) =
+        case alts of
+            [ElabAlt checks bodyExpr] ->
+                let e = ExpandedCase (Prelude.map lower checks) (lower bodyExpr) SourceInteractive
+                in case retTy of
+                    UNDEFINED -> e
+                    _ -> Typed e retTy
+            _ -> case retTy of
+                    UNDEFINED -> UNDEFINED
+                    _ -> Typed UNDEFINED retTy
+    lower (ESurface e) = resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet e
+    lower (ECall kind headExpr args retTy) =
+        let loweredArgs = map (lower . elabArgExpr) args
+            loweredHead = lower headExpr
+            wrapRet e = case exprToTypeName retTy of
+              Just _ -> Typed e retTy
+              Nothing -> e
+            resolveByObligation funcName obl =
+              case obl of
+                HandlerObligation{} -> case Map.lookup funcName handlerOps of
+                  Just handlerLam -> goSurface (substituteInstanceBody handlerLam loweredArgs)
+                  Nothing -> wrapRet (App (Id funcName) loweredArgs)
+                StructureObligation{} ->
+                  let inferredArgs = nub' (catMaybes (map (inferExprTypeName env typeEnv) loweredArgs))
+                      inferredOblArgs = nub' (catMaybes (map (inferExprTypeName env typeEnv) (oblExprArgs obl)))
+                      types1Base = if null (oblTypeArgs obl) then (if null inferredArgs then inferredOblArgs else inferredArgs) else oblTypeArgs obl
+                      types1 = nub' types1Base
+                  in case resolveTargetInstanceMulti tInstances funcName types1 of
+                      Just resolvedBody -> wrapRet (goSurface (substituteInstanceBody resolvedBody loweredArgs))
+                      Nothing -> case monoLevel of
+                        MonoFull -> case resolveInstanceLambdaWithKey env funcName types1 of
+                          Just (instKey, _) -> wrapRet (App (Id instKey) loweredArgs)
+                          Nothing -> wrapRet (App (Id funcName) loweredArgs)
+                        _ -> wrapRet (App (Id funcName) loweredArgs)
+        in case (kind, calleeHeadName loweredHead) of
+            (DirectCall, _) -> wrapRet (App loweredHead loweredArgs)
+            (IntrinsicCall _, _) -> wrapRet (App loweredHead loweredArgs)
+            (EvidenceCall wit, _) ->
+              case wit of
+                InstanceWitness{witnessKey=instKey} -> wrapRet (App (Id instKey) loweredArgs)
+                HandlerWitness{} ->
+                  case Map.lookup (witnessMethod wit) handlerOps of
+                    Just handlerLam -> wrapRet (substituteInstanceBody handlerLam loweredArgs)
+                    Nothing -> wrapRet (App loweredHead loweredArgs)
+            (SemanticCall obl, Just funcName) -> resolveByObligation funcName obl
+            (HandlerCall obl, Just funcName) -> resolveByObligation funcName obl
+            _ -> wrapRet (App loweredHead loweredArgs)
+
+    goSurface = resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet
 
 -- | Walk a Surface expression, resolving implicit-param function calls
 -- to their target instance bodies where possible.
@@ -168,21 +270,43 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
         -- Be elaboration-aware: the callee head may be wrapped in Typed.
         App f args
             | Just funcName <- calleeHeadName f ->
-                let isImplicit = case lookupLambda funcName env of
-                        Just fun | hasImplicit fun -> True
+                let -- Phase 1: Check ANY implicit param (not just evidence roles).
+                    -- Functions like foldl have type-constructor implicit params (c:Type1)
+                    -- that need dispatch, even though they're not "semantic evidence".
+                    isSemanticImplicit = case lookupLambdaRep ElabLambdaRep funcName env of
+                        Just fun ->
+                            let infos = lookupAnyLambdaBinderInfo funcName env
+                            in or
+                                [ binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)
+                                | bi <- take (length (params fun)) (infos ++ repeat defaultExplicitBinderInfo)
+                                ]
                         _ -> False
                     hasTargetInstance = hasAnyTargetInstance funcName tInstances
-                in if isImplicit || hasTargetInstance || Map.member funcName handlerOps
-                    then resolveImplicitCall funcName (map go args)
+                    -- Phase 1: Don't pre-process lambda args with `go` — instead pass
+                    -- them to resolveImplicitCall which enriches them with callee type info
+                    -- before recursing into their bodies.
+                    smartArgs = map (\a -> case unwrapTyped a of
+                        Function lam | any (\v -> not (isImplicitVar v) && typ v == UNDEFINED) (params lam) -> a  -- keep unenriched
+                        _ -> go a) args
+                    unwrapTyped (Typed e _) = e
+                    unwrapTyped e = e
+                in if isSemanticImplicit || hasTargetInstance || Map.member funcName handlerOps
+                    then resolveImplicitCall funcName smartArgs
                     else App (go f) (map go args)
 
         -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`, `readLine`)
         Id funcName ->
-            case lookupLambda funcName env of
-                Just fun | hasImplicit fun ->
-                    case Map.lookup funcName handlerOps of
-                        Just handlerLam -> substituteInstanceBody handlerLam []
-                        Nothing -> expr
+            case lookupLambdaRep ElabLambdaRep funcName env of
+                Just fun
+                    | let infos = lookupAnyLambdaBinderInfo funcName env
+                          semanticImplicit = or
+                            [ binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)
+                            | bi <- take (length (params fun)) (infos ++ repeat defaultExplicitBinderInfo)
+                            ]
+                    , semanticImplicit ->
+                        case Map.lookup funcName handlerOps of
+                            Just handlerLam -> substituteInstanceBody handlerLam []
+                            Nothing -> expr
                 _ -> expr
 
         -- Desugared let-in: App (Function λ(x). body) [val]
@@ -202,8 +326,11 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
 
         -- Recurse into all expression forms
         App f args -> App (go f) (map go args)
+        -- Phase 1.3: For standalone lambdas, use param types (which may have been
+        -- enriched by callee-directed propagation from processArgsWithCalleeContext)
         Function lam ->
-            let innerTypeEnv = Map.union (buildTypeEnv (params lam)) typeEnv
+            let paramEnv = buildTypeEnv (params lam)
+                innerTypeEnv = Map.union paramEnv typeEnv
                 innerRet = case exprToTypeName (lamType lam) of
                     Just r  -> Just r
                     Nothing -> mLamRet
@@ -236,6 +363,8 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
 
     -- | Resolve a single implicit-param function call.
     -- Tries: handler ops → target instances → instanceLambdas (MonoFull).
+    -- Phase 1: After inferring arg types, enriches lambda closure args with
+    -- type info from the callee's signature before final resolution.
     resolveImplicitCall :: Name -> [Expr] -> Expr
     resolveImplicitCall funcName args' =
         -- Try handler operation first (putStrLn, readRef, etc.)
@@ -245,18 +374,218 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                 go (substituteInstanceBody handlerLam args')
             Nothing ->
                 let argTypes = map (inferExprTypeName env typeEnv) args'
-                in case sequence argTypes of
+                    knownTypes = nub' (catMaybes argTypes)
+                    -- Phase 1: Enrich lambda args using callee-directed type propagation
+                    enrichedArgs = enrichLambdaArgsFromCallee funcName knownTypes args'
+                    enrichedArgTypes = map (inferExprTypeName env typeEnv) enrichedArgs
+                in case sequence enrichedArgTypes of
                     Just types ->
                         dbg debug ("resolve " ++ funcName ++ " types=" ++ show types) $
-                        resolveWithTypes funcName types args'
+                        resolveWithTypes funcName types enrichedArgs
                     Nothing ->
                         -- Partial: try with just the known types
-                        let knownTypes = nub' (catMaybes argTypes)
-                        in if null knownTypes
-                            then dbg debug ("UNRESOLVED " ++ funcName ++ " — no arg types inferred, args=" ++ show (map showExprBrief args')) $
-                                 App (Id funcName) args'
-                            else dbg debug ("resolve " ++ funcName ++ " partial types=" ++ show knownTypes) $
-                                 resolveWithTypes funcName knownTypes args'
+                        let enrichedKnown = nub' (catMaybes enrichedArgTypes)
+                        in if null enrichedKnown
+                            then dbg debug ("UNRESOLVED " ++ funcName ++ " — no arg types inferred, args=" ++ show (map showExprBrief enrichedArgs)) $
+                                 App (Id funcName) enrichedArgs
+                            else dbg debug ("resolve " ++ funcName ++ " partial types=" ++ show enrichedKnown) $
+                                 resolveWithTypes funcName enrichedKnown enrichedArgs
+
+    -- | Phase 1: Enrich lambda closure arguments using the callee's type signature.
+    -- When we know some arg types (e.g., Int from literal 0, Array from [1,2,3]),
+    -- use the callee's param types to infer what the lambda params should be.
+    enrichLambdaArgsFromCallee :: Name -> [Name] -> [Expr] -> [Expr]
+    enrichLambdaArgsFromCallee funcName knownArgTypes args'
+        | null knownArgTypes = args'  -- nothing to propagate
+        | not (any isUntypedFunctionArg args') = args'  -- no lambda args to enrich
+        | otherwise =
+            case lookupLambdaRep ElabLambdaRep funcName env of
+                Nothing -> args'
+                Just calleeLam ->
+                    let implParams = filter isImplicitVar (params calleeLam)
+                        rawValParams = filter (not . isImplicitVar) (params calleeLam)
+                        -- For structure methods, params only has implicit type params.
+                        -- Extract value param types from the function type signature instead.
+                        valParams = if null rawValParams
+                            then extractVirtualValParams calleeLam
+                            else rawValParams
+                        -- Collect all type var names (explicit + free in param types)
+                        allTypeVarNames = nub' (map name implParams ++ concatMap (collectFreeTypeVars . typ) valParams)
+                        -- Build type var bindings from known arg types
+                        tvBindings0 = inferTypeVarBindings implParams valParams args' knownArgTypes
+                        -- Enhance with element type inference from arrays
+                        tvBindings = inferTypeVarBindingsWithElements tvBindings0 valParams args'
+                    in if Map.null tvBindings then args'
+                       else dbg debug ("  callee-directed " ++ funcName ++ ": tvBindings=" ++ show (Map.toList tvBindings)) $
+                            zipWith (enrichArg valParams tvBindings) [0..] args'
+      where
+        isUntypedFunctionArg (Function lam) =
+            any (\v -> not (isImplicitVar v) && typ v == UNDEFINED) (params lam)
+        isUntypedFunctionArg (Typed (Function lam) _) =
+            any (\v -> not (isImplicitVar v) && typ v == UNDEFINED) (params lam)
+        isUntypedFunctionArg _ = False
+
+        -- For structure methods where params only has implicit type params,
+        -- extract value params from the inner lambda body (the implementation).
+        extractVirtualValParams :: Lambda -> [Var]
+        extractVirtualValParams lam = case lamType lam of
+            Function innerLam -> filter (not . isImplicitVar) (params innerLam)
+            piType@(Pi _ _ _) -> synthVarsFromPiChain piType
+            _ -> case body lam of
+                Function innerLam -> filter (not . isImplicitVar) (params innerLam)
+                _ -> []
+
+        synthVarsFromPiChain :: Expr -> [Var]
+        synthVarsFromPiChain (Pi Nothing dom rest) =
+            Var ("__p" ++ show (length (synthVarsFromPiChain rest) + 1)) dom UNDEFINED : synthVarsFromPiChain rest
+        synthVarsFromPiChain (Pi (Just n) dom rest)
+            | isUniverseType dom = synthVarsFromPiChain rest
+            | otherwise = Var n dom UNDEFINED : synthVarsFromPiChain rest
+        synthVarsFromPiChain _ = []
+
+        -- Build type variable bindings by matching known arg types against callee param types.
+        -- Collects ALL free lowercase type variables from callee param types,
+        -- not just implicit param names (e.g., for foldl: a, b from `f: b -> a -> b`).
+        inferTypeVarBindings :: [Var] -> [Var] -> [Expr] -> [Name] -> HashMap Name Name
+        inferTypeVarBindings implParams valParams argExprs _knownTypes =
+            let -- Collect all type variable names: explicit implicit params + free lowercase vars
+                explicitTVs = map name implParams
+                freeTypeTVs = concatMap (collectFreeTypeVars . typ) valParams
+                typeVarNames = nub' (explicitTVs ++ freeTypeTVs)
+                -- For each arg, try to match its type against the corresponding callee param type
+                bindings = catMaybes
+                    [ case (inferExprTypeName env typeEnv argExpr, safeIndex i valParams) of
+                        (Just tn, Just calleeParam) ->
+                            matchParamTypeVars typeVarNames (typ calleeParam) tn
+                        _ -> Nothing
+                    | (i, argExpr) <- zip [0..] argExprs
+                    , not (isFunctionExpr argExpr)  -- skip lambda args for inference
+                    ]
+            in Map.fromList (concat bindings)
+
+        -- Collect free lowercase identifiers from a type expression (type variables)
+        collectFreeTypeVars :: Expr -> [Name]
+        collectFreeTypeVars (Id n) | not (null n) && head n >= 'a' && head n <= 'z' = [n]
+        collectFreeTypeVars (App f as) = concatMap collectFreeTypeVars (f : as)
+        collectFreeTypeVars (Pi _ a b) = collectFreeTypeVars a ++ collectFreeTypeVars b
+        collectFreeTypeVars _ = []
+
+        isFunctionExpr (Function _) = True
+        isFunctionExpr _ = False
+
+        safeIndex :: Int -> [a] -> Maybe a
+        safeIndex i xs | i < length xs = Just (xs !! i)
+                       | otherwise = Nothing
+
+        -- Match a param type against a concrete type to extract type var bindings.
+        -- Also infers element types from array arguments when possible.
+        matchParamTypeVars :: [Name] -> Expr -> Name -> Maybe [(Name, Name)]
+        matchParamTypeVars tvNames (Id n) concrete
+            | n `elem` tvNames = Just [(n, concrete)]
+        matchParamTypeVars tvNames (App (Id n) typeArgs) concrete
+            | n `elem` tvNames = Just [(n, concrete)]
+            | otherwise =
+                -- c(a) matching against "Array" — c = Array, but need to infer a separately
+                -- Try to get a from the actual argument expression's element type
+                Just $ catMaybes
+                    [ if tn `elem` tvNames
+                      then Just (n, concrete)  -- bind outer: c = Array
+                      else Nothing
+                    | Id tn <- [Id n]  -- the constructor type var (c)
+                    ] ++
+                    -- For inner type vars (like a in c(a)), try to infer from array elements
+                    -- This will be filled by inferElementTypes below
+                    []
+        matchParamTypeVars _ _ _ = Nothing
+
+        -- After initial type var bindings, try to infer remaining vars from array element types
+        inferTypeVarBindingsWithElements :: HashMap Name Name -> [Var] -> [Expr] -> HashMap Name Name
+        inferTypeVarBindingsWithElements initial valParams argExprs =
+            let missing = [tv | tv <- concatMap (collectFreeTypeVars . typ) valParams
+                              , not (Map.member tv initial)]
+            in if null missing then initial
+               else foldl' (\acc (i, argExpr) ->
+                   let unwrapped = case argExpr of { Typed e _ -> e; e -> e }
+                   in case (safeIndex i valParams, unwrapped) of
+                       (Just param, ArrayLit (e:_)) ->
+                           -- For Array args, infer element type from first element
+                           case inferExprTypeName env typeEnv e of
+                               Just elemType ->
+                                   let paramTy = typ param
+                                       -- If param type is c(a), and we know c = Array,
+                                       -- then the element is a
+                                       innerBindings = matchElementTypeVars (map name (filter isImplicitVar (params calleeLam)) ++ missing) paramTy elemType
+                                   in Map.union innerBindings acc
+                               Nothing -> acc
+                       _ -> acc
+                   ) initial (zip [0..] argExprs)
+              where
+                calleeLam = case lookupLambdaRep ElabLambdaRep funcName env of
+                    Just l -> l
+                    Nothing -> error "unreachable: calleeLam"
+
+                -- Match element type vars: if param type is c(a) and elem type is "Int", bind a = Int
+                matchElementTypeVars :: [Name] -> Expr -> Name -> HashMap Name Name
+                matchElementTypeVars tvNames (App _ innerArgs) elemType =
+                    Map.fromList [(n, elemType) | Id n <- innerArgs, n `elem` tvNames]
+                matchElementTypeVars _ _ _ = Map.empty
+
+        -- Enrich a single argument if it's an untyped lambda
+        enrichArg :: [Var] -> HashMap Name Name -> Int -> Expr -> Expr
+        -- Handle Typed-wrapped functions
+        enrichArg valParams tvBindings i (Typed (Function lam) t) =
+            case enrichArg valParams tvBindings i (Function lam) of
+                Function lam' -> Typed (Function lam') t
+                other -> other
+        enrichArg valParams tvBindings i (Function lam)
+            | i < length valParams
+            , any (\v -> not (isImplicitVar v) && typ v == UNDEFINED) (params lam) =
+                let calleeParamType = typ (valParams !! i)
+                    expectedTypes = extractArrowTypes tvBindings calleeParamType
+                    enrichedParams = zipEnrichParams (params lam) expectedTypes
+                    enrichedTypeEnv = Map.union
+                        (Map.fromList [(name v, tn) | v <- enrichedParams
+                                      , not (isImplicitVar v)
+                                      , Just tn <- [exprToTypeName (typ v)]])
+                        typeEnv
+                    innerRet = case exprToTypeName (lamType lam) of
+                        Just r  -> Just r
+                        Nothing -> mLamRet
+                    body' = resolveImplicitCalls debug monoLevel env tInstances handlerOps enrichedTypeEnv innerRet (body lam)
+                in dbg debug ("  enriched lambda params: " ++ show [(name v, typ v) | v <- enrichedParams, not (isImplicitVar v)]) $
+                   Function (lam { params = enrichedParams, body = body' })
+        enrichArg _ _ _ arg = arg
+
+        -- Extract parameter types from an arrow type, applying type var substitutions
+        extractArrowTypes :: HashMap Name Name -> Expr -> [Expr]
+        extractArrowTypes tvBinds (Pi Nothing dom cod) =
+            applyTVSubst tvBinds dom : extractArrowTypes tvBinds cod
+        extractArrowTypes tvBinds (Pi (Just n) dom cod)
+            | isUniverseType dom = extractArrowTypes tvBinds cod  -- skip type params
+            | otherwise = applyTVSubst tvBinds dom : extractArrowTypes tvBinds cod
+        extractArrowTypes _ _ = []
+
+        applyTVSubst :: HashMap Name Name -> Expr -> Expr
+        applyTVSubst tvBinds (Id n) = case Map.lookup n tvBinds of
+            Just concrete -> Id concrete
+            Nothing -> Id n
+        applyTVSubst tvBinds (App f as) = App (applyTVSubst tvBinds f) (map (applyTVSubst tvBinds) as)
+        applyTVSubst _ e = e
+
+        isUniverseType (U _) = True
+        isUniverseType (Id "Type") = True
+        isUniverseType (Id "Type1") = True
+        isUniverseType _ = False
+
+        -- Zip params with inferred types, only enriching UNDEFINED ones
+        zipEnrichParams :: [Var] -> [Expr] -> [Var]
+        zipEnrichParams [] _ = []
+        zipEnrichParams (v:vs) ts
+            | isImplicitVar v = v : zipEnrichParams vs ts
+            | otherwise = case ts of
+                (t:ts') | typ v == UNDEFINED -> v { typ = t } : zipEnrichParams vs ts'
+                (_:ts') -> v : zipEnrichParams vs ts'
+                [] -> v : vs
 
     -- | Try to resolve given known arg types, with morphism fallback.
     resolveWithTypes :: Name -> [Name] -> [Expr] -> Expr
@@ -317,14 +646,24 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                     Just ret -> resolveInstanceLambdaWithKey env funcName (argTypes ++ [ret])
                     Nothing  -> Nothing
             in case withRet of
-                Just (instKey, _instLam) ->
-                    dbg debug ("  " ++ funcName ++ " → instance " ++ instKey ++ " (morphism fallback)") $
-                    App (Id instKey) args'
+                Just (instKey, instLam)
+                    -- Skip intrinsic instances — they can't be compiled to bytecode
+                    -- and the original dispatch will handle them at runtime
+                    | body instLam /= Intrinsic ->
+                        dbg debug ("  " ++ funcName ++ " → instance " ++ instKey ++ " (morphism fallback)") $
+                        App (Id instKey) args'
+                    | otherwise ->
+                        dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (kept as dispatch)") $
+                        App (Id funcName) args'
                 _ ->
                     case resolveInstanceLambdaWithKey env funcName argTypes of
-                        Just (instKey, _instLam) ->
-                            dbg debug ("  " ++ funcName ++ " → instance " ++ instKey) $
-                            App (Id instKey) args'
+                        Just (instKey, instLam)
+                            | body instLam /= Intrinsic ->
+                                dbg debug ("  " ++ funcName ++ " → instance " ++ instKey) $
+                                App (Id instKey) args'
+                            | otherwise ->
+                                dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (kept as dispatch)") $
+                                App (Id funcName) args'
                         Nothing ->
                             dbg debug ("  UNRESOLVED " ++ funcName ++ " — no instance found for types=" ++ show argTypes) $
                             App (Id funcName) args'
@@ -454,6 +793,9 @@ extractPatternTypes env _outerTypeEnv caseVars =
     substTypeExpr _ e = e
 
 -- ============================================================================
+-- (Unused callee-directed propagation removed — integrated into resolveImplicitCall)
+
+-- ============================================================================
 -- Type Name Inference (reads from TC-annotated AST)
 -- ============================================================================
 
@@ -487,8 +829,43 @@ inferExprTypeName env _ (App f _)
                     Nothing -> lookupExternRetType n env
 inferExprTypeName env _ (ConTuple (ConsTag cname _) _) =
     lookupTypeOfConstructor cname env
+inferExprTypeName env typeEnv (RecFieldAccess _ e) =
+    inferExprTypeName env typeEnv e
+inferExprTypeName env typeEnv (LetIn binds bodyExpr) =
+    inferExprTypeName env typeEnv bodyExpr <|> firstJust [inferExprTypeName env typeEnv rhs | (_, rhs) <- binds]
+inferExprTypeName env typeEnv (CaseOf _ branchExpr _) =
+    inferExprTypeName env typeEnv branchExpr
+inferExprTypeName env typeEnv (ExpandedCase checks branchExpr _) =
+    inferExprTypeName env typeEnv branchExpr <|> firstJust [inferExprTypeName env typeEnv chk | chk <- checks]
 inferExprTypeName env typeEnv (IfThenElse _ thenBr _) =
     inferExprTypeName env typeEnv thenBr
+-- Phase 5.1: PatternMatches — type from first branch
+inferExprTypeName env typeEnv (PatternMatches (c:_)) =
+    inferExprTypeName env typeEnv c
+-- Phase 5.1: NTuple — no single type name
+inferExprTypeName _ _ (NTuple _) = Nothing
+-- Phase 5.1: ArrayLit — Array type
+inferExprTypeName _ _ (ArrayLit _) = Just "Array"
+-- Phase 5.1: HandleWith — type of computation
+inferExprTypeName env typeEnv (HandleWith c _) =
+    inferExprTypeName env typeEnv c
+-- Phase 5.1: BinaryOp — try operator return type
+inferExprTypeName env _ (BinaryOp op _ _) =
+    case lookupLambda op env of
+        Just lam -> exprToTypeName (lamType lam)
+        Nothing -> Nothing
+-- Phase 5.1: UnaryOp — try operator return type
+inferExprTypeName env _ (UnaryOp op _) =
+    case lookupLambda op env of
+        Just lam -> exprToTypeName (lamType lam)
+        Nothing -> Nothing
+-- Phase 5.1: ReprCast — the target type
+inferExprTypeName _ _ (ReprCast _ t) = exprToTypeName t
+-- Phase 5.1: Statements — type of last statement
+inferExprTypeName env typeEnv (Statements stmts) =
+    case reverse stmts of
+        (s:_) -> inferExprTypeName env typeEnv s
+        []    -> Nothing
 inferExprTypeName _ _ _ = Nothing
 
 -- | Look up the return type of a target extern function.

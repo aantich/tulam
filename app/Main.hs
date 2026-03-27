@@ -23,6 +23,7 @@ import Surface
 import Pipeline
 import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass)
 import TypeCheck (typeCheckPass, typeAnnotatePass)
+import TypeElaborate (elaborateExpr)
 import TypeElaborate (typeElaboratePass)
 -- addBinding, traceExpr, installDefaultHandlers are in Pipeline (imported unqualified)
 import CLM (pprSummary)
@@ -82,10 +83,12 @@ processNew line = do
                 Right ex1 -> do
                     -- Desugar the expression (BinaryOp → App, IfThenElse → match, etc.)
                     let ex = desugarActions . desugarStringLiterals . afterparse $ traverseExpr afterparse ex1
-                    -- Evaluate via bytecode VM
+                    -- Phase 2: Add Typed wrappers from environment info before bytecode compilation.
+                    -- This gives mono type information for dispatch resolution in REPL expressions.
                     st <- get
                     let env = currentEnvironment st
-                    result <- liftIO $ evalInteractive env st ex
+                        ex' = elaborateExpr env Map.empty ex
+                    result <- liftIO $ evalInteractive env st ex'
                     case result of
                         BCRunOK val -> liftIO $ putStrLn $ T.unpack (valToString val)
                         BCCompileError e -> liftIO $ putStrLn $ TC.as [TC.bold, TC.red] "Error: " ++ e

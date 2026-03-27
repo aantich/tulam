@@ -43,10 +43,19 @@ module TypeCheck
   , typeAnnotatePass
   , annotateLambdaTypes
   , decomposePi
+    -- * Post-TC meta resolution (Phase 1.2)
+  , resolveMetasInEnvironment
+  , resolveMetasInLambda
+  , resolveMetasInType
+  , resolveMetasInExpr
   ) where
 
 import Surface
 import State
+import ElabMetadata (binderInfoFromVar, defaultExplicitBinderInfo, defaultImplicitBinderInfo)
+import qualified ElabMetadata as EM
+import ElabCore
+import ElabObligation
 import CLM (CLMExpr(..), CLMLam(..), CLMPatternCheck(..), evalCLMPure, inferTypePure)
 import Logs
 
@@ -57,6 +66,7 @@ import Data.HashMap.Strict as Map
 import qualified Data.IntSet as IntSet
 import qualified Data.Set as Set
 import Data.List (intercalate, nub)
+import qualified Data.Maybe as Maybe
 
 -- ============================================================================
 -- Type Checker State & Monad
@@ -78,7 +88,7 @@ data TCError
   deriving (Show)
 
 data Constraint
-  = CStructure Name (Maybe Name) [Expr]  -- ^ e.g. CStructure "Eq" Nothing [Meta 3], CStructure "Semigroup" (Just "Additive") [Int]
+  = CStructure Name (Maybe Name) [Expr] (Maybe Name)  -- ^ class, tag, type args, optional call-site method name
   | CRowLack Name Expr             -- ^ Field absence constraint for row unification
   | CEffect Name                   -- ^ Effect requirement: this function needs effect E (e.g. CEffect "Console")
   deriving (Show)
@@ -87,6 +97,7 @@ data TCState = TCState
   { nextMeta      :: !Int                       -- ^ Fresh metavariable counter
   , substitution  :: HashMap Int Expr           -- ^ Unified substitution (type vars AND row vars)
   , constraints   :: [Constraint]               -- ^ Deferred constraints
+  , witnessMap    :: HashMap Name SemanticWitness -- ^ Selected semantic witnesses by method name
   , tcErrors      :: [TCError]                  -- ^ Accumulated errors (halt pipeline in strict mode)
   , tcMode        :: TCMode                     -- ^ Strict or relaxed
   } deriving (Show)
@@ -104,6 +115,7 @@ initTCState mode = TCState
   { nextMeta      = 0
   , substitution  = Map.empty
   , constraints   = []
+  , witnessMap    = Map.empty
   , tcErrors      = []
   , tcMode        = mode
   }
@@ -1064,20 +1076,24 @@ emitStructConstraint :: Name -> Lambda -> TC ()
 emitStructConstraint funcName lam =
   case params lam of
     (Var _ (Implicit implTy) _ : _) ->
-      case implTy of
-        -- Tagged: Implicit (NamedRef (App (Id "Semigroup") [Id "a"]) "Additive")
-        NamedRef (App (Id structName) typeArgs) tag ->
-          tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
-            tcModify (\st -> st { constraints = CStructure structName (Just tag) tyArgs : constraints st })
-        NamedRef (Id structName) tag ->
-          tcModify (\st -> st { constraints = CStructure structName (Just tag) [] : constraints st })
-        -- Untagged: Implicit (App (Id "Eq") [Id "a"])
-        App (Id structName) typeArgs ->
-          tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
-            tcModify (\st -> st { constraints = CStructure structName Nothing tyArgs : constraints st })
-        Id structName ->
-          tcModify (\st -> st { constraints = CStructure structName Nothing [] : constraints st })
-        _ -> tcPure ()
+      emitStructConstraintFromType funcName implTy
+    _ -> tcPure ()
+
+emitStructConstraintFromType :: Name -> Expr -> TC ()
+emitStructConstraintFromType methodName implTy =
+  case implTy of
+    -- Tagged: Implicit (NamedRef (App (Id "Semigroup") [Id "a"]) "Additive")
+    NamedRef (App (Id structName) typeArgs) tag ->
+      tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
+        tcModify (\st -> st { constraints = CStructure structName (Just tag) tyArgs (Just methodName) : constraints st })
+    NamedRef (Id structName) tag ->
+      tcModify (\st -> st { constraints = CStructure structName (Just tag) [] (Just methodName) : constraints st })
+    -- Untagged: Implicit (App (Id "Eq") [Id "a"])
+    App (Id structName) typeArgs ->
+      tcMapM normalizeTypeExpr typeArgs `tcBind` \tyArgs ->
+        tcModify (\st -> st { constraints = CStructure structName Nothing tyArgs (Just methodName) : constraints st })
+    Id structName ->
+      tcModify (\st -> st { constraints = CStructure structName Nothing [] (Just methodName) : constraints st })
     _ -> tcPure ()
 
 -- | Convert a Lambda's signature to a type (params → return type).
@@ -1571,23 +1587,28 @@ inferActionStmt (ActionBind _name expr) = infer expr
 inferActionStmt (ActionLet _name expr) = infer expr
 inferActionStmt (ActionExpr expr) = infer expr
 
--- | Infer let bindings and extend environment
+-- | Infer let bindings and extend environment.
+-- Phase 1.1: Generalize each binding's type (let-polymorphism) so that
+-- a let-bound generic function like `id = fn(x) = x` gets type `∀t. t -> t`
+-- and each use site instantiates fresh metas, preventing type pollution.
 inferLetBinds :: [(Var, Expr)] -> TC ()
 inferLetBinds [] = tcPure ()
 inferLetBinds ((v, e):rest) =
   infer e `tcBind` \ty ->
-    tcLocal (\env -> env { varTypes = Map.insert (name v) ty (varTypes env) }) (
-      inferLetBinds rest
-    )
+    generalize ty `tcBind` \genTy ->
+      tcLocal (\env -> env { varTypes = Map.insert (name v) genTy (varTypes env) }) (
+        inferLetBinds rest
+      )
 
--- | Infer let bindings with body
+-- | Infer let bindings with body (with let-polymorphism).
 inferLetBindsAndBody :: [(Var, Expr)] -> Expr -> TC Expr
 inferLetBindsAndBody [] bodyExpr = infer bodyExpr
 inferLetBindsAndBody ((v, e):rest) bodyExpr =
   infer e `tcBind` \ty ->
-    tcLocal (\env -> env { varTypes = Map.insert (name v) ty (varTypes env) }) (
-      inferLetBindsAndBody rest bodyExpr
-    )
+    generalize ty `tcBind` \genTy ->
+      tcLocal (\env -> env { varTypes = Map.insert (name v) genTy (varTypes env) }) (
+        inferLetBindsAndBody rest bodyExpr
+      )
 
 -- | Check that an expression has the expected type
 check :: Expr -> Expr -> TC ()
@@ -1884,10 +1905,27 @@ checkElab expr expectedTy =
 -- Takes elaborated f, its type, and raw args.
 -- Returns (Typed (App f' args') retTy, retTy).
 inferAppElab :: Expr -> Expr -> [Expr] -> TC (Expr, Expr)
-inferAppElab f' fTy args = goApp fTy args [] `tcBind` \(elabArgs, retTy) ->
-    let result = if Prelude.null args then f' else Typed (App f' (Prelude.reverse elabArgs)) retTy
-    in tcPure (result, retTy)
+inferAppElab f' fTy args =
+    emitCalleeConstraint f' `tcBind` \_ ->
+      goApp fTy args [] `tcBind` \(elabArgs, retTy) ->
+        let result = if Prelude.null args then f' else Typed (App f' (Prelude.reverse elabArgs)) retTy
+        in tcPure (result, retTy)
   where
+    emitCalleeConstraint expr =
+      case calleeExprHead expr of
+        Just fname ->
+          tcAsk `tcBind` \tcEnv ->
+            case envCompiler tcEnv of
+              Just cenv ->
+                case lookupLambda fname cenv of
+                  Just lam ->
+                    if hasSemanticImplicitLambda lam
+                      then emitStructConstraint fname lam
+                      else tcPure ()
+                  Nothing -> tcPure ()
+              Nothing -> tcPure ()
+        Nothing -> tcPure ()
+
     goApp ty [] acc = tcPure (acc, ty)
     -- Non-dependent arrow
     goApp (Pi Nothing paramTy retTy) (arg:rest) acc =
@@ -1937,6 +1975,64 @@ inferAppElab f' fTy args = goApp fTy args [] `tcBind` \(elabArgs, retTy) ->
 
 -- | Infer type of a Lambda definition and return elaborated form.
 -- Returns (Function elaboratedLam, funcType).
+calleeExprHead :: Expr -> Maybe Name
+calleeExprHead (Typed e _) = calleeExprHead e
+calleeExprHead (Id n) = Just n
+calleeExprHead (Function lam) = Just (lamName lam)
+calleeExprHead _ = Nothing
+
+exprToTypeNameR :: Expr -> Maybe Name
+exprToTypeNameR (Typed _ ty) = exprToTypeNameR ty
+exprToTypeNameR (Id n) = Just n
+exprToTypeNameR (App (Id n) _) = Just n
+exprToTypeNameR _ = Nothing
+
+obligationFromImplicitType :: Name -> ObligationOrigin -> [Expr] -> Expr -> Maybe SemanticObligation
+obligationFromImplicitType methodName origin exprArgs implTy =
+  case implTy of
+    NamedRef (App (Id structName) typeArgs) tag ->
+      Just (StructureObligation methodName structName (Just tag) (Maybe.mapMaybe exprToTypeNameR typeArgs) exprArgs origin)
+    NamedRef (Id structName) tag ->
+      Just (StructureObligation methodName structName (Just tag) [] exprArgs origin)
+    App (Id structName) typeArgs ->
+      Just (StructureObligation methodName structName Nothing (Maybe.mapMaybe exprToTypeNameR typeArgs) exprArgs origin)
+    Id structName ->
+      Just (StructureObligation methodName structName Nothing [] exprArgs origin)
+    _ -> Nothing
+
+callKindForHead :: Environment -> Maybe SemanticWitness -> Name -> [Expr] -> Expr -> ElabCallKind
+callKindForHead cenv mWitness fname exprArgs fTy =
+  case mWitness of
+    Just w -> EvidenceCall w
+    Nothing ->
+      case lookupLambda fname cenv of
+        Just lam ->
+          case body lam of
+            Intrinsic -> IntrinsicCall fname
+            _ ->
+              case params lam of
+                (Var _ (Implicit implTy) _ : _) ->
+                  case obligationFromImplicitType fname OriginCallSite exprArgs implTy of
+                    Just obl -> SemanticCall obl
+                    Nothing -> DirectCall
+                _ ->
+                  if Map.member fname (effectOps cenv)
+                    then HandlerCall (HandlerObligation fname (maybe "" id (Map.lookup fname (effectOps cenv))) Nothing [] exprArgs OriginCallSite)
+                    else DirectCall
+        Nothing -> DirectCall
+
+hasSemanticImplicitLambda :: Lambda -> Bool
+hasSemanticImplicitLambda lam =
+  case params lam of
+    (Var _ (Implicit implTy) _ : _) ->
+      case implTy of
+        Id _ -> True
+        App (Id _) _ -> True
+        NamedRef (Id _) _ -> True
+        NamedRef (App (Id _) _) _ -> True
+        _ -> False
+    _ -> False
+
 inferLambdaElab :: Lambda -> TC (Expr, Expr)
 inferLambdaElab lam =
   let ps = case params lam of
@@ -1976,11 +2072,11 @@ inferLambdaElab lam =
           ) `tcBind` \(elabBody, bodyTy) ->
             let paramTys = Prelude.map snd paramBindings
                 funcTy = Prelude.foldr (\a b -> Pi Nothing a b) bodyTy paramTys
-                elabLam = lam { body = elabBody, lamType = bodyTy }
+                elabLam = lam { body = elabBody, lamType = funcTy }
             in tcPure (Function elabLam, funcTy)
     )
 
--- | Infer let bindings with elaboration and body.
+-- | Infer let bindings with elaboration and body (with let-polymorphism).
 inferLetBindsElabAndBody :: [(Var, Expr)] -> Expr -> TC (Expr, Expr)
 inferLetBindsElabAndBody binds bodyExpr = goLet binds [] `tcBind` \(elabBinds, body', bodyTy) ->
   tcPure (Typed (LetIn (Prelude.reverse elabBinds) body') bodyTy, bodyTy)
@@ -1988,8 +2084,9 @@ inferLetBindsElabAndBody binds bodyExpr = goLet binds [] `tcBind` \(elabBinds, b
     goLet [] acc = inferElab bodyExpr `tcBind` \(body', bodyTy) -> tcPure (acc, body', bodyTy)
     goLet ((v, e):rest) acc =
       inferElab e `tcBind` \(e', ty) ->
-        tcLocal (\env -> env { varTypes = Map.insert (Surface.name v) ty (varTypes env) })
-          (goLet rest ((v, e'):acc))
+        generalize ty `tcBind` \genTy ->
+          tcLocal (\env -> env { varTypes = Map.insert (Surface.name v) genTy (varTypes env) })
+            (goLet rest ((v, e'):acc))
 
 -- | Infer the type of an action statement with elaboration.
 inferActionStmtElab :: ActionStmt -> TC (ActionStmt, Expr)
@@ -2173,7 +2270,7 @@ typeCheckPass = do
         exprToName (App (Id n) _) = n
         exprToName e = showExprBrief e
         md' = Prelude.map useOptimized md
-    (_, allElabLams) <- foldM (\(accSt, accLams) (expr, srcInfo) ->
+    (tcStFinal, allElabLams) <- foldM (\(accSt, accLams) (expr, srcInfo) ->
         case runTC (checkTopLevelElab expr) tcEnv accSt of
             Left errs -> do
                 forM_ errs $ \err ->
@@ -2188,24 +2285,164 @@ typeCheckPass = do
                     modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length newErrors })
                 return (tcSt' { tcErrors = [] }, elabLams ++ accLams)
       ) (tcSt, []) md'
+    stMid <- get
+    let envMid = currentEnvironment stMid
+        wmap = witnessMap tcStFinal
+        stageRLams = Maybe.mapMaybe (toStageRLambda envMid wmap) allElabLams
+    modify (\s -> s { currentEnvironment = Prelude.foldl (\e (n, elam) -> storeElaboratedLambdaR n elam e) envMid stageRLams })
     -- Write elaborated lambdas into separate elab maps (not overwriting raw canonical maps).
     -- normalizeTy and exprToCLMTC consume raw maps; Monomorphize/Specialize use elab maps.
     st2 <- get
     let env2 = currentEnvironment st2
-        env3 = Prelude.foldl (\e (n, lam) -> storeElaboratedLambda n lam e) env2 allElabLams
+        env3 = Prelude.foldl (\e (n, lam) ->
+                  let e' = storeElaboratedLambda n lam e
+                  in storeElaboratedBinderInfo n (Prelude.map binderInfoFromVar (params lam)) e'
+               ) env2 allElabLams
     modify (\s -> s { currentEnvironment = env3 })
+    -- Phase 1.2: Post-TC meta resolution — resolve all remaining metas in raw lambda maps
+    -- using the final TC substitution. This ensures downstream passes (TypeElaborate,
+    -- Monomorphize) see concrete types instead of Meta n placeholders.
+    let subst = substitution tcStFinal
+    unless (Map.null subst) $ do
+        st3 <- get
+        let env4 = currentEnvironment st3
+            env5 = resolveMetasInEnvironment subst env4
+        modify (\s -> s { currentEnvironment = env5 })
+    verboseLog "  Pass 3 (typecheck): meta resolution complete"
+
+-- | Phase 1.2: Resolve all Meta nodes in the environment's lambda maps
+-- using the TC substitution. Metas that have no solution are converted to
+-- Id "?tN" (same as zonkRemaining) so downstream passes never see raw Meta nodes.
+resolveMetasInEnvironment :: HashMap Int Expr -> Environment -> Environment
+resolveMetasInEnvironment subst env = env
+    { topLambdas = Map.map (resolveMetasInLambda subst) (topLambdas env)
+    , instanceLambdas = Map.map (resolveMetasInLambda subst) (instanceLambdas env)
+    , topLambdasElab = Map.map (resolveMetasInLambda subst) (topLambdasElab env)
+    , instanceLambdasElab = Map.map (resolveMetasInLambda subst) (instanceLambdasElab env)
+    }
+
+-- | Resolve metas in a Lambda's body, params, and return type.
+resolveMetasInLambda :: HashMap Int Expr -> Lambda -> Lambda
+resolveMetasInLambda subst lam = lam
+    { body = resolveMetasInExpr subst (body lam)
+    , params = Prelude.map (\v -> v { typ = resolveMetasInType subst (typ v) }) (params lam)
+    , lamType = resolveMetasInType subst (lamType lam)
+    }
+
+-- | Resolve Meta nodes in a type expression (pure).
+-- Applies the substitution map, then converts any remaining unresolved metas to Id "?tN".
+resolveMetasInType :: HashMap Int Expr -> Expr -> Expr
+resolveMetasInType subst = go
+  where
+    go (Meta n) = case Map.lookup n subst of
+        Just ty -> go ty  -- recursively resolve (handles chains)
+        Nothing -> Id ("?t" ++ show n)  -- unsolved → readable name
+    go e = mapTypeChildren go e
+
+-- | Resolve Meta nodes in a full expression tree (including non-type positions).
+-- Uses traverseExpr to reach into Lambda bodies, let-bindings, etc.
+resolveMetasInExpr :: HashMap Int Expr -> Expr -> Expr
+resolveMetasInExpr subst = resolveDeep
+  where
+    resolveType = resolveMetasInType subst
+    resolveDeep (Meta n) = case Map.lookup n subst of
+        Just ty -> resolveType ty
+        Nothing -> Id ("?t" ++ show n)
+    resolveDeep (Typed e t) = Typed (resolveDeep e) (resolveType t)
+    resolveDeep (Function lam) = Function $ lam
+        { body = resolveDeep (body lam)
+        , params = Prelude.map (\v -> v { typ = resolveType (typ v) }) (params lam)
+        , lamType = resolveType (lamType lam)
+        }
+    resolveDeep (LetIn binds bodyExpr) =
+        LetIn (Prelude.map (\(v, e) -> (v { typ = resolveType (typ v) }, resolveDeep e)) binds) (resolveDeep bodyExpr)
+    resolveDeep (App f args) = App (resolveDeep f) (Prelude.map resolveDeep args)
+    resolveDeep (CaseOf cv ex si) =
+        CaseOf (Prelude.map (\v -> v { typ = resolveType (typ v), val = resolveDeep (val v) }) cv)
+               (resolveDeep ex) si
+    resolveDeep (ExpandedCase checks bodyExpr si) =
+        ExpandedCase (Prelude.map resolveDeep checks) (resolveDeep bodyExpr) si
+    resolveDeep (PatternMatches cases) = PatternMatches (Prelude.map resolveDeep cases)
+    resolveDeep (ConTuple ct args) = ConTuple ct (Prelude.map resolveDeep args)
+    resolveDeep (NTuple fields) = NTuple (Prelude.map (\(mn, e) -> (mn, resolveDeep e)) fields)
+    resolveDeep (BinaryOp op l r) = BinaryOp op (resolveDeep l) (resolveDeep r)
+    resolveDeep (UnaryOp op e) = UnaryOp op (resolveDeep e)
+    resolveDeep (IfThenElse c t e) = IfThenElse (resolveDeep c) (resolveDeep t) (resolveDeep e)
+    resolveDeep (ArrayLit es) = ArrayLit (Prelude.map resolveDeep es)
+    resolveDeep (RecFieldAccess ac e) = RecFieldAccess ac (resolveDeep e)
+    resolveDeep (ReprCast e t) = ReprCast (resolveDeep e) (resolveType t)
+    resolveDeep (HandleWith c h) = HandleWith (resolveDeep c) (resolveDeep h)
+    resolveDeep (ActionBlock stmts) = ActionBlock (Prelude.map resolveDeepStmt stmts)
+    resolveDeep (PatternGuard pc e) = PatternGuard pc (resolveDeep e)
+    resolveDeep (Pi mn a b) = Pi mn (resolveType a) (resolveType b)
+    resolveDeep (Sigma mn a b) = Sigma mn (resolveType a) (resolveType b)
+    resolveDeep (RowExtend l t r) = RowExtend l (resolveType t) (resolveType r)
+    resolveDeep (EffType r t) = EffType (resolveType r) (resolveType t)
+    resolveDeep (Implicit e) = Implicit (resolveDeep e)
+    resolveDeep (DeclBlock exs) = DeclBlock (Prelude.map resolveDeep exs)
+    resolveDeep (RecordConstruct nm fields) = RecordConstruct nm (Prelude.map (\(n,e) -> (n, resolveDeep e)) fields)
+    resolveDeep (RecordUpdate e fields) = RecordUpdate (resolveDeep e) (Prelude.map (\(n,ex) -> (n, resolveDeep ex)) fields)
+    resolveDeep (Statements stmts) = Statements (Prelude.map resolveDeep stmts)
+    resolveDeep e = e  -- Id, Lit, U, RowEmpty, UNDEFINED, etc.
+
+    resolveDeepStmt (ActionExpr e) = ActionExpr (resolveDeep e)
+    resolveDeepStmt (ActionBind n e) = ActionBind n (resolveDeep e)
+    resolveDeepStmt (ActionLet n e) = ActionLet n (resolveDeep e)
 
 -- | Build a TCEnv from the compiler's Environment
+toStageRBinder :: Var -> ElabBinder
+toStageRBinder v = ElabBinder (name v) (typ v) (binderInfoFromVar v)
+
+toStageRExpr :: Environment -> HashMap Name SemanticWitness -> Expr -> ElabExpr
+toStageRExpr env wmap expr = case expr of
+  Typed e ty ->
+    case e of
+      RecFieldAccess fa base -> EAnn (EProject fa (toStageRExpr env wmap base) ty) ty
+      IfThenElse c t f -> EAnn (EIf (toStageRExpr env wmap c) (toStageRExpr env wmap t) (toStageRExpr env wmap f) ty) ty
+      CaseOf pats bodyExpr _ -> EAnn (ECase [ElabAlt [] (toStageRExpr env wmap bodyExpr)] ty) ty
+      ExpandedCase checks bodyExpr _ -> EAnn (ECase [ElabAlt (Prelude.map (toStageRExpr env wmap) checks) (toStageRExpr env wmap bodyExpr)] ty) ty
+      _ -> EAnn (toStageRExpr env wmap e) ty
+  Id n -> EGlobal n
+  Lit l -> ELit l
+  Function lam ->
+    let binders = Prelude.map toStageRBinder (params lam)
+        bodyR = toStageRExpr env wmap (body lam)
+    in ELam binders bodyR (lamType lam)
+  LetIn binds bodyExpr ->
+    ELet [ (name v, toStageRExpr env wmap rhs) | (v, rhs) <- binds ] (toStageRExpr env wmap bodyExpr)
+  App f args ->
+    let headR = toStageRExpr env wmap f
+        argRs = Prelude.map (\a -> ElabArg (toStageRExpr env wmap a) defaultExplicitBinderInfo) args
+        retTy = UNDEFINED
+        callKind = case calleeExprHead f of
+          Just fname ->
+            let mWitness = Map.lookup fname wmap
+            in callKindForHead env mWitness fname args UNDEFINED
+          Nothing -> DirectCall
+    in ECall callKind headR argRs retTy
+  RecFieldAccess fa e -> EProject fa (toStageRExpr env wmap e) UNDEFINED
+  CaseOf pats bodyExpr _ -> ECase [ElabAlt [] (toStageRExpr env wmap bodyExpr)] UNDEFINED
+  ExpandedCase checks bodyExpr _ -> ECase [ElabAlt (Prelude.map (toStageRExpr env wmap) checks) (toStageRExpr env wmap bodyExpr)] UNDEFINED
+  IfThenElse c t f -> EIf (toStageRExpr env wmap c) (toStageRExpr env wmap t) (toStageRExpr env wmap f) UNDEFINED
+  _ -> ESurface expr
+
+toStageRLambda :: Environment -> HashMap Name SemanticWitness -> (Name, Lambda) -> Maybe (Name, ElabLambda)
+toStageRLambda env wmap (n, lam) =
+  let binders = Prelude.map toStageRBinder (params lam)
+      bodyR = toStageRExpr env wmap (body lam)
+  in Just (n, ElabLambda n binders bodyR (lamType lam) lam)
+
 buildTCEnvFromEnvironment :: Environment -> TCEnv
 buildTCEnvFromEnvironment env = emptyTCEnv { envCompiler = Just env }
 
 -- | Resolve accumulated structure constraints.
--- Phase 3: fixpoint loop — resolving constraint A may solve a meta that enables constraint B.
--- Loops up to 10 iterations until no more constraints are resolved.
+-- Phase 1.3: true fixpoint loop — resolving constraint A may solve a meta that enables B.
+-- Iterates until no progress is made (up to 100 iterations as safety bound).
+-- In strict mode, unresolved constraints with concrete types become hard errors.
 resolveConstraints :: TC ()
-resolveConstraints = resolveLoop 10
+resolveConstraints = resolveLoop 100
   where
-    resolveLoop 0 = warnRemaining
+    resolveLoop 0 = warnRemaining  -- safety bound: emit remaining as warnings/errors
     resolveLoop n =
       tcGet `tcBind` \st ->
         let before = Prelude.length (constraints st)
@@ -2221,11 +2458,17 @@ resolveConstraints = resolveLoop 10
           tcMapM_ (warnOne env) (constraints st) `tcBind` \_ ->
             tcModify (\s -> s { constraints = [] })
 
-    warnOne env (CStructure structName mTag tyArgs) =
+    warnOne env (CStructure structName mTag tyArgs mMethod) =
       tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
         let typeNames = Prelude.map tyToName resolvedArgs
-        in if Prelude.any (== "") typeNames then tcPure ()
-           else tcWarnOrFail (ConstraintUnsolved (CStructure structName mTag resolvedArgs))
+        in if Prelude.any (== "") typeNames
+           -- Phase 1.3: In strict mode, even constraints with unresolved type args
+           -- are reported. In relaxed mode, skip them (type info is incomplete).
+           then tcGet `tcBind` \st ->
+             if tcMode st == TCStrict
+             then tcWarnOrFail (ConstraintUnsolved (CStructure structName mTag resolvedArgs mMethod))
+             else tcPure ()
+           else tcWarnOrFail (ConstraintUnsolved (CStructure structName mTag resolvedArgs mMethod))
     warnOne _ (CRowLack _ _) = tcPure ()
     warnOne _ (CEffect _) = tcPure ()  -- effect constraints are informational, not warnings
 
@@ -2236,11 +2479,11 @@ resolveConstraints = resolveLoop 10
           in tcModify (\s -> s { constraints = [] }) `tcBind` \_ ->
              tcMapM_ (resolveOne env) cs
 
-    resolveOne env (CStructure structName mTag tyArgs) =
+    resolveOne env (CStructure structName mTag tyArgs mMethod) =
       tcMapM applySubst tyArgs `tcBind` \resolvedArgs ->
         let typeNames = Prelude.map tyToName resolvedArgs
         in if Prelude.any (== "") typeNames
-           then tcModify (\s -> s { constraints = CStructure structName mTag tyArgs : constraints s })
+           then tcModify (\s -> s { constraints = CStructure structName mTag tyArgs mMethod : constraints s })
            else case envCompiler env of
              Nothing -> tcPure ()
              Just cenv ->
@@ -2248,9 +2491,13 @@ resolveConstraints = resolveLoop 10
                  Just (Structure structLam _) -> case body structLam of
                    DeclBlock exs ->
                      let funcNames = [lamName l | Function l <- exs]
-                     in if Prelude.any (\fn -> instanceExistsTagged cenv fn typeNames mTag) funcNames
-                        then tcPure ()
-                        else tcModify (\s -> s { constraints = CStructure structName mTag resolvedArgs : constraints s })
+                         witnessFor fn = InstanceWitness fn (mkInstanceKey fn typeNames mTag) typeNames mTag
+                     in case mMethod of
+                          Just methodName | instanceExistsTagged cenv methodName typeNames mTag ->
+                            tcModify (\s -> s { witnessMap = Map.insert methodName (witnessFor methodName) (witnessMap s) })
+                          _ -> if Prelude.any (\fn -> instanceExistsTagged cenv fn typeNames mTag) funcNames
+                                then tcPure ()
+                                else tcModify (\s -> s { constraints = CStructure structName mTag resolvedArgs mMethod : constraints s })
                    _ -> tcPure ()
                  _ -> tcPure ()
     resolveOne _ (CRowLack n e) =
@@ -2526,7 +2773,7 @@ typeAnnotatePass = do
         topLams' = Map.map (annotateLambdaTypes tcEnv) (topLambdas env)
         -- Annotate instanceLambdas
         instLams' = Map.map (annotateLambdaTypes tcEnv) (instanceLambdas env)
-        env' = env { topLambdas = topLams', instanceLambdas = instLams' }
+        env' = clearElaboratedLambdas env { topLambdas = topLams', instanceLambdas = instLams' }
     modify (\s -> s { currentEnvironment = env' })
     verboseLog "  Pass 3.1: type annotation complete"
 
@@ -2669,7 +2916,7 @@ showSourceLoc (SourceInfo l c f _) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
 showSourceLoc SourceInteractive = ""
 
 showConstraint :: Constraint -> String
-showConstraint (CStructure n mTag tys) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")" ++ maybe "" (" as " ++) mTag
+showConstraint (CStructure n mTag tys _mMethod) = n ++ "(" ++ intercalate ", " (Prelude.map showTy tys) ++ ")" ++ maybe "" (" as " ++) mTag
 showConstraint (CRowLack n _) = "row lacks " ++ n
 
 -- | Pretty-print a type (Expr used as type)

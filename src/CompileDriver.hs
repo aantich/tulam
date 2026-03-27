@@ -30,6 +30,10 @@ import Data.List (nub)
 
 import Surface
 import State
+import qualified ElabMetadata as EM
+import ElabMetadata (binderVisibility, binderRole, defaultExplicitBinderInfo, isSemanticRole)
+import ElabCore
+import ElabObligation
 import Monomorphize (monomorphizeLambdas, buildHandlerOpsMap)
 import Specialize (specializeLambdas)
 
@@ -102,7 +106,7 @@ buildCompilationPlan debug entryPoints targetName monoLevel specLvl env state =
         -- After SpecFull, user functions and specialized instances (keys with $)
         -- should have zero unresolved calls. Generic instances may still have
         -- some if specialization couldn't resolve all type params.
-        compiledFuncs = Map.filter (not . hasImplicit) specLams
+        compiledFuncs = Map.filterWithKey (\n lam -> not (lambdaHasSemanticImplicit lam (lookupLambdaBinderInfo n env))) specLams
         specializedInsts = Map.filterWithKey (\k _ -> '$' `elem` k) specInsts
         checkSet = Map.union compiledFuncs specializedInsts
         unresolvedWithSource = [(fname ++ " (" ++ show (lamSrcInfo lam) ++ ")", u)
@@ -307,38 +311,92 @@ buildOriginMap names modules =
 -- specialization. This must be target-aware: some dispatch heads (like effectSeq)
 -- are provided by target handlers rather than top-level implicit functions.
 collectUnresolvedCalls :: Name -> Environment -> Lambda -> [Name]
-collectUnresolvedCalls targetName env lam = go (body lam)
+collectUnresolvedCalls targetName env lam =
+    case Map.lookup (lamName lam) (topLambdasR env) of
+        Just rlam -> collectUnresolvedCallsR targetName env rlam
+        Nothing -> goSurface (body lam)
   where
     handlerOps = buildHandlerOpsMap targetName env
 
     isUnresolvedDispatchHead n =
-        case lookupLambda n env of
-            Just fun | hasImplicit fun -> True
-            _ -> Map.member n handlerOps
+        case lookupLambdaRep ElabLambdaRep n env of
+            Just fun ->
+                let infos = lookupAnyLambdaBinderInfo n env
+                    hasSemanticImplicit = or
+                        [ binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)
+                        | bi <- take (length (params fun)) (infos ++ repeat defaultExplicitBinderInfo)
+                        ]
+                in hasSemanticImplicit || Map.member n handlerOps
+            Nothing -> Map.member n handlerOps
 
-    go (App (Id n) args) =
+    goSurface (App (Id n) args) =
         let self = if isUnresolvedDispatchHead n then [n] else []
-        in self ++ concatMap go args
-    go (App f args) = go f ++ concatMap go args
-    go (Function inner) = go (body inner)
-    go (LetIn binds bodyExpr) = concatMap (go . snd) binds ++ go bodyExpr
-    go (ExpandedCase checks bodyExpr _) = concatMap goPC checks ++ go bodyExpr
-    go (PatternMatches cases) = concatMap go cases
-    go (CaseOf cv ex _) = concatMap (go . val) cv ++ go ex
-    go (ConTuple _ args) = concatMap go args
-    go (NTuple fields) = concatMap (go . snd) fields
-    go (IfThenElse c t e) = go c ++ go t ++ go e
-    go (BinaryOp _ l r) = go l ++ go r
-    go (ActionBlock stmts) = concatMap goAS stmts
-    go (RecFieldAccess _ e) = go e
-    go (ArrayLit es) = concatMap go es
-    go (Typed e _) = go e
-    go (ReprCast e _) = go e
-    go _ = []
+        in self ++ concatMap goSurface args
+    goSurface (App f args) = goSurface f ++ concatMap goSurface args
+    goSurface (Function inner) = goSurface (body inner)
+    goSurface (LetIn binds bodyExpr) = concatMap (goSurface . snd) binds ++ goSurface bodyExpr
+    goSurface (ExpandedCase checks bodyExpr _) = concatMap goPC checks ++ goSurface bodyExpr
+    goSurface (PatternMatches cases) = concatMap goSurface cases
+    goSurface (CaseOf cv ex _) = concatMap (goSurface . val) cv ++ goSurface ex
+    goSurface (ConTuple _ args) = concatMap goSurface args
+    goSurface (NTuple fields) = concatMap (goSurface . snd) fields
+    goSurface (IfThenElse c t e) = goSurface c ++ goSurface t ++ goSurface e
+    goSurface (BinaryOp _ l r) = goSurface l ++ goSurface r
+    goSurface (ActionBlock stmts) = concatMap goAS stmts
+    goSurface (RecFieldAccess _ e) = goSurface e
+    goSurface (ArrayLit es) = concatMap goSurface es
+    goSurface (Typed e _) = goSurface e
+    goSurface (ReprCast e _) = goSurface e
+    goSurface _ = []
 
-    goPC (PatternGuard _ e) = go e
+    goPC (PatternGuard _ e) = goSurface e
     goPC _ = []
 
-    goAS (ActionExpr e) = go e
-    goAS (ActionBind _ e) = go e
-    goAS (ActionLet _ e) = go e
+    goAS (ActionExpr e) = goSurface e
+    goAS (ActionBind _ e) = goSurface e
+    goAS (ActionLet _ e) = goSurface e
+
+collectUnresolvedCallsR :: Name -> Environment -> ElabLambda -> [Name]
+collectUnresolvedCallsR targetName env lam = go (elabLamBody lam)
+  where
+    handlerOps = buildHandlerOpsMap targetName env
+    go (EVar _) = []
+    go (EGlobal _) = []
+    go (ELit _) = []
+    go (EType _) = []
+    go (EAnn e _) = go e
+    go (ELam _ body _) = go body
+    go (ELet binds bodyExpr) = concatMap (go . snd) binds ++ go bodyExpr
+    go (ECall kind headExpr args _) =
+        let self = case kind of
+                SemanticCall obl -> [oblMethod obl]
+                HandlerCall obl -> if Map.member (oblMethod obl) handlerOps then [] else [oblMethod obl]
+                EvidenceCall _ -> []
+                DirectCall -> []
+                IntrinsicCall _ -> []
+        in self ++ go headExpr ++ concatMap (go . elabArgExpr) args
+    go (ESurface e) = goSurface e
+
+    goSurface (App f args) = goSurface f ++ concatMap goSurface args
+    goSurface (Function inner) = goSurface (body inner)
+    goSurface (LetIn binds bodyExpr) = concatMap (goSurface . snd) binds ++ goSurface bodyExpr
+    goSurface (ExpandedCase checks bodyExpr _) = concatMap goPC checks ++ goSurface bodyExpr
+    goSurface (PatternMatches cases) = concatMap goSurface cases
+    goSurface (CaseOf cv ex _) = concatMap (goSurface . val) cv ++ goSurface ex
+    goSurface (ConTuple _ args) = concatMap goSurface args
+    goSurface (NTuple fields) = concatMap (goSurface . snd) fields
+    goSurface (IfThenElse c t e) = goSurface c ++ goSurface t ++ goSurface e
+    goSurface (BinaryOp _ l r) = goSurface l ++ goSurface r
+    goSurface (ActionBlock stmts) = concatMap goAS stmts
+    goSurface (RecFieldAccess _ e) = goSurface e
+    goSurface (ArrayLit es) = concatMap goSurface es
+    goSurface (Typed e _) = goSurface e
+    goSurface (ReprCast e _) = goSurface e
+    goSurface _ = []
+
+    goPC (PatternGuard _ e) = goSurface e
+    goPC _ = []
+
+    goAS (ActionExpr e) = goSurface e
+    goAS (ActionBind _ e) = goSurface e
+    goAS (ActionLet _ e) = goSurface e

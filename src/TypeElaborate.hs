@@ -153,12 +153,16 @@ elaborateExpr env elabEnv expr = case expr of
             args' = map (elaborateExpr env elabEnv) args
         in App f' args'
 
-    -- Function/Lambda: elaborate body with extended env
+    -- Function/Lambda: elaborate body with extended env, wrap with return type
     Function lam ->
         let innerEnv = Map.union (buildElabEnv (params lam)) elabEnv
             body' = elaborateExpr env innerEnv (body lam)
             lam' = lam { body = body' }
-        in Function lam'
+            -- If lambda has known return type, use it; otherwise infer from body
+            retType = case lamType lam of
+                UNDEFINED -> typeOfExpr body'
+                t         -> Just t
+        in wrapTyped (Function lam') retType
 
     -- Let-in: elaborate bindings, extend env, elaborate body
     LetIn binds bodyExpr ->
@@ -175,11 +179,14 @@ elaborateExpr env elabEnv expr = case expr of
                 in wrapTyped (ConTuple ct args') resolvedType
             Nothing -> ConTuple ct args'
 
-    -- Pattern matching: elaborate each case
+    -- Pattern matching: elaborate each case but do NOT wrap with Typed.
+    -- PatternMatches must remain unwrapped because lambdaToCLMLambda' pattern-matches
+    -- on Lambda{body = PatternMatches cases} directly. Wrapping breaks this.
     PatternMatches cases ->
         PatternMatches (map (elaborateExpr env elabEnv) cases)
 
-    -- ExpandedCase: elaborate checks and body
+    -- ExpandedCase: elaborate checks and body. Don't wrap — ExpandedCase is a
+    -- structural form used by CLM converter and wrapping can interfere.
     ExpandedCase checks bodyExpr si ->
         let checks' = map (elaborateCheck env elabEnv) checks
             body' = elaborateExpr env elabEnv bodyExpr
@@ -205,15 +212,26 @@ elaborateExpr env elabEnv expr = case expr of
         let stmts' = map (elaborateActionStmt env elabEnv) stmts
         in Typed (ActionBlock stmts') (Id "Unit")
 
-    -- Binary operators: elaborate children
+    -- Binary operators: elaborate children, look up operator return type.
+    -- BinaryOp is desugared to App in afterparserPass, but may appear in
+    -- pre-desugar contexts. Look up the operator as a function for return type.
     BinaryOp op l r ->
         let l' = elaborateExpr env elabEnv l
             r' = elaborateExpr env elabEnv r
-        in BinaryOp op l' r'
+            retType = case lookupLambda op env of
+                Just lam -> resolveReturnType env lam [l', r']
+                Nothing  -> Nothing
+        in wrapTyped (BinaryOp op l' r') retType
 
-    -- NTuple: elaborate fields
+    -- NTuple: elaborate fields, produce record type if all fields are named+typed
     NTuple fields ->
-        NTuple (map (\(mn, e) -> (mn, elaborateExpr env elabEnv e)) fields)
+        let fields' = map (\(mn, e) -> (mn, elaborateExpr env elabEnv e)) fields
+            -- If all fields have names and types, create a RecordType
+            namedTypes = [ (n, t) | (Just n, e) <- fields', Just t <- [typeOfExpr e] ]
+            recType = if length namedTypes == length fields' && not (null fields')
+                      then Just (RecordType [(n, t) | (n, t) <- namedTypes] False)
+                      else Nothing
+        in wrapTyped (NTuple fields') recType
 
     -- DeclBlock: elaborate members
     DeclBlock exprs ->
@@ -228,9 +246,18 @@ elaborateExpr env elabEnv expr = case expr of
             arrType = fmap (\et -> App (Id "Array") [et]) elemType
         in wrapTyped (ArrayLit es') arrType
 
-    -- RecFieldAccess: elaborate inner
-    RecFieldAccess ac e ->
-        RecFieldAccess ac (elaborateExpr env elabEnv e)
+    -- RecFieldAccess: elaborate inner, try to resolve field type from class/record
+    RecFieldAccess ac@(fieldName, _) e ->
+        let e' = elaborateExpr env elabEnv e
+            -- Try to find field type from base expression's type (class fields)
+            fieldType = case typeOfExpr e' of
+                Just (Id className) -> case lookupClass className env of
+                    Just cm -> case [typ v | v <- cmAllFields cm, name v == fieldName] of
+                        (ft:_) -> validType ft
+                        []     -> Nothing
+                    Nothing -> Nothing
+                _ -> Nothing
+        in wrapTyped (RecFieldAccess ac e') fieldType
 
     -- ReprCast: elaborate inner
     ReprCast e t ->
@@ -240,6 +267,61 @@ elaborateExpr env elabEnv expr = case expr of
     Instance sn mTag ta impls reqs ->
         Instance sn mTag ta (map (elaborateExpr env elabEnv) impls) reqs
 
+    -- RecordConstruct: elaborate fields, look up constructor type
+    RecordConstruct consName fields ->
+        let fields' = map (\(n, e) -> (n, elaborateExpr env elabEnv e)) fields
+            retType = case lookupConstructor consName env of
+                Just (consLam, _) ->
+                    let args' = map snd fields'
+                        resolvedType = resolveConstructorType env consLam args'
+                    in resolvedType
+                Nothing -> Nothing
+        in wrapTyped (RecordConstruct consName fields') retType
+
+    -- RecordUpdate: elaborate base and fields, preserve base type
+    RecordUpdate e fields ->
+        let e' = elaborateExpr env elabEnv e
+            fields' = map (\(n, ex) -> (n, elaborateExpr env elabEnv ex)) fields
+        in wrapTyped (RecordUpdate e' fields') (typeOfExpr e')
+
+    -- RecordPattern: elaborate fields
+    RecordPattern nm fields ->
+        RecordPattern nm (map (\(n, e) -> (n, elaborateExpr env elabEnv e)) fields)
+
+    -- HandleWith: elaborate both, result type is the computation's type
+    HandleWith c h ->
+        let c' = elaborateExpr env elabEnv c
+            h' = elaborateExpr env elabEnv h
+        in wrapTyped (HandleWith c' h') (typeOfExpr c')
+
+    -- UnaryOp: elaborate operand, look up operator
+    UnaryOp op e ->
+        let e' = elaborateExpr env elabEnv e
+            retType = case lookupLambda op env of
+                Just lam -> resolveReturnType env lam [e']
+                Nothing  -> Nothing
+        in wrapTyped (UnaryOp op e') retType
+
+    -- Statements: type is the last statement's type
+    Statements stmts ->
+        let stmts' = map (elaborateExpr env elabEnv) stmts
+            lastType = case reverse stmts' of
+                (s:_) -> typeOfExpr s
+                []    -> Nothing
+        in wrapTyped (Statements stmts') lastType
+
+    -- PropEq: type is a PropEq type
+    PropEq e1 e2 ->
+        let e1' = elaborateExpr env elabEnv e1
+            e2' = elaborateExpr env elabEnv e2
+        in PropEq e1' e2'
+
+    -- Implies: elaborate both sides
+    Implies e1 e2 ->
+        let e1' = elaborateExpr env elabEnv e1
+            e2' = elaborateExpr env elabEnv e2
+        in Implies e1' e2'
+
     -- Everything else: pass through
     _ -> expr
 
@@ -247,19 +329,34 @@ elaborateExpr env elabEnv expr = case expr of
 -- Helpers
 -- ============================================================================
 
--- | Extract type from a Typed wrapper.
+-- | Extract type from a Typed wrapper, filtering out non-type expressions.
+-- Phase 2.1 fix: reject Function/Lambda values, PatternMatches, etc. that
+-- may have been stored as "types" — these are values, not types.
 typeOfExpr :: Expr -> Maybe Expr
-typeOfExpr (Typed _ t) = Just t
+typeOfExpr (Typed _ t) = validType t
 typeOfExpr _ = Nothing
 
--- | Wrap with Typed only if type is known.
+-- | Wrap with Typed only if type is known and valid.
 wrapTyped :: Expr -> Maybe Expr -> Expr
 wrapTyped e (Just t) = Typed e t
 wrapTyped e Nothing  = e
 
--- | Check if type expression is valid (not UNDEFINED).
+-- | Check if an expression is a valid type expression (not a value form).
+-- Rejects UNDEFINED, Function/Lambda, PatternMatches, and other value-level forms
+-- that should never appear as type annotations.
 validType :: Expr -> Maybe Expr
 validType UNDEFINED = Nothing
+validType (Function _) = Nothing
+validType (PatternMatches _) = Nothing
+validType (ExpandedCase _ _ _) = Nothing
+validType (CaseOf _ _ _) = Nothing
+validType (ActionBlock _) = Nothing
+validType (LetIn _ _) = Nothing
+validType (BinaryOp _ _ _) = Nothing
+validType (UnaryOp _ _) = Nothing
+validType (HandleWith _ _) = Nothing
+validType (Statements _) = Nothing
+validType (IfThenElse _ _ _) = Nothing
 validType t = Just t
 
 -- | Check if a name starts with uppercase (constructor/type name).

@@ -1491,7 +1491,7 @@ main = do
 
             describe "showTCError coverage" $ do
                 it "ConstraintUnsolved shows structure name" $ do
-                    let err = ConstraintUnsolved (CStructure "Eq" Nothing [Id "MyType"])
+                    let err = ConstraintUnsolved (CStructure "Eq" Nothing [Id "MyType"] Nothing)
                     showTCError err `shouldSatisfy` ("Eq" `isInfixOf`)
                     showTCError err `shouldSatisfy` ("MyType" `isInfixOf`)
 
@@ -3511,7 +3511,7 @@ main = do
                                   UNDEFINED
                         cenv = addNamedStructure (Structure eqLam (StructInfo SAlgebra [] [] [] [])) initialEnvironment
                         envWithCompiler = emptyTCEnv { envCompiler = Just cenv }
-                        action = tcModify (\s -> s { constraints = [CStructure "Eq" Nothing [Id "Unknown"]] })
+                        action = tcModify (\s -> s { constraints = [CStructure "Eq" Nothing [Id "Unknown"] Nothing] })
                                  `tcBind` \_ -> resolveConstraints
                     let result = runTC action envWithCompiler stStrict
                     case result of

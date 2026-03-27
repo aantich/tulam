@@ -484,14 +484,16 @@ encodeInstr instr = case instr of
     IJmpF s off     -> mkB OP_JMPF s off
     ISwitch s t     -> mkB OP_SWITCH s t
     IRet s          -> mkB OP_RET s 0
-    ICall d f n     -> mkA OP_CALL d f n
-    ITailCall f n   -> mkA OP_TAILCALL 0 f n
+    -- Use Format B for CALL: [OP:8][dst:8][funcIdx:16] — supports up to 65535 functions.
+    -- nargs is read from the function info at runtime (fi.arity).
+    ICall d f n     -> mkB OP_CALL d f
+    ITailCall f n   -> mkB OP_TAILCALL 0 f
     ICallCls d c n  -> mkA OP_CALLCLS d c n
     ITailCallCls c n -> mkA OP_TAILCALLCLS 0 c n
-    ICallExt d e n  -> mkA OP_CALLEXT d e n
-    IClosure d f n  -> mkA OP_CLOSURE d f n
+    ICallExt d e n  -> mkB OP_CALLEXT d e  -- Format B: [OP:8][dst:8][externIdx:16]
+    IClosure d f n  -> mkB OP_CLOSURE d f  -- Format B: [OP:8][dst:8][funcIdx:16]
     IGetUpval d i   -> mkB OP_GETUPVAL d i
-    IPap d f n      -> mkA OP_PAP d f n
+    IPap d f n      -> mkB OP_PAP d f    -- Format B: [OP:8][dst:8][funcIdx:16]
     INewCon d t n   -> mkA OP_NEWCON d t n
     IGetField d o i -> mkA OP_GETFIELD d o i
     IGetTag d o     -> mkA OP_GETTAG d o 0
@@ -605,14 +607,15 @@ decodeInstr w =
         Just OP_JMPF        -> Just $ IJmpF a simm16
         Just OP_SWITCH      -> Just $ ISwitch a imm16
         Just OP_RET         -> Just $ IRet a
-        Just OP_CALL        -> Just $ ICall a b c
-        Just OP_TAILCALL    -> Just $ ITailCall b c
+        -- CALL uses Format B: [op:8][dst:8][funcIdx:16]
+        Just OP_CALL        -> Just $ ICall a imm16 0
+        Just OP_TAILCALL    -> Just $ ITailCall imm16 0
         Just OP_CALLCLS     -> Just $ ICallCls a b c
         Just OP_TAILCALLCLS -> Just $ ITailCallCls b c
-        Just OP_CALLEXT     -> Just $ ICallExt a b c
-        Just OP_CLOSURE     -> Just $ IClosure a b c
+        Just OP_CALLEXT     -> Just $ ICallExt a imm16 0  -- Format B
+        Just OP_CLOSURE     -> Just $ IClosure a imm16 0  -- Format B: nupvals from func info
         Just OP_GETUPVAL    -> Just $ IGetUpval a imm16
-        Just OP_PAP         -> Just $ IPap a b c
+        Just OP_PAP         -> Just $ IPap a imm16 0      -- Format B: nargs from func info
         Just OP_NEWCON      -> Just $ INewCon a b c
         Just OP_GETFIELD    -> Just $ IGetField a b c
         Just OP_GETTAG      -> Just $ IGetTag a b

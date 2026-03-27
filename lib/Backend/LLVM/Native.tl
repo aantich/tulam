@@ -373,12 +373,12 @@ target native {
     };
 
     instance Eq(Bool) = {
-        function (==)(x, y) = match x
-            | True -> match y | True -> True | False -> False
-            | False -> match y | True -> False | False -> True;
-        function (!=)(x, y) = match x
-            | True -> match y | True -> False | False -> True
-            | False -> match y | True -> True | False -> False
+        function (==)(x:Bool, y:Bool) : Bool =
+            if x then (if y then True else False)
+            else (if y then False else True);
+        function (!=)(x:Bool, y:Bool) : Bool =
+            if x then (if y then False else True)
+            else (if y then True else False)
     };
 
 };

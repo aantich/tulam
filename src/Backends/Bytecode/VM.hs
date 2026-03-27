@@ -536,9 +536,9 @@ dispatch vm 0x3C a _ _ _ _ _ = do
             execLoop vm
 
 -- CALL: r = func(args in r+1..r+nargs)
-dispatch vm 0x40 a b c _ _ _ = do
-    let funcIdx = b
-        nargs = c
+-- Format B: [OP:8][dst:8][funcIdx:16] — nargs read from function info
+dispatch vm 0x40 a _ _ imm16 _ _ = do
+    let funcIdx = imm16
         dstReg = a
     let bm = vmModule vm
     case lookupFunction bm funcIdx of
@@ -557,6 +557,7 @@ dispatch vm 0x40 a b c _ _ _ = do
             -- New frame starts AFTER caller's register space
             let newFP = fp + callerFrameSize
             writeIORef (vmFP vm) newFP
+            let nargs = fiArity fi
             writeIORef (vmFrameSize vm) (csMaxRegs fi)
             forM_ [0..nargs-1] $ \i -> do
                 v <- readRegAbs vm (fp + dstReg + 1 + i)
@@ -566,13 +567,14 @@ dispatch vm 0x40 a b c _ _ _ = do
             execLoop vm
 
 -- TAILCALL: reuse frame, jump to func
-dispatch vm 0x41 _ b c _ _ _ = do
-    let funcIdx = b
-        nargs = c
+-- Format B: [OP:8][0:8][funcIdx:16] — nargs from function info
+dispatch vm 0x41 _ _ _ imm16 _ _ = do
+    let funcIdx = imm16
     let bm = vmModule vm
     case lookupFunction bm funcIdx of
         Nothing -> return $ Left (VMInvalidFunction funcIdx)
         Just fi -> do
+            let nargs = fiArity fi
             fp <- readIORef (vmFP vm)
             -- Read all args first to handle overlapping reads/writes
             args <- mapM (\i -> readReg vm i) [0..nargs-1]
@@ -905,9 +907,13 @@ dispatch vm 0x79 a b _ _ _ _ = do
     execLoop vm
 
 -- CLOSURE: r = Closure(funcIdx, upvalues from r+1..r+nupvals)
-dispatch vm 0x48 a b c _ _ _ = do
-    let funcIdx = b
-        nupvals = c
+-- Format B: [OP:8][dst:8][funcIdx:16] — nupvals from function info
+dispatch vm 0x48 a _ _ imm16 _ _ = do
+    let funcIdx = imm16
+    let bm = vmModule vm
+        nupvals = case lookupFunction bm funcIdx of
+            Just fi -> fiUpvalCount fi
+            Nothing -> 0
     upvals <- V.generateM nupvals $ \i -> Val <$> readReg vm (a + 1 + i)
     w <- heapAlloc (vmHeap vm) (HClosure funcIdx upvals)
     writeReg vm a w

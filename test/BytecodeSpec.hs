@@ -46,7 +46,13 @@ instructionTests = describe "Instruction encoding" $ do
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes CALL" $ do
-        let instr = ICall 0 1 3
+        -- CALL uses Format B: [OP:8][dst:8][funcIdx:16] — nargs not encoded (read from func info)
+        let instr = ICall 0 1 0
+            w = encodeInstr instr
+        decodeInstr w `shouldBe` Just instr
+    it "encodes CALL with large funcIdx" $ do
+        -- Verify funcIdx > 255 works (was broken with Format A)
+        let instr = ICall 3 300 0
             w = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 

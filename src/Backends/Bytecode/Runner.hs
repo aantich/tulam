@@ -101,14 +101,17 @@ compileToBytecodeWith env state funcNames =
 -- Entry point is the last function in the list (or "main" if present).
 runBytecode :: Environment -> InterpreterState -> [Name] -> IO BytecodeResult
 runBytecode env state funcNames = do
-    case compileToBytecode env state funcNames of
-        Left err -> return $ BCCompileError err
-        Right bm -> do
-            let entryPoint = if "main" `elem` funcNames
-                    then "main"
-                    else last funcNames
-            vm <- initVM bm
-            result <- runFunctionByName vm (T.pack entryPoint) []
-            case result of
-                Left vmErr -> return $ BCRuntimeError (show vmErr)
-                Right val  -> return $ BCRunOK val
+    let entryPoint = if "main" `elem` funcNames then "main" else last funcNames
+    case Map.lookup entryPoint (topLambdas env) of
+        Just lam | not (null (params lam)) ->
+            return $ BCCompileError $
+                "Invalid bytecode entry '" ++ entryPoint ++ "': expected a nullary function/action, but found arity "
+                ++ show (length (params lam)) ++ "."
+        _ -> case compileToBytecode env state funcNames of
+            Left err -> return $ BCCompileError err
+            Right bm -> do
+                vm <- initVM bm
+                result <- runFunctionByName vm (T.pack entryPoint) []
+                case result of
+                    Left vmErr -> return $ BCRuntimeError (show vmErr)
+                    Right val  -> return $ BCRunOK val

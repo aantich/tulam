@@ -49,6 +49,17 @@ pOptionalVars = try pVars <|> pure []
 mkSrcInfo :: SourcePos -> SourceInfo
 mkSrcInfo pos = SourceInfo (sourceLine pos) (sourceColumn pos) (sourceName pos) ""
 
+-- | Phase 4.1: Build a type expression for a let-block function binding from its Lambda.
+-- Constructs ArrowType chain from value param types → return type.
+-- Returns UNDEFINED if not enough type info is available.
+lambdaToBindingType :: Lambda -> Expr
+lambdaToBindingType lam =
+    let valParams = filter (not . isImplicitVar) (params lam)
+        retTy = lamType lam
+    in if retTy == UNDEFINED && all (\v -> typ v == UNDEFINED) valParams
+       then UNDEFINED  -- no type info at all
+       else foldr (\v acc -> Pi Nothing (typ v) acc) retTy valParams
+
 -- | Check if identifier starts with a lowercase letter or underscore.
 isLowerFirst :: String -> Bool
 isLowerFirst (c:_) = (c >= 'a' && c <= 'z') || c == '_'
@@ -576,10 +587,12 @@ pWhereClause = do
 pWhereBinding :: Parser (Var, Expr)
 pWhereBinding = try pWhereFn <|> pWhereVal
 
+-- Phase 4.2: Preserve Lambda's type on where-clause function bindings.
 pWhereFn :: Parser (Var, Expr)
 pWhereFn = do
     lam <- pFuncL
-    return (Var (lamName lam) UNDEFINED UNDEFINED, Function lam)
+    let bindTy = lambdaToBindingType lam
+    return (Var (lamName lam) bindTy UNDEFINED, Function lam)
 
 pWhereVal :: Parser (Var, Expr)
 pWhereVal = do
@@ -1172,12 +1185,16 @@ pLetBlockDecl = try pLetBlockFuncExplicit   -- function name(params) = body
             <|> pLetBlockVal                -- name = expr
 
 -- Explicit function keyword in let block (reuses pFuncL)
+-- Phase 4.1: Preserve the Lambda's type on the binding Var so TC and downstream
+-- passes see the type at the binding level, not just buried inside the Lambda.
 pLetBlockFuncExplicit :: Parser (Var, Expr)
 pLetBlockFuncExplicit = do
     lam <- pFuncL
-    return (Var (lamName lam) UNDEFINED UNDEFINED, Function lam)
+    let bindTy = lambdaToBindingType lam
+    return (Var (lamName lam) bindTy UNDEFINED, Function lam)
 
 -- Bare function definition: name(params) : RetType = body
+-- Phase 4.1: Preserve the Lambda's type on the binding Var.
 pLetBlockBareFunc :: Parser (Var, Expr)
 pLetBlockBareFunc = do
     pos <- getPosition
@@ -1190,7 +1207,9 @@ pLetBlockBareFunc = do
                      , lamType = tp, lamRequires = reqs, lamSrcInfo = mkSrcInfo pos }
     bdy <- try (reserved "match" >> PatternMatches <$> many1 (reservedOp "|" >> pPatternMatch lam))
            <|> pExpr
-    return (Var nm UNDEFINED UNDEFINED, Function (lam { body = bdy }))
+    let finalLam = lam { body = bdy }
+        bindTy = lambdaToBindingType finalLam
+    return (Var nm bindTy UNDEFINED, Function finalLam)
 
 -- Simple value binding in let block
 pLetBlockVal :: Parser (Var, Expr)

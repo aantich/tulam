@@ -1224,8 +1224,8 @@ recordDesugarPass = do
     let env = currentEnvironment s
     -- Desugar in parsed module
     let mod' = Prelude.map (\(e, si) -> (desugarRecordExpr env e, si)) (parsedModule s)
-    -- Desugar in topLambdas and instanceLambdas
-    let env' = transformLambdaMaps (desugarRecordLambda env) env
+    -- Desugar in topLambdas and instanceLambdas, invalidating elaborated caches
+    let env' = transformRawLambdaMaps (desugarRecordLambda env) env
     put s { parsedModule = mod', currentEnvironment = env' }
     verboseLog $ "  Pass 1.5: record desugaring complete"
 
@@ -1332,6 +1332,9 @@ lamToCLMPass :: IntState()
 lamToCLMPass = do
     s <- get
     let env = currentEnvironment s
+    -- Phase 3.3: Use raw lambdas for CLM conversion (they have resolved metas
+    -- from Phase 1.2). Elab lambdas have Typed wrappers that would create extra
+    -- CLMTYPED nodes, which can interfere with pure evaluation in normalizeTy.
     let lambdas = topLambdas env
     let clms = Map.mapWithKey (\n l -> lambdaToCLMLambda env l) lambdas
     -- also convert instance lambdas to CLM
@@ -1525,7 +1528,16 @@ exprToCLM' env scope (ReprCast e tp) =
                  else if Map.member simpleName (reprMap env)
                       then CLMIAP (CLMID "fromRepr") [clmE]
                       else CLMERR ("[CLM] no repr or class found for cast to " ++ show tp) SourceInteractive
-exprToCLM' env scope (Typed e _) = exprToCLM' env scope e
+-- Phase 3.1: Preserve concrete types through CLM conversion using CLMTYPED.
+-- Only wrap dispatch nodes (CLMIAP) with CLMTYPED — other nodes don't need it
+-- and wrapping them breaks pure evaluation in normalizeTy.
+exprToCLM' env scope (Typed e t) =
+    let clmE = exprToCLM' env scope e
+    in case clmE of
+        CLMIAP _ _ ->
+            let clmT = exprToCLM env t
+            in if isConcreteRetType clmT then CLMTYPED clmE clmT else clmE
+        _ -> clmE
 exprToCLM' _ _ (Pi _ _ _) = CLMEMPTY
 exprToCLM' _ _ (Implicit _) = CLMEMPTY
 exprToCLM' env scope (NTuple fields) =

@@ -18,6 +18,9 @@ import qualified Data.Foldable as Foldable
 
 import Surface
 import CLM
+import qualified ElabMetadata as EM
+import ElabMetadata (BinderInfo, BinderInfo(..), isSemanticRole)
+import ElabCore (ElabLambda)
 import Data.HashMap.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.List
@@ -127,6 +130,10 @@ mergeEnvironment base overlay = Environment
     , clmInstances = Map.union (clmInstances overlay) (clmInstances base)
     , topLambdasElab = Map.union (topLambdasElab overlay) (topLambdasElab base)
     , instanceLambdasElab = Map.union (instanceLambdasElab overlay) (instanceLambdasElab base)
+    , topLambdasR = Map.union (topLambdasR overlay) (topLambdasR base)
+    , instanceLambdasR = Map.union (instanceLambdasR overlay) (instanceLambdasR base)
+    , topLambdaBinderInfo = Map.union (topLambdaBinderInfo overlay) (topLambdaBinderInfo base)
+    , instanceLambdaBinderInfo = Map.union (instanceLambdaBinderInfo overlay) (instanceLambdaBinderInfo base)
     , structInheritance = Map.union (structInheritance overlay) (structInheritance base)
     , reprMap = Map.union (reprMap overlay) (reprMap base)
     , effectDecls = Map.union (effectDecls overlay) (effectDecls base)
@@ -182,6 +189,13 @@ data Environment = Environment {
     -- consumers that need raw Surface syntax (normalizeTy, exprToCLMTC) use raw maps.
     topLambdasElab      :: NameMap Lambda,
     instanceLambdasElab :: NameMap Lambda,
+    -- Stage-R elaborated semantic lambdas (uniform across universes; transitional alongside Surface elaboration)
+    topLambdasR         :: NameMap ElabLambda,
+    instanceLambdasR    :: NameMap ElabLambda,
+    -- Binder-level metadata for authoritative elaborated lambdas.
+    -- Produced by TypeCheck and preserved by compatibility elaboration.
+    topLambdaBinderInfo      :: NameMap [BinderInfo],
+    instanceLambdaBinderInfo :: NameMap [BinderInfo],
     -- structure inheritance: maps child structure name to list of (parent name, optional tag)
     structInheritance :: NameMap [(Name, Maybe Name)],
     -- repr map: user type -> list of (reprTypeName, isDefault, toReprLam, fromReprLam, maybeInvariant)
@@ -263,6 +277,10 @@ instance Binary Environment where
         putHashMap (clmInstances env)
         putHashMap (topLambdasElab env)
         putHashMap (instanceLambdasElab env)
+        putHashMap (topLambdasR env)
+        putHashMap (instanceLambdasR env)
+        putHashMap (topLambdaBinderInfo env)
+        putHashMap (instanceLambdaBinderInfo env)
         putHashMap (structInheritance env)
         putHashMap (reprMap env)
         putHashMap (effectDecls env)
@@ -281,8 +299,9 @@ instance Binary Environment where
         putNestedHashMap (targetExterns env)
     get = Environment <$> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
-                      <*> getHashMap <*> getHashMap  -- topLambdasElab, instanceLambdasElab
                       <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap <*> getHashMap <*> getHashMap
+                      <*> getHashMap <*> getHashMap
                       <*> getHashMap <*> getHashMap  -- effectOps, defaultHandlers
                       <*> getHashMap <*> Bin.get <*> Bin.get <*> getHashMap
                       <*> getHashMap <*> getHashMap <*> getHashMap
@@ -299,6 +318,10 @@ initialEnvironment = Environment {
     clmInstances = Map.empty,
     topLambdasElab = Map.empty,
     instanceLambdasElab = Map.empty,
+    topLambdasR = Map.empty,
+    instanceLambdasR = Map.empty,
+    topLambdaBinderInfo = Map.empty,
+    instanceLambdaBinderInfo = Map.empty,
     structInheritance = Map.empty,
     reprMap = Map.empty,
     effectDecls = Map.empty,
@@ -536,6 +559,12 @@ transformLambdaMaps f env = env
     , instanceLambdas = Map.map f (instanceLambdas env)
     }
 
+-- | Preferred helper for raw-lambda rewrites.
+-- Any mutation of raw lambda maps invalidates elaborated lambda caches and
+-- their binder metadata snapshots.
+transformRawLambdaMaps :: (Lambda -> Lambda) -> Environment -> Environment
+transformRawLambdaMaps f = clearElaboratedLambdas . transformLambdaMaps f
+
 -- | Lambda representation tag: raw Surface vs elaborated (with Typed wrappers).
 data LambdaRep = RawLambdaRep | ElabLambdaRep
     deriving (Eq, Show)
@@ -578,6 +607,10 @@ clearElaboratedLambdas :: Environment -> Environment
 clearElaboratedLambdas env = env
     { topLambdasElab = Map.empty
     , instanceLambdasElab = Map.empty
+    , topLambdasR = Map.empty
+    , instanceLambdasR = Map.empty
+    , topLambdaBinderInfo = Map.empty
+    , instanceLambdaBinderInfo = Map.empty
     }
 
 -- | Store an elaborated lambda, routing to the correct elab map based on
@@ -589,6 +622,49 @@ storeElaboratedLambda n lam env
     | Map.member n (instanceLambdas env) =
         env { instanceLambdasElab = Map.insert n lam (instanceLambdasElab env) }
     | otherwise = env
+
+storeElaboratedBinderInfo :: Name -> [BinderInfo] -> Environment -> Environment
+storeElaboratedBinderInfo n infos env
+    | Map.member n (topLambdas env) =
+        env { topLambdaBinderInfo = Map.insert n infos (topLambdaBinderInfo env) }
+    | Map.member n (instanceLambdas env) =
+        env { instanceLambdaBinderInfo = Map.insert n infos (instanceLambdaBinderInfo env) }
+    | otherwise = env
+
+storeElaboratedLambdaR :: Name -> ElabLambda -> Environment -> Environment
+storeElaboratedLambdaR n lam env
+    | Map.member n (topLambdas env) =
+        env { topLambdasR = Map.insert n lam (topLambdasR env) }
+    | Map.member n (instanceLambdas env) =
+        env { instanceLambdasR = Map.insert n lam (instanceLambdasR env) }
+    | otherwise = env
+
+lookupLambdaBinderInfo :: Name -> Environment -> [BinderInfo]
+lookupLambdaBinderInfo n env =
+    case Map.lookup n (topLambdaBinderInfo env) of
+        Just infos -> infos
+        Nothing -> Prelude.map defaultBinderInfoFromVar (maybe [] params (lookupLambdaRep ElabLambdaRep n env))
+
+lookupInstanceLambdaBinderInfo :: Name -> Environment -> [BinderInfo]
+lookupInstanceLambdaBinderInfo n env =
+    case Map.lookup n (instanceLambdaBinderInfo env) of
+        Just infos -> infos
+        Nothing -> Prelude.map defaultBinderInfoFromVar (maybe [] params (lookupInstanceLambdaByKeyRep ElabLambdaRep n env))
+
+lookupAnyLambdaBinderInfo :: Name -> Environment -> [BinderInfo]
+lookupAnyLambdaBinderInfo n env =
+    case lookupLambdaBinderInfo n env of
+        [] -> lookupInstanceLambdaBinderInfo n env
+        infos -> infos
+
+lambdaHasSemanticImplicit :: Lambda -> [BinderInfo] -> Bool
+lambdaHasSemanticImplicit lam infos =
+    let relevantInfos = Prelude.take (Prelude.length (params lam)) (infos ++ Prelude.repeat (BinderInfo EM.Explicit EM.Runtime EM.OrdinaryRole))
+    in Prelude.any (\bi -> binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)) relevantInfos
+
+defaultBinderInfoFromVar :: Var -> BinderInfo
+defaultBinderInfoFromVar (Var _ (Implicit _) _) = BinderInfo EM.Implicit EM.Erased EM.OrdinaryRole
+defaultBinderInfoFromVar _ = BinderInfo EM.Explicit EM.Runtime EM.OrdinaryRole
 
 -- | Deep-erase all Typed wrappers from an expression.
 -- Use at boundaries where raw Surface syntax is required (e.g. normalizeTy).
