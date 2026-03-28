@@ -69,6 +69,12 @@ data BuiltinOp
       -- ^ __error(msg) -> ERROR msgIdx
     | BConstInt Int
       -- ^ Compile-time constant integer (e.g. minBound, maxBound)
+    | BStrNeq
+      -- ^ __string_neq(a, b) -> STREQ + NOT
+    | BStrLt
+      -- ^ __string_lt(a, b) -> STRLT dst, a, b
+    | BStrCompare
+      -- ^ __string_compare(a, b) -> Ordering constructor (STREQ/STRLT + NEWCON)
     | BClockNanos
       -- ^ clockNanos() -> CLOCK dst (monotonic nanoseconds)
 
@@ -158,7 +164,10 @@ builtinTable = Map.fromList $
     -- ====================================================================
     , ("__string_concat", BStrCat)
     , ("__string_length", BStrLen)
-    , ("__string_eq",     BInline2 IEqP)
+    , ("__string_eq",     BInline2 IStrEq)
+    , ("__string_neq",    BStrNeq)
+    , ("__string_lt",     BStrLt)
+    , ("__string_compare", BStrCompare)
 
     -- ====================================================================
     -- Show (value -> string conversion)
@@ -221,14 +230,19 @@ builtinTable = Map.fromList $
     -- ====================================================================
     -- Char operations
     -- ====================================================================
-    , ("__eq_i32",      BInline2 IEqI)   -- Char is Int internally
-    , ("__neq_i32",     BInline2 INeqI)
-    , ("__lt_i32",      BInline2 ILtI)
+    -- Char comparison (in bytecode, chars are NaN-boxed with tagChar, not tagInt,
+    -- so use pointer/bitwise equality and char-to-int for ordering)
+    , ("__eq_i32",      BInline2 IEqP)    -- Char eq: same codepoint = same NaN bits
+    , ("__neq_i32",     BInline2 INeqI)   -- TODO: needs proper char neq
+    , ("__lt_i32",      BInline2 ILtI)    -- TODO: needs proper char ordering
     , ("__le_i32",      BInline2 ILeI)
     , ("__gt_i32",      BInline2 IGtI)
     , ("__ge_i32",      BInline2 IGeI)
-    , ("__char_to_int", BInline1 IMov)
-    , ("__int_to_char", BInline1 IMov)
+    , ("__char_to_int", BInline1 ICToI)
+    , ("__int_to_char", BInline1 IIToC)
+    , ("__char_succ",   BInline1 ICharSucc)
+    , ("__char_pred",   BInline1 ICharPred)
+    , ("__show_char",   BShowC)
 
     -- ====================================================================
     -- Float32 arithmetic (mapped to Float64 in bytecode VM)

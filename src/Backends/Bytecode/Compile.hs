@@ -6,6 +6,7 @@
 -- mapping names to registers.
 module Backends.Bytecode.Compile
     ( compileCLMModule
+    , compileCLMModuleWith
     , compileCLMExpr
     , CompileError(..)
     ) where
@@ -49,7 +50,8 @@ data CompState = CompState
     , csJumpTables :: ![JumpTable]        -- jump tables (reversed)
     , csNextFunc   :: !Int                -- next function index
     , csTailPos    :: !Bool               -- are we in tail position?
-    , csConsNames  :: ![(Text, Int)]      -- constructor name -> tag mapping
+    , csConsNames  :: ![(Text, Int)]      -- constructor name -> tag mapping (for module output)
+    , csConsTagMap :: !(HashMap Name Int) -- constructor name -> tag lookup (for CLMID resolution)
     , csInstrCount :: !Int                -- monotonic instruction counter (for jump offset calculation)
     } deriving (Show)
 
@@ -70,6 +72,7 @@ initCompState funcMap = CompState
     , csNextFunc   = Map.size funcMap
     , csTailPos    = True
     , csConsNames  = []
+    , csConsTagMap = Map.empty
     , csInstrCount = 0
     }
 
@@ -121,13 +124,20 @@ inTailPos :: Bool -> CompState -> CompState
 inTailPos b cs = cs { csTailPos = b }
 
 -- | Compile a complete CLM module.
--- Takes a map of function names to their CLM lambdas.
+-- Takes a map of function names to their CLM lambdas,
+-- and an optional constructor tag map for resolving CLMID references to constructors.
 compileCLMModule :: Text -> HashMap Name CLMLam -> Either CompileError BytecodeModule
-compileCLMModule modName clmFuncs =
+compileCLMModule modName clmFuncs = compileCLMModuleWith modName clmFuncs Map.empty
+
+-- | Compile with an explicit constructor tag map.
+compileCLMModuleWith :: Text -> HashMap Name CLMLam -> HashMap Name Int -> Either CompileError BytecodeModule
+compileCLMModuleWith modName clmFuncs extraConsTags =
     let -- Assign function indices
         funcNames = Map.keys clmFuncs
         funcMap = Map.fromList (zip funcNames [0..])
-        cs0 = initCompState funcMap
+        -- Pre-scan CLM for constructor tags, merged with externally provided tags
+        consTagMap = Map.union extraConsTags (collectConstructorTags clmFuncs)
+        cs0 = (initCompState funcMap) { csConsTagMap = consTagMap }
 
         -- Compile each function
         cs1 = foldl' (\cs nm ->
@@ -137,7 +147,8 @@ compileCLMModule modName clmFuncs =
             ) cs0 funcNames
 
         -- Build the module — encode instructions to Word32
-        allCode = V.fromList (map encodeInstr (reverse (csAllCode cs1)))
+        allCode = V.fromList (concatMap encodeInstr (reverse (csAllCode cs1)))
+        -- Note: encodeInstr returns [Word32] — most are single-element, CALL/CLOSURE are single-element with Format B
         constants = V.fromList (reverse (csConstants cs1))
         functions = V.fromList (sortOn fiFuncIdx (csCompiledFuncs cs1))
         jumpTables = V.fromList (reverse (csJumpTables cs1))
@@ -151,6 +162,27 @@ compileCLMModule modName clmFuncs =
         , bmJumpTables = jumpTables
         , bmConsNames  = consNames
         }
+
+-- | Pre-scan CLM functions to collect all constructor name→tag mappings.
+-- This allows the compiler to resolve CLMID references to nullary constructors.
+collectConstructorTags :: HashMap Name CLMLam -> HashMap Name Int
+collectConstructorTags clmFuncs =
+    let allExprs = concatMap lamExprs (Map.elems clmFuncs)
+    in Map.fromList (concatMap consTagsInExpr allExprs)
+  where
+    lamExprs (CLMLam _ body) = [body]
+    lamExprs (CLMLamCases _ cases) = cases
+    consTagsInExpr (CLMCON (ConsTag nm tag) fields) =
+        (nm, tag) : concatMap consTagsInExpr fields
+    consTagsInExpr (CLMAPP f args) = consTagsInExpr f ++ concatMap consTagsInExpr args
+    consTagsInExpr (CLMIAP f args) = consTagsInExpr f ++ concatMap consTagsInExpr args
+    consTagsInExpr (CLMPROG es) = concatMap consTagsInExpr es
+    consTagsInExpr (CLMBIND _ e) = consTagsInExpr e
+    consTagsInExpr (CLMCASE _ body) = consTagsInExpr body
+    consTagsInExpr (CLMTYPED e _) = consTagsInExpr e
+    consTagsInExpr (CLMLAM (CLMLam _ body)) = consTagsInExpr body
+    consTagsInExpr (CLMLAM (CLMLamCases _ cs)) = concatMap consTagsInExpr cs
+    consTagsInExpr _ = []
 
 -- | Compile a single function into the module.
 compileFunction :: Name -> CLMLam -> CompState -> (Int, CompState)
@@ -244,8 +276,8 @@ extractBCTagSwitch :: [CLMExpr] -> CompState -> Maybe (Int, [(Int, CLMExpr)], Ma
 extractBCTagSwitch cases cs = go cases [] Nothing Nothing
   where
     go [] _ Nothing _ = Nothing
-    go [] tagBodies _ (Just r) =
-      Just (r, [(t, b) | (t, b) <- reverse tagBodies], Nothing)
+    go [] tagBodies defBody (Just r) =
+      Just (r, [(t, b) | (t, b) <- reverse tagBodies], defBody)
     go (CLMCASE [] body : rest) tagBodies _ reg =
       case tagBodies of
         [] -> Nothing
@@ -550,9 +582,10 @@ compileLiteral lit cs = case lit of
             (r, cs2) = allocReg cs1
         in (r, emit (ILoadK r kidx) cs2)
     LChar c ->
-        let (kidx, cs1) = addConstant (KInt (fromEnum c)) cs
-            (r, cs2) = allocReg cs1
-        in (r, emit (ILoadK r kidx) cs2)
+        -- Emit LOADINT for codepoint, then ITOC to convert to NaN-boxed char
+        let (r, cs1) = allocReg cs
+            cs2 = emit (ILoadInt r (fromEnum c)) cs1
+        in (r, emit (IIToC r r) cs2)
     LWord8 w ->
         let (r, cs1) = allocReg cs
         in (r, emit (ILoadInt r (fromIntegral w)) cs1)
@@ -574,13 +607,23 @@ compileCLMExpr expr cs = case expr of
         Nothing -> case Map.lookup nm (csFuncMap cs) of
             -- Reference to a top-level function (might need closure later)
             Just fidx ->
+                -- Create a closure for the function (no captures needed for top-level functions)
                 let (r, cs1) = allocReg cs
-                in (r, emit (ILoadK r fidx) cs1)  -- TODO: proper func ref
-            Nothing ->
-                -- Unknown variable - emit as constant name for later dispatch
-                let (kidx, cs1) = addConstant (KName (T.pack nm)) cs
-                    (r, cs2) = allocReg cs1
-                in (r, emit (ILoadK r kidx) cs2)
+                in (r, emit (IClosure r fidx 0) cs1)
+            Nothing -> case Map.lookup nm (csConsTagMap cs) of
+                -- Nullary constructor reference (e.g., True, False, Nothing, Equal)
+                Just tag
+                    | nm == "True"  -> let (r, cs1) = allocReg cs in (r, emit (ILoadTrue r) cs1)
+                    | nm == "False" -> let (r, cs1) = allocReg cs in (r, emit (ILoadFalse r) cs1)
+                    | nm == "Unit"  -> let (r, cs1) = allocReg cs in (r, emit (ILoadUnit r) cs1)
+                    | otherwise ->
+                        let (r, cs1) = allocReg cs
+                        in (r, emit (INewCon r tag 0) cs1)
+                Nothing ->
+                    -- Unknown variable - emit as constant name for later dispatch
+                    let (kidx, cs1) = addConstant (KName (T.pack nm)) cs
+                        (r, cs2) = allocReg cs1
+                    in (r, emit (ILoadK r kidx) cs2)
 
     -- Empty / Unit
     CLMEMPTY ->
@@ -927,6 +970,48 @@ compileCall funcName args cs =
                     (dstReg, emit (IStrCat dstReg arg1Reg arg2Reg) cs2)
                 Just BStrLen ->
                     (dstReg, emit (IStrLen dstReg arg1Reg) cs2)
+                Just BStrNeq ->
+                    -- STREQ + compare with False to negate: (streq == False) = not(streq)
+                    let (tmpReg, cs3) = allocReg cs2
+                        cs4 = emit (IStrEq tmpReg arg1Reg arg2Reg) cs3
+                        (falseReg, cs5) = allocReg cs4
+                        cs6 = emit (ILoadFalse falseReg) cs5
+                    in (dstReg, emit (IEqP dstReg tmpReg falseReg) cs6)
+                Just BStrLt ->
+                    (dstReg, emit (IStrLt dstReg arg1Reg arg2Reg) cs2)
+                Just BStrCompare ->
+                    -- Emit: STREQ tmp1 arg1 arg2
+                    --       JMPF tmp1 +3  (skip EqualTo if not equal)
+                    --       NEWCON dst 1 0  (EqualTo, tag=1)
+                    --       JMP +5          (skip rest)
+                    --       STRLT tmp2 arg1 arg2
+                    --       JMPF tmp2 +3  (skip LessThan if not less)
+                    --       NEWCON dst 0 0  (LessThan, tag=0)
+                    --       JMP +2          (skip GreaterThan)
+                    --       NEWCON dst 2 0  (GreaterThan, tag=2)
+                    let (eqReg, cs3) = allocReg cs2
+                        cs4 = emit (IStrEq eqReg arg1Reg arg2Reg) cs3
+                        jmpf1Pos = csInstrCount cs4
+                        cs5 = emit (IJmpF eqReg 0) cs4  -- placeholder
+                        cs6 = emit (INewCon dstReg 1 0) cs5  -- EqualTo(1)
+                        jmp1Pos = csInstrCount cs6
+                        cs7 = emit (IJmp 0) cs6  -- placeholder
+                        -- patch JMPF1 to here
+                        cs8 = patchJmpFs cs7 [jmpf1Pos] (csInstrCount cs7)
+                        (ltReg, cs9) = allocReg cs8
+                        cs10 = emit (IStrLt ltReg arg1Reg arg2Reg) cs9
+                        jmpf2Pos = csInstrCount cs10
+                        cs11 = emit (IJmpF ltReg 0) cs10  -- placeholder
+                        cs12 = emit (INewCon dstReg 0 0) cs11  -- LessThan(0)
+                        jmp2Pos = csInstrCount cs12
+                        cs13 = emit (IJmp 0) cs12  -- placeholder
+                        -- patch JMPF2 to here
+                        cs14 = patchJmpFs cs13 [jmpf2Pos] (csInstrCount cs13)
+                        cs15 = emit (INewCon dstReg 2 0) cs14  -- GreaterThan(2)
+                        -- patch JMP1 and JMP2 to here (merge point)
+                        mergePos = csInstrCount cs15
+                        cs16 = patchJmps cs15 [jmp1Pos, jmp2Pos] mergePos
+                    in (dstReg, cs16)
                 Just BClockNanos ->
                     (dstReg, emit (IClock dstReg) cs2)
                 Just BPrintNewline ->
@@ -956,7 +1041,14 @@ compileCall funcName args cs =
                             -- Call as closure: move closure reg, then CALLCLS
                             let cs3 = emit (IMov dstReg closureReg) cs2
                             in if isTail
-                               then (dstReg, emit (ITailCallCls dstReg nargs) cs3)
+                               then -- For TAILCALLCLS: move args to r0..rN-1 (same as TAILCALL)
+                                    let cs4 = foldl' (\s i ->
+                                            let srcReg = baseReg + 1 + i
+                                            in if srcReg /= i
+                                               then emit (IMov i srcReg) s
+                                               else s
+                                            ) cs3 [0..nargs-1]
+                                    in (dstReg, emit (ITailCallCls dstReg nargs) cs4)
                                else (dstReg, emit (ICallCls dstReg dstReg nargs) cs3)
                         Nothing ->
                             -- Truly unknown function: compile error

@@ -12,6 +12,7 @@ module Backends.Bytecode.Instruction
     , Instruction(..)
     , encodeInstr
     , decodeInstr
+    , decodeInstrWide
     , disassemble
     , disassembleOne
     ) where
@@ -120,6 +121,14 @@ data OpCode
     | OP_SHOWS       -- 0x7D  A: r = show(string) (quoted)
     -- Print newline
     | OP_PRINTNL     -- 0x7E  D: print newline to stdout
+    -- String comparison
+    | OP_STREQ       -- 0x81  A: r = (a == b) string content equality
+    | OP_STRLT       -- 0x82  A: r = (a < b) string lexicographic
+    -- Char conversion
+    | OP_ITOC        -- 0x83  A: r = intToChar(a) (NaN-boxed int → NaN-boxed char)
+    | OP_CTOI        -- 0x84  A: r = charToInt(a) (NaN-boxed char → NaN-boxed int)
+    | OP_CHARSUCC    -- 0x85  A: r = charSucc(a) (char + 1)
+    | OP_CHARPRED    -- 0x86  A: r = charPred(a) (char - 1)
     -- Clock
     | OP_CLOCK       -- 0x73  B: r = monotonic clock (nanoseconds)
     -- Method call (OOP dynamic dispatch)
@@ -221,6 +230,12 @@ opToByte OP_SHOWC       = 0x7C
 opToByte OP_SHOWS       = 0x7D
 opToByte OP_PRINTNL     = 0x7E
 opToByte OP_MODREF      = 0x7F
+opToByte OP_STREQ       = 0x81
+opToByte OP_STRLT       = 0x82
+opToByte OP_ITOC        = 0x83
+opToByte OP_CTOI        = 0x84
+opToByte OP_CHARSUCC    = 0x85
+opToByte OP_CHARPRED    = 0x86
 opToByte OP_MCALL       = 0x80
 opToByte OP_DEBUGLOC    = 0xF0
 opToByte OP_ERROR       = 0xF1
@@ -314,6 +329,12 @@ byteToOp 0x7D = Just OP_SHOWS
 byteToOp 0x7E = Just OP_PRINTNL
 byteToOp 0x7F = Just OP_MODREF
 byteToOp 0x80 = Just OP_MCALL
+byteToOp 0x81 = Just OP_STREQ
+byteToOp 0x82 = Just OP_STRLT
+byteToOp 0x83 = Just OP_ITOC
+byteToOp 0x84 = Just OP_CTOI
+byteToOp 0x85 = Just OP_CHARSUCC
+byteToOp 0x86 = Just OP_CHARPRED
 byteToOp 0xF0 = Just OP_DEBUGLOC
 byteToOp 0xF1 = Just OP_ERROR
 byteToOp 0xF2 = Just OP_ERRORREG
@@ -416,6 +437,12 @@ data Instruction
     -- Strings
     | IStrCat    !Int !Int !Int   -- dst, src1, src2
     | IStrLen    !Int !Int        -- dst, src
+    | IStrEq     !Int !Int !Int   -- dst, src1, src2 (string content equality)
+    | IStrLt     !Int !Int !Int   -- dst, src1, src2 (string lexicographic <)
+    | IIToC      !Int !Int        -- dst, src (int → char)
+    | ICToI      !Int !Int        -- dst, src (char → int)
+    | ICharSucc  !Int !Int        -- dst, src (char + 1)
+    | ICharPred  !Int !Int        -- dst, src (char - 1)
     -- Show (value->string)
     | IShowI     !Int !Int        -- dst, src (int->string)
     | IShowF     !Int !Int        -- dst, src (float->string)
@@ -435,100 +462,111 @@ data Instruction
     | IHalt
     deriving (Show, Eq)
 
--- | Encode a high-level instruction to a 32-bit word.
-encodeInstr :: Instruction -> Word32
+-- | Encode a high-level instruction to one or more 32-bit words.
+-- Most instructions produce a single word. CALL/TAILCALL/CLOSURE/PAP use
+-- a wide format: the first word has [OP:8][dst:8][nargs:8][0:8] and the
+-- second word has [funcIdx:32], supporting up to 2^32 function indices.
+encodeInstr :: Instruction -> [Word32]
 encodeInstr instr = case instr of
-    ILoadK d k      -> mkB OP_LOADK d k
-    ILoadInt d i    -> mkB OP_LOADINT d i
-    ILoadTrue d     -> mkB OP_LOADTRUE d 0
-    ILoadFalse d    -> mkB OP_LOADFALSE d 0
-    ILoadUnit d     -> mkB OP_LOADUNIT d 0
-    ILoadNil d      -> mkB OP_LOADNIL d 0
-    IMov d s        -> mkA OP_MOV d s 0
-    IAddI d a b     -> mkA OP_ADDI d a b
-    ISubI d a b     -> mkA OP_SUBI d a b
-    IMulI d a b     -> mkA OP_MULI d a b
-    IDivI d a b     -> mkA OP_DIVI d a b
-    IRemI d a b     -> mkA OP_REMI d a b
-    INegI d a       -> mkA OP_NEGI d a 0
-    IAbsI d a       -> mkA OP_ABSI d a 0
-    IAddF d a b     -> mkA OP_ADDF d a b
-    ISubF d a b     -> mkA OP_SUBF d a b
-    IMulF d a b     -> mkA OP_MULF d a b
-    IDivF d a b     -> mkA OP_DIVF d a b
-    INegF d a       -> mkA OP_NEGF d a 0
-    ISqrtF d a      -> mkA OP_SQRTF d a 0
-    IAbsF d a       -> mkA OP_ABSF d a 0
-    IItoF d a       -> mkA OP_ITOF d a 0
-    IEqI d a b      -> mkA OP_EQI d a b
-    INeqI d a b     -> mkA OP_NEQI d a b
-    ILtI d a b      -> mkA OP_LTI d a b
-    ILeI d a b      -> mkA OP_LEI d a b
-    IGtI d a b      -> mkA OP_GTI d a b
-    IGeI d a b      -> mkA OP_GEI d a b
-    IFtoI d a       -> mkA OP_FTOI d a 0
-    IGtF d a b      -> mkA OP_GTF d a b
-    IGeF d a b      -> mkA OP_GEF d a b
-    IEqF d a b      -> mkA OP_EQF d a b
-    INeqF d a b     -> mkA OP_NEQF d a b
-    ILtF d a b      -> mkA OP_LTF d a b
-    IEqP d a b      -> mkA OP_EQP d a b
-    ILeF d a b      -> mkA OP_LEF d a b
-    IBand d a b     -> mkA OP_BAND d a b
-    IBor d a b      -> mkA OP_BOR d a b
-    IBxor d a b     -> mkA OP_BXOR d a b
-    IBshl d a b     -> mkA OP_BSHL d a b
-    IBshr d a b     -> mkA OP_BSHR d a b
-    IJmp off        -> mkD OP_JMP off
-    IJmpT s off     -> mkB OP_JMPT s off
-    IJmpF s off     -> mkB OP_JMPF s off
-    ISwitch s t     -> mkB OP_SWITCH s t
-    IRet s          -> mkB OP_RET s 0
-    -- Use Format B for CALL: [OP:8][dst:8][funcIdx:16] — supports up to 65535 functions.
-    -- nargs is read from the function info at runtime (fi.arity).
-    ICall d f n     -> mkB OP_CALL d f
-    ITailCall f n   -> mkB OP_TAILCALL 0 f
-    ICallCls d c n  -> mkA OP_CALLCLS d c n
-    ITailCallCls c n -> mkA OP_TAILCALLCLS 0 c n
-    ICallExt d e n  -> mkB OP_CALLEXT d e  -- Format B: [OP:8][dst:8][externIdx:16]
-    IClosure d f n  -> mkB OP_CLOSURE d f  -- Format B: [OP:8][dst:8][funcIdx:16]
-    IGetUpval d i   -> mkB OP_GETUPVAL d i
-    IPap d f n      -> mkB OP_PAP d f    -- Format B: [OP:8][dst:8][funcIdx:16]
-    INewCon d t n   -> mkA OP_NEWCON d t n
-    IGetField d o i -> mkA OP_GETFIELD d o i
-    IGetTag d o     -> mkA OP_GETTAG d o 0
-    INewArray d l   -> mkB OP_NEWARRAY d l
-    IArrGet d a i   -> mkA OP_ARRGET d a i
-    IArrSet a i v   -> mkA OP_ARRSET a i v
-    IArrLen d a     -> mkA OP_ARRLEN d a 0
-    INewRef d v     -> mkA OP_NEWREF d v 0
-    IReadRef d r    -> mkA OP_READREF d r 0
-    IWriteRef r v   -> mkA OP_WRITEREF r v 0
-    INewMutArr d l v -> mkA OP_NEWMUTARR d l v
-    IMutRead d a i  -> mkA OP_MUTREAD d a i
-    IMutWrite a i v -> mkA OP_MUTWRITE a i v
-    IMutLen d a     -> mkA OP_MUTLEN d a 0
-    IPushHandler h  -> mkD OP_PUSHHANDLER h
-    IPopHandler     -> mkD OP_POPHANDLER 0
-    IPerform d o n  -> mkA OP_PERFORM d o n
-    IPrint s        -> mkB OP_PRINT s 0
-    IPrintLn s      -> mkB OP_PRINTLN s 0
-    IReadLine d     -> mkB OP_READLINE d 0
-    IClock d        -> mkB OP_CLOCK d 0
-    IStrCat d a b   -> mkA OP_STRCAT d a b
-    IStrLen d a     -> mkA OP_STRLEN d a 0
-    IShowI d a      -> mkA OP_SHOWI d a 0
-    IShowF d a      -> mkA OP_SHOWF d a 0
-    IShowC d a      -> mkA OP_SHOWC d a 0
-    IShowS d a      -> mkA OP_SHOWS d a 0
-    IPrintNl        -> mkD OP_PRINTNL 0
-    IModRef d r c   -> mkA OP_MODREF d r c
-    IMCall d n a    -> mkA OP_MCALL d n a
-    IDebugLoc s     -> mkB OP_DEBUGLOC 0 s
-    IError m        -> mkB OP_ERROR 0 m
-    IErrorReg r     -> mkB OP_ERRORREG r 0
-    INop            -> mkD OP_NOP 0
-    IHalt           -> mkD OP_HALT 0
+    -- Format B for CALL: [OP:8][dst:8][funcIdx:16] — nargs read from fiArity at runtime
+    ICall d f n     -> [mkB OP_CALL d f]
+    ITailCall f n   -> [mkB OP_TAILCALL 0 f]
+    -- Format B for CLOSURE/PAP: [OP:8][dst:8][funcIdx:16]
+    IClosure d f n  -> [mkB OP_CLOSURE d f]
+    IPap d f n      -> [mkB OP_PAP d f]
+    -- All other instructions: single word
+    ILoadK d k      -> [mkB OP_LOADK d k]
+    ILoadInt d i    -> [mkB OP_LOADINT d i]
+    -- All single-word instructions wrapped in [...]
+    ILoadTrue d     -> [mkB OP_LOADTRUE d 0]
+    ILoadFalse d    -> [mkB OP_LOADFALSE d 0]
+    ILoadUnit d     -> [mkB OP_LOADUNIT d 0]
+    ILoadNil d      -> [mkB OP_LOADNIL d 0]
+    IMov d s        -> [mkA OP_MOV d s 0]
+    IAddI d a b     -> [mkA OP_ADDI d a b]
+    ISubI d a b     -> [mkA OP_SUBI d a b]
+    IMulI d a b     -> [mkA OP_MULI d a b]
+    IDivI d a b     -> [mkA OP_DIVI d a b]
+    IRemI d a b     -> [mkA OP_REMI d a b]
+    INegI d a       -> [mkA OP_NEGI d a 0]
+    IAbsI d a       -> [mkA OP_ABSI d a 0]
+    IAddF d a b     -> [mkA OP_ADDF d a b]
+    ISubF d a b     -> [mkA OP_SUBF d a b]
+    IMulF d a b     -> [mkA OP_MULF d a b]
+    IDivF d a b     -> [mkA OP_DIVF d a b]
+    INegF d a       -> [mkA OP_NEGF d a 0]
+    ISqrtF d a      -> [mkA OP_SQRTF d a 0]
+    IAbsF d a       -> [mkA OP_ABSF d a 0]
+    IItoF d a       -> [mkA OP_ITOF d a 0]
+    IEqI d a b      -> [mkA OP_EQI d a b]
+    INeqI d a b     -> [mkA OP_NEQI d a b]
+    ILtI d a b      -> [mkA OP_LTI d a b]
+    ILeI d a b      -> [mkA OP_LEI d a b]
+    IGtI d a b      -> [mkA OP_GTI d a b]
+    IGeI d a b      -> [mkA OP_GEI d a b]
+    IFtoI d a       -> [mkA OP_FTOI d a 0]
+    IGtF d a b      -> [mkA OP_GTF d a b]
+    IGeF d a b      -> [mkA OP_GEF d a b]
+    IEqF d a b      -> [mkA OP_EQF d a b]
+    INeqF d a b     -> [mkA OP_NEQF d a b]
+    ILtF d a b      -> [mkA OP_LTF d a b]
+    IEqP d a b      -> [mkA OP_EQP d a b]
+    ILeF d a b      -> [mkA OP_LEF d a b]
+    IBand d a b     -> [mkA OP_BAND d a b]
+    IBor d a b      -> [mkA OP_BOR d a b]
+    IBxor d a b     -> [mkA OP_BXOR d a b]
+    IBshl d a b     -> [mkA OP_BSHL d a b]
+    IBshr d a b     -> [mkA OP_BSHR d a b]
+    IJmp off        -> [mkD OP_JMP off]
+    IJmpT s off     -> [mkB OP_JMPT s off]
+    IJmpF s off     -> [mkB OP_JMPF s off]
+    ISwitch s t     -> [mkB OP_SWITCH s t]
+    IRet s          -> [mkB OP_RET s 0]
+    ICallCls d c n  -> [mkA OP_CALLCLS d c n]
+    ITailCallCls c n -> [mkA OP_TAILCALLCLS 0 c n]
+    ICallExt d e n  -> [mkA OP_CALLEXT d e n]
+    IGetUpval d i   -> [mkB OP_GETUPVAL d i]
+    INewCon d t n   -> [mkA OP_NEWCON d t n]
+    IGetField d o i -> [mkA OP_GETFIELD d o i]
+    IGetTag d o     -> [mkA OP_GETTAG d o 0]
+    INewArray d l   -> [mkB OP_NEWARRAY d l]
+    IArrGet d a i   -> [mkA OP_ARRGET d a i]
+    IArrSet a i v   -> [mkA OP_ARRSET a i v]
+    IArrLen d a     -> [mkA OP_ARRLEN d a 0]
+    INewRef d v     -> [mkA OP_NEWREF d v 0]
+    IReadRef d r    -> [mkA OP_READREF d r 0]
+    IWriteRef r v   -> [mkA OP_WRITEREF r v 0]
+    INewMutArr d l v -> [mkA OP_NEWMUTARR d l v]
+    IMutRead d a i  -> [mkA OP_MUTREAD d a i]
+    IMutWrite a i v -> [mkA OP_MUTWRITE a i v]
+    IMutLen d a     -> [mkA OP_MUTLEN d a 0]
+    IPushHandler h  -> [mkD OP_PUSHHANDLER h]
+    IPopHandler     -> [mkD OP_POPHANDLER 0]
+    IPerform d o n  -> [mkA OP_PERFORM d o n]
+    IPrint s        -> [mkB OP_PRINT s 0]
+    IPrintLn s      -> [mkB OP_PRINTLN s 0]
+    IReadLine d     -> [mkB OP_READLINE d 0]
+    IClock d        -> [mkB OP_CLOCK d 0]
+    IStrCat d a b   -> [mkA OP_STRCAT d a b]
+    IStrLen d a     -> [mkA OP_STRLEN d a 0]
+    IStrEq d a b    -> [mkA OP_STREQ d a b]
+    IStrLt d a b    -> [mkA OP_STRLT d a b]
+    IIToC d a       -> [mkA OP_ITOC d a 0]
+    ICToI d a       -> [mkA OP_CTOI d a 0]
+    ICharSucc d a   -> [mkA OP_CHARSUCC d a 0]
+    ICharPred d a   -> [mkA OP_CHARPRED d a 0]
+    IShowI d a      -> [mkA OP_SHOWI d a 0]
+    IShowF d a      -> [mkA OP_SHOWF d a 0]
+    IShowC d a      -> [mkA OP_SHOWC d a 0]
+    IShowS d a      -> [mkA OP_SHOWS d a 0]
+    IPrintNl        -> [mkD OP_PRINTNL 0]
+    IModRef d r c   -> [mkA OP_MODREF d r c]
+    IMCall d n a    -> [mkA OP_MCALL d n a]
+    IDebugLoc s     -> [mkB OP_DEBUGLOC 0 s]
+    IError m        -> [mkB OP_ERROR 0 m]
+    IErrorReg r     -> [mkB OP_ERRORREG r 0]
+    INop            -> [mkD OP_NOP 0]
+    IHalt           -> [mkD OP_HALT 0]
 
 -- Format A: [op:8][a:8][b:8][c:8]
 mkA :: OpCode -> Int -> Int -> Int -> Word32
@@ -548,9 +586,15 @@ mkD :: OpCode -> Int -> Word32
 mkD op imm = (fromIntegral (opToByte op) `shiftL` 24)
     .|. (fromIntegral (imm .&. 0xFFFFFF))
 
--- | Decode a 32-bit word into a high-level instruction.
+-- | Decode a 32-bit word into a high-level instruction (single-word only, legacy).
+-- For wide instructions (CALL, TAILCALL, CLOSURE, PAP), use decodeInstrWide.
 decodeInstr :: Word32 -> Maybe Instruction
-decodeInstr w =
+decodeInstr w = fmap fst (decodeInstrWide w Nothing)
+
+-- | Decode instruction with optional second word for wide format.
+-- Returns (Instruction, wordsConsumed) where wordsConsumed is 1 or 2.
+decodeInstrWide :: Word32 -> Maybe Word32 -> Maybe (Instruction, Int)
+decodeInstrWide w mNextWord =
     let opByte = fromIntegral (w `shiftR` 24) :: Word8
         a      = fromIntegral ((w `shiftR` 16) .&. 0xFF) :: Int
         b      = fromIntegral ((w `shiftR` 8) .&. 0xFF) :: Int
@@ -560,97 +604,110 @@ decodeInstr w =
         simm16 = if imm16 >= 0x8000 then imm16 - 0x10000 else imm16
         imm24  = fromIntegral (w .&. 0xFFFFFF) :: Int
         simm24 = if imm24 >= 0x800000 then imm24 - 0x1000000 else imm24
+        nextFuncIdx = case mNextWord of
+            Just w2 -> fromIntegral w2 :: Int
+            Nothing -> 0  -- fallback for legacy single-word decode
+        wide instr = Just (instr, 2)
+        single instr = Just (instr, 1)
     in case byteToOp opByte of
-        Just OP_LOADK       -> Just $ ILoadK a imm16
-        Just OP_LOADINT     -> Just $ ILoadInt a simm16
-        Just OP_LOADTRUE    -> Just $ ILoadTrue a
-        Just OP_LOADFALSE   -> Just $ ILoadFalse a
-        Just OP_LOADUNIT    -> Just $ ILoadUnit a
-        Just OP_LOADNIL     -> Just $ ILoadNil a
-        Just OP_MOV         -> Just $ IMov a b
-        Just OP_ADDI        -> Just $ IAddI a b c
-        Just OP_SUBI        -> Just $ ISubI a b c
-        Just OP_MULI        -> Just $ IMulI a b c
-        Just OP_DIVI        -> Just $ IDivI a b c
-        Just OP_REMI        -> Just $ IRemI a b c
-        Just OP_NEGI        -> Just $ INegI a b
-        Just OP_ABSI        -> Just $ IAbsI a b
-        Just OP_ADDF        -> Just $ IAddF a b c
-        Just OP_SUBF        -> Just $ ISubF a b c
-        Just OP_MULF        -> Just $ IMulF a b c
-        Just OP_DIVF        -> Just $ IDivF a b c
-        Just OP_NEGF        -> Just $ INegF a b
-        Just OP_SQRTF       -> Just $ ISqrtF a b
-        Just OP_ABSF        -> Just $ IAbsF a b
-        Just OP_ITOF        -> Just $ IItoF a b
-        Just OP_EQI         -> Just $ IEqI a b c
-        Just OP_NEQI        -> Just $ INeqI a b c
-        Just OP_LTI         -> Just $ ILtI a b c
-        Just OP_LEI         -> Just $ ILeI a b c
-        Just OP_GTI         -> Just $ IGtI a b c
-        Just OP_GEI         -> Just $ IGeI a b c
-        Just OP_FTOI        -> Just $ IFtoI a b
-        Just OP_GTF         -> Just $ IGtF a b c
-        Just OP_GEF         -> Just $ IGeF a b c
-        Just OP_EQF         -> Just $ IEqF a b c
-        Just OP_NEQF        -> Just $ INeqF a b c
-        Just OP_LTF         -> Just $ ILtF a b c
-        Just OP_EQP         -> Just $ IEqP a b c
-        Just OP_LEF         -> Just $ ILeF a b c
-        Just OP_BAND        -> Just $ IBand a b c
-        Just OP_BOR         -> Just $ IBor a b c
-        Just OP_BXOR        -> Just $ IBxor a b c
-        Just OP_BSHL        -> Just $ IBshl a b c
-        Just OP_BSHR        -> Just $ IBshr a b c
-        Just OP_JMP         -> Just $ IJmp simm24
-        Just OP_JMPT        -> Just $ IJmpT a simm16
-        Just OP_JMPF        -> Just $ IJmpF a simm16
-        Just OP_SWITCH      -> Just $ ISwitch a imm16
-        Just OP_RET         -> Just $ IRet a
-        -- CALL uses Format B: [op:8][dst:8][funcIdx:16]
-        Just OP_CALL        -> Just $ ICall a imm16 0
-        Just OP_TAILCALL    -> Just $ ITailCall imm16 0
-        Just OP_CALLCLS     -> Just $ ICallCls a b c
-        Just OP_TAILCALLCLS -> Just $ ITailCallCls b c
-        Just OP_CALLEXT     -> Just $ ICallExt a imm16 0  -- Format B
-        Just OP_CLOSURE     -> Just $ IClosure a imm16 0  -- Format B: nupvals from func info
-        Just OP_GETUPVAL    -> Just $ IGetUpval a imm16
-        Just OP_PAP         -> Just $ IPap a imm16 0      -- Format B: nargs from func info
-        Just OP_NEWCON      -> Just $ INewCon a b c
-        Just OP_GETFIELD    -> Just $ IGetField a b c
-        Just OP_GETTAG      -> Just $ IGetTag a b
-        Just OP_NEWARRAY    -> Just $ INewArray a imm16
-        Just OP_ARRGET      -> Just $ IArrGet a b c
-        Just OP_ARRSET      -> Just $ IArrSet a b c
-        Just OP_ARRLEN      -> Just $ IArrLen a b
-        Just OP_NEWREF      -> Just $ INewRef a b
-        Just OP_READREF     -> Just $ IReadRef a b
-        Just OP_WRITEREF    -> Just $ IWriteRef a b
-        Just OP_NEWMUTARR  -> Just $ INewMutArr a b c
-        Just OP_MUTREAD    -> Just $ IMutRead a b c
-        Just OP_MUTWRITE   -> Just $ IMutWrite a b c
-        Just OP_MUTLEN     -> Just $ IMutLen a b
-        Just OP_PUSHHANDLER -> Just $ IPushHandler imm24
-        Just OP_POPHANDLER  -> Just $ IPopHandler
-        Just OP_PERFORM     -> Just $ IPerform a b c
-        Just OP_PRINT       -> Just $ IPrint a
-        Just OP_PRINTLN     -> Just $ IPrintLn a
-        Just OP_READLINE    -> Just $ IReadLine a
-        Just OP_CLOCK       -> Just $ IClock a
-        Just OP_STRCAT      -> Just $ IStrCat a b c
-        Just OP_STRLEN      -> Just $ IStrLen a b
-        Just OP_SHOWI       -> Just $ IShowI a b
-        Just OP_SHOWF       -> Just $ IShowF a b
-        Just OP_SHOWC       -> Just $ IShowC a b
-        Just OP_SHOWS       -> Just $ IShowS a b
-        Just OP_PRINTNL     -> Just IPrintNl
-        Just OP_MODREF      -> Just $ IModRef a b c
-        Just OP_MCALL       -> Just $ IMCall a b c
-        Just OP_DEBUGLOC    -> Just $ IDebugLoc imm16
-        Just OP_ERROR       -> Just $ IError imm16
-        Just OP_ERRORREG   -> Just $ IErrorReg a
-        Just OP_NOP         -> Just INop
-        Just OP_HALT        -> Just IHalt
+        Just OP_LOADK       -> single $ ILoadK a imm16
+        Just OP_LOADINT     -> single $ ILoadInt a simm16
+        Just OP_LOADTRUE    -> single $ ILoadTrue a
+        Just OP_LOADFALSE   -> single $ ILoadFalse a
+        Just OP_LOADUNIT    -> single $ ILoadUnit a
+        Just OP_LOADNIL     -> single $ ILoadNil a
+        Just OP_MOV         -> single $ IMov a b
+        Just OP_ADDI        -> single $ IAddI a b c
+        Just OP_SUBI        -> single $ ISubI a b c
+        Just OP_MULI        -> single $ IMulI a b c
+        Just OP_DIVI        -> single $ IDivI a b c
+        Just OP_REMI        -> single $ IRemI a b c
+        Just OP_NEGI        -> single $ INegI a b
+        Just OP_ABSI        -> single $ IAbsI a b
+        Just OP_ADDF        -> single $ IAddF a b c
+        Just OP_SUBF        -> single $ ISubF a b c
+        Just OP_MULF        -> single $ IMulF a b c
+        Just OP_DIVF        -> single $ IDivF a b c
+        Just OP_NEGF        -> single $ INegF a b
+        Just OP_SQRTF       -> single $ ISqrtF a b
+        Just OP_ABSF        -> single $ IAbsF a b
+        Just OP_ITOF        -> single $ IItoF a b
+        Just OP_EQI         -> single $ IEqI a b c
+        Just OP_NEQI        -> single $ INeqI a b c
+        Just OP_LTI         -> single $ ILtI a b c
+        Just OP_LEI         -> single $ ILeI a b c
+        Just OP_GTI         -> single $ IGtI a b c
+        Just OP_GEI         -> single $ IGeI a b c
+        Just OP_FTOI        -> single $ IFtoI a b
+        Just OP_GTF         -> single $ IGtF a b c
+        Just OP_GEF         -> single $ IGeF a b c
+        Just OP_EQF         -> single $ IEqF a b c
+        Just OP_NEQF        -> single $ INeqF a b c
+        Just OP_LTF         -> single $ ILtF a b c
+        Just OP_EQP         -> single $ IEqP a b c
+        Just OP_LEF         -> single $ ILeF a b c
+        Just OP_BAND        -> single $ IBand a b c
+        Just OP_BOR         -> single $ IBor a b c
+        Just OP_BXOR        -> single $ IBxor a b c
+        Just OP_BSHL        -> single $ IBshl a b c
+        Just OP_BSHR        -> single $ IBshr a b c
+        Just OP_JMP         -> single $ IJmp simm24
+        Just OP_JMPT        -> single $ IJmpT a simm16
+        Just OP_JMPF        -> single $ IJmpF a simm16
+        Just OP_SWITCH      -> single $ ISwitch a imm16
+        Just OP_RET         -> single $ IRet a
+        -- Format B CALL: [OP:8][dst:8][funcIdx:16] — nargs from fiArity
+        Just OP_CALL        -> single $ ICall a imm16 0
+        Just OP_TAILCALL    -> single $ ITailCall imm16 0
+        Just OP_CALLCLS     -> single $ ICallCls a b c
+        Just OP_TAILCALLCLS -> single $ ITailCallCls b c
+        Just OP_CALLEXT     -> single $ ICallExt a b c
+        -- Format B CLOSURE: [OP:8][dst:8][funcIdx:16]
+        Just OP_CLOSURE     -> single $ IClosure a imm16 0
+        Just OP_GETUPVAL    -> single $ IGetUpval a imm16
+        -- Format B PAP: [OP:8][dst:8][funcIdx:16]
+        Just OP_PAP         -> single $ IPap a imm16 0
+        Just OP_NEWCON      -> single $ INewCon a b c
+        Just OP_GETFIELD    -> single $ IGetField a b c
+        Just OP_GETTAG      -> single $ IGetTag a b
+        Just OP_NEWARRAY    -> single $ INewArray a imm16
+        Just OP_ARRGET      -> single $ IArrGet a b c
+        Just OP_ARRSET      -> single $ IArrSet a b c
+        Just OP_ARRLEN      -> single $ IArrLen a b
+        Just OP_NEWREF      -> single $ INewRef a b
+        Just OP_READREF     -> single $ IReadRef a b
+        Just OP_WRITEREF    -> single $ IWriteRef a b
+        Just OP_NEWMUTARR  -> single $ INewMutArr a b c
+        Just OP_MUTREAD    -> single $ IMutRead a b c
+        Just OP_MUTWRITE   -> single $ IMutWrite a b c
+        Just OP_MUTLEN     -> single $ IMutLen a b
+        Just OP_PUSHHANDLER -> single $ IPushHandler imm24
+        Just OP_POPHANDLER  -> single $ IPopHandler
+        Just OP_PERFORM     -> single $ IPerform a b c
+        Just OP_PRINT       -> single $ IPrint a
+        Just OP_PRINTLN     -> single $ IPrintLn a
+        Just OP_READLINE    -> single $ IReadLine a
+        Just OP_CLOCK       -> single $ IClock a
+        Just OP_STRCAT      -> single $ IStrCat a b c
+        Just OP_STRLEN      -> single $ IStrLen a b
+        Just OP_STREQ       -> single $ IStrEq a b c
+        Just OP_STRLT       -> single $ IStrLt a b c
+        Just OP_ITOC        -> single $ IIToC a b
+        Just OP_CTOI        -> single $ ICToI a b
+        Just OP_CHARSUCC    -> single $ ICharSucc a b
+        Just OP_CHARPRED    -> single $ ICharPred a b
+        Just OP_SHOWI       -> single $ IShowI a b
+        Just OP_SHOWF       -> single $ IShowF a b
+        Just OP_SHOWC       -> single $ IShowC a b
+        Just OP_SHOWS       -> single $ IShowS a b
+        Just OP_PRINTNL     -> single IPrintNl
+        Just OP_MODREF      -> single $ IModRef a b c
+        Just OP_MCALL       -> single $ IMCall a b c
+        Just OP_DEBUGLOC    -> single $ IDebugLoc imm16
+        Just OP_ERROR       -> single $ IError imm16
+        Just OP_ERRORREG   -> single $ IErrorReg a
+        Just OP_NOP         -> single INop
+        Just OP_HALT        -> single IHalt
         Nothing             -> Nothing
 
 -- | Disassemble a single instruction to a readable string.
@@ -733,6 +790,12 @@ disassembleOne pc instr = padRight 6 (show pc) ++ "  " ++ case instr of
     IClock d        -> "CLOCK     r" ++ show d
     IStrCat d a b   -> "STRCAT    r" ++ show d ++ ", r" ++ show a ++ ", r" ++ show b
     IStrLen d a     -> "STRLEN    r" ++ show d ++ ", r" ++ show a
+    IStrEq d a b    -> "STREQ     r" ++ show d ++ ", r" ++ show a ++ ", r" ++ show b
+    IStrLt d a b    -> "STRLT     r" ++ show d ++ ", r" ++ show a ++ ", r" ++ show b
+    IIToC d a       -> "ITOC      r" ++ show d ++ ", r" ++ show a
+    ICToI d a       -> "CTOI      r" ++ show d ++ ", r" ++ show a
+    ICharSucc d a   -> "CHARSUCC  r" ++ show d ++ ", r" ++ show a
+    ICharPred d a   -> "CHARPRED  r" ++ show d ++ ", r" ++ show a
     IShowI d a      -> "SHOWI     r" ++ show d ++ ", r" ++ show a
     IShowF d a      -> "SHOWF     r" ++ show d ++ ", r" ++ show a
     IShowC d a      -> "SHOWC     r" ++ show d ++ ", r" ++ show a

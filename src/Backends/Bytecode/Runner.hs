@@ -24,7 +24,7 @@ import State (Environment(..), InterpreterState(..), MonomorphLevel(..), Current
 import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import CLM (CLMLam)
-import Backends.Bytecode.Compile (compileCLMModule)
+import Backends.Bytecode.Compile (compileCLMModule, compileCLMModuleWith)
 import Backends.Bytecode.Module (BytecodeModule(..), dumpModule)
 import Backends.Bytecode.VM (VMState, VMError, initVM, runFunctionByName)
 import Backends.Bytecode.Value (Val, valToString)
@@ -93,7 +93,9 @@ compileToBytecodeWith env state funcNames =
                             let allCLM = Map.union clmFuncs clmInsts
 
                             -- Step 3: Compile CLM → BytecodeModule
-                            case compileCLMModule "tulam_bytecode" allCLM of
+                            -- Build constructor tag map from environment for CLMID → NEWCON resolution
+                            let consTagMap = Map.map snd (constructors env)
+                            case compileCLMModuleWith "tulam_bytecode" allCLM consTagMap of
                                 Left err -> Left $ "Bytecode compilation error: " ++ show err
                                 Right bm -> Right bm
 

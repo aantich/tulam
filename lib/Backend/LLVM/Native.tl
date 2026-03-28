@@ -79,7 +79,7 @@ target native {
         function compare(x, y) =
             if __lt_i64(x, y) then LessThan
             else if __gt_i64(x, y) then GreaterThan
-            else EqualTo
+            else Equal
     };
 
     instance Show(Int) = {
@@ -176,7 +176,7 @@ target native {
         function compare(x, y) =
             if __flt_f64(x, y) then LessThan
             else if __fgt_f64(x, y) then GreaterThan
-            else EqualTo
+            else Equal
     };
 
     instance Show(Float64) = {
@@ -256,7 +256,7 @@ target native {
         function compare(x, y) =
             if __flt_f32(x, y) then LessThan
             else if __fgt_f32(x, y) then GreaterThan
-            else EqualTo
+            else Equal
     };
 
     instance Show(Float32) = {
@@ -344,7 +344,7 @@ target native {
         function compare(x, y) =
             if __lt_i32(x, y) then LessThan
             else if __gt_i32(x, y) then GreaterThan
-            else EqualTo
+            else Equal
     };
 
     instance Show(Char) = {

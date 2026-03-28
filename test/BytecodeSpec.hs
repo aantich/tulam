@@ -27,43 +27,43 @@ instructionTests :: Spec
 instructionTests = describe "Instruction encoding" $ do
     it "encodes and decodes LOADINT" $ do
         let instr = ILoadInt 3 42
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes ADDI" $ do
         let instr = IAddI 0 1 2
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes RET" $ do
         let instr = IRet 5
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes JMP with negative offset" $ do
         let instr = IJmp (-10)
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
-    it "encodes and decodes CALL" $ do
-        -- CALL uses Format B: [OP:8][dst:8][funcIdx:16] — nargs not encoded (read from func info)
+    it "encodes and decodes CALL (Format B)" $ do
+        -- CALL uses Format B: [OP:8][dst:8][funcIdx:16] — nargs not in instruction
         let instr = ICall 0 1 0
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
     it "encodes CALL with large funcIdx" $ do
         -- Verify funcIdx > 255 works (was broken with Format A)
         let instr = ICall 3 300 0
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes NEWCON" $ do
         let instr = INewCon 0 2 3
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "encodes and decodes GETFIELD" $ do
         let instr = IGetField 0 1 2
-            w = encodeInstr instr
+            [w] = encodeInstr instr
         decodeInstr w `shouldBe` Just instr
 
     it "roundtrips all basic instructions" $ do
@@ -73,7 +73,7 @@ instructionTests = describe "Instruction encoding" $ do
                       , IEqI 0 1 2, ILtI 0 1 2
                       , IGtI 0 1 2, IGeI 0 1 2
                       ]
-        mapM_ (\i -> decodeInstr (encodeInstr i) `shouldBe` Just i) instrs
+        mapM_ (\i -> let [w] = encodeInstr i in decodeInstr w `shouldBe` Just i) instrs
 
 -- | Compiler tests.
 compileTests :: Spec

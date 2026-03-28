@@ -22,6 +22,7 @@ import qualified Data.Text.IO as TIO
 import Data.Text (Text)
 import Data.Word
 import Data.Bits
+import Data.Char (chr, ord)
 import Data.IORef
 import Control.Monad (when, forM_)
 import System.IO (hFlush, stdout)
@@ -49,6 +50,7 @@ data Frame = Frame
     , frBaseFP   :: !Int    -- caller's frame pointer (register base)
     , frFrameSize :: !Int   -- caller's frame size (for restoring on return)
     , frFuncIdx  :: !Int    -- function index (for debug)
+    , frFuncEntry :: !Int   -- caller's function entry offset (for jump table base restore)
     } deriving (Show, Eq)
 
 -- | Maximum call stack depth (for non-tail calls only).
@@ -68,6 +70,7 @@ data VMState = VMState
     , vmFrameSize  :: !(IORef Int)                 -- current frame size (caller's maxRegs)
     , vmCallStack  :: !(IORef [Frame])             -- call stack (LIFO)
     , vmCallDepth  :: !(IORef Int)                 -- current call depth
+    , vmFuncEntry  :: !(IORef Int)                 -- current function's entry offset (for jump table base)
     , vmHeap       :: !HeapTable                   -- heap-allocated objects
     , vmStrings    :: !StringTable                 -- interned strings
     }
@@ -82,6 +85,7 @@ initVM bm = do
     frameSize <- newIORef 256  -- default; set properly by runFunction
     stack <- newIORef []
     depth <- newIORef 0
+    funcEntry <- newIORef 0
     heap <- newHeapTable
     strings <- newStringTable
     return VMState
@@ -92,6 +96,7 @@ initVM bm = do
         , vmFrameSize = frameSize
         , vmCallStack = stack
         , vmCallDepth = depth
+        , vmFuncEntry = funcEntry
         , vmHeap      = heap
         , vmStrings   = strings
         }
@@ -163,6 +168,7 @@ runFunction vm funcIdx args = do
             writeIORef (vmFrameSize vm) (csMaxRegs fi)
             writeIORef (vmCallStack vm) []
             writeIORef (vmCallDepth vm) 0
+            writeIORef (vmFuncEntry vm) (fiEntry fi)
             -- Write arguments to parameter registers (unwrap Val to Word64)
             forM_ (zip [0..] args) $ \(i, Val w) ->
                 writeReg vm i w
@@ -498,12 +504,14 @@ dispatch vm 0x3A a _ _ _ simm16 _ = do
     execLoop vm
 
 -- SWITCH: dispatch on tag via jump table
+-- Jump table entries are function-local offsets; add vmFuncEntry to get absolute PC.
 dispatch vm 0x3B a _ _ imm16 _ _ = do
     va <- readReg vm a
     tag <- getTagForSwitch vm va
     let jts = bmJumpTables (vmModule vm)
     if imm16 < V.length jts
         then do
+            baseEntry <- readIORef (vmFuncEntry vm)
             let jt = jts V.! imm16
                 entries = jtEntries jt
                 -- Linear scan for matching tag (jump tables are small)
@@ -512,10 +520,9 @@ dispatch vm 0x3B a _ _ imm16 _ _ = do
                         Just _  -> acc
                         Nothing -> if t == tag then Just off else Nothing
                     ) Nothing entries
-            pc <- readIORef (vmPC vm)
             case target of
-                Just off -> writeIORef (vmPC vm) off
-                Nothing  -> writeIORef (vmPC vm) (jtDefault jt)
+                Just off -> writeIORef (vmPC vm) (baseEntry + off)
+                Nothing  -> writeIORef (vmPC vm) (baseEntry + jtDefault jt)
             execLoop vm
         else return $ Left (VMRuntimeError "SWITCH: invalid jump table index")
 
@@ -525,25 +532,27 @@ dispatch vm 0x3C a _ _ _ _ _ = do
     stack <- readIORef (vmCallStack vm)
     case stack of
         [] -> return $ Right val  -- top-level return
-        (Frame retPC retReg baseFP callerFS _funcIdx : rest) -> do
+        (Frame retPC retReg baseFP callerFS _funcIdx callerFuncEntry : rest) -> do
             writeIORef (vmCallStack vm) rest
             writeIORef (vmPC vm) retPC
             writeIORef (vmFP vm) baseFP
             writeIORef (vmFrameSize vm) callerFS
+            writeIORef (vmFuncEntry vm) callerFuncEntry
             depth <- readIORef (vmCallDepth vm)
             writeIORef (vmCallDepth vm) (depth - 1)
             writeReg vm retReg val
             execLoop vm
 
 -- CALL: r = func(args in r+1..r+nargs)
--- Format B: [OP:8][dst:8][funcIdx:16] — nargs read from function info
+-- Format B: [OP:8][dst:8][funcIdx:16] — nargs read from fiArity
 dispatch vm 0x40 a _ _ imm16 _ _ = do
-    let funcIdx = imm16
-        dstReg = a
+    let dstReg = a
+        funcIdx = imm16
     let bm = vmModule vm
     case lookupFunction bm funcIdx of
         Nothing -> return $ Left (VMInvalidFunction funcIdx)
         Just fi -> do
+            let nargs = fiArity fi
             depth <- readIORef (vmCallDepth vm)
             when (depth >= maxCallDepth) $
                 return () -- TODO: proper error
@@ -551,14 +560,15 @@ dispatch vm 0x40 a _ _ imm16 _ _ = do
             pc <- readIORef (vmPC vm)
             fp <- readIORef (vmFP vm)
             callerFrameSize <- readIORef (vmFrameSize vm)
-            let frame = Frame pc dstReg fp callerFrameSize funcIdx
+            callerEntry <- readIORef (vmFuncEntry vm)
+            let frame = Frame pc dstReg fp callerFrameSize funcIdx callerEntry
             modifyIORef' (vmCallStack vm) (frame :)
             writeIORef (vmCallDepth vm) (depth + 1)
             -- New frame starts AFTER caller's register space
             let newFP = fp + callerFrameSize
             writeIORef (vmFP vm) newFP
-            let nargs = fiArity fi
             writeIORef (vmFrameSize vm) (csMaxRegs fi)
+            writeIORef (vmFuncEntry vm) (fiEntry fi)
             forM_ [0..nargs-1] $ \i -> do
                 v <- readRegAbs vm (fp + dstReg + 1 + i)
                 writeRegAbs vm (newFP + i) v
@@ -567,7 +577,7 @@ dispatch vm 0x40 a _ _ imm16 _ _ = do
             execLoop vm
 
 -- TAILCALL: reuse frame, jump to func
--- Format B: [OP:8][0:8][funcIdx:16] — nargs from function info
+-- Format B: [OP:8][0:8][funcIdx:16] — nargs from fiArity
 dispatch vm 0x41 _ _ _ imm16 _ _ = do
     let funcIdx = imm16
     let bm = vmModule vm
@@ -581,6 +591,7 @@ dispatch vm 0x41 _ _ _ imm16 _ _ = do
             forM_ (zip [0..] args) $ \(i, v) ->
                 writeRegAbs vm (fp + i) v
             writeIORef (vmFrameSize vm) (csMaxRegs fi)
+            writeIORef (vmFuncEntry vm) (fiEntry fi)
             writeIORef (vmPC vm) (fiEntry fi)
             execLoop vm
 
@@ -602,13 +613,15 @@ dispatch vm 0x42 a b c _ _ _ = do
                             pc <- readIORef (vmPC vm)
                             fp <- readIORef (vmFP vm)
                             callerFS <- readIORef (vmFrameSize vm)
-                            let frame = Frame pc dstReg fp callerFS funcIdx
+                            callerEntry <- readIORef (vmFuncEntry vm)
+                            let frame = Frame pc dstReg fp callerFS funcIdx callerEntry
                             modifyIORef' (vmCallStack vm) (frame :)
                             writeIORef (vmCallDepth vm) (depth + 1)
                             -- Set up new frame: upvalues first, then args
                             let newFP = fp + callerFS
                             writeIORef (vmFP vm) newFP
                             writeIORef (vmFrameSize vm) (csMaxRegs fi)
+                            writeIORef (vmFuncEntry vm) (fiEntry fi)
                             -- Write upvalues (stored as Val in heap)
                             forM_ [0..V.length upvals - 1] $ \i ->
                                 writeRegAbs vm (newFP + i) (unVal (upvals V.! i))
@@ -635,12 +648,14 @@ dispatch vm 0x42 a b c _ _ _ = do
                                     fp <- readIORef (vmFP vm)
                                     callerFS <- readIORef (vmFrameSize vm)
                                     depth <- readIORef (vmCallDepth vm)
-                                    let frame = Frame pc dstReg fp callerFS funcIdx
+                                    callerEntry <- readIORef (vmFuncEntry vm)
+                                    let frame = Frame pc dstReg fp callerFS funcIdx callerEntry
                                     modifyIORef' (vmCallStack vm) (frame :)
                                     writeIORef (vmCallDepth vm) (depth + 1)
                                     let newFP = fp + callerFS
                                     writeIORef (vmFP vm) newFP
                                     writeIORef (vmFrameSize vm) (csMaxRegs fi)
+                                    writeIORef (vmFuncEntry vm) (fiEntry fi)
                                     forM_ (zip [0..] allArgs) $ \(i, Val w) ->
                                         writeRegAbs vm (newFP + i) w
                                     writeIORef (vmPC vm) (fiEntry fi)
@@ -677,6 +692,7 @@ dispatch vm 0x43 _ b c _ _ _ = do
                             forM_ (zip [0..] args) $ \(i, v) ->
                                 writeRegAbs vm (fp + argBase + i) v
                             writeIORef (vmFrameSize vm) (csMaxRegs fi)
+                            writeIORef (vmFuncEntry vm) (fiEntry fi)
                             writeIORef (vmPC vm) (fiEntry fi)
                             execLoop vm
                 _ -> return $ Left (VMRuntimeError "TAILCALLCLS: not a closure")
@@ -906,8 +922,60 @@ dispatch vm 0x79 a b _ _ _ _ = do
         else writeReg vm a (mkIntW 0)
     execLoop vm
 
+-- STREQ: string content equality
+dispatch vm 0x81 a b c _ _ _ = do
+    va <- readReg vm b
+    vb <- readReg vm c
+    if va == vb
+        then writeReg vm a (mkBoolW True)  -- same pointer → equal
+        else do
+            sa <- valToStringW vm va
+            sb <- valToStringW vm vb
+            writeReg vm a (mkBoolW (sa == sb))
+    execLoop vm
+
+-- STRLT: string lexicographic <
+dispatch vm 0x82 a b c _ _ _ = do
+    va <- readReg vm b
+    vb <- readReg vm c
+    sa <- valToStringW vm va
+    sb <- valToStringW vm vb
+    writeReg vm a (mkBoolW (sa < sb))
+    execLoop vm
+
+-- ITOC: int → char
+dispatch vm 0x83 a b _ _ _ _ = do
+    va <- readReg vm b
+    let n = getIntW va
+    writeReg vm a (mkCharW (chr n))
+    execLoop vm
+
+-- CTOI: char → int
+dispatch vm 0x84 a b _ _ _ _ = do
+    va <- readReg vm b
+    if isCharW va
+        then writeReg vm a (mkIntW (ord (getCharW va)))
+        else writeReg vm a (mkIntW 0)
+    execLoop vm
+
+-- CHARSUCC: char + 1
+dispatch vm 0x85 a b _ _ _ _ = do
+    va <- readReg vm b
+    if isCharW va
+        then writeReg vm a (mkCharW (chr (ord (getCharW va) + 1)))
+        else writeReg vm a va
+    execLoop vm
+
+-- CHARPRED: char - 1
+dispatch vm 0x86 a b _ _ _ _ = do
+    va <- readReg vm b
+    if isCharW va
+        then writeReg vm a (mkCharW (chr (ord (getCharW va) - 1)))
+        else writeReg vm a va
+    execLoop vm
+
 -- CLOSURE: r = Closure(funcIdx, upvalues from r+1..r+nupvals)
--- Format B: [OP:8][dst:8][funcIdx:16] — nupvals from function info
+-- Format B: [OP:8][dst:8][funcIdx:16] — nupvals from fiUpvalCount
 dispatch vm 0x48 a _ _ imm16 _ _ = do
     let funcIdx = imm16
     let bm = vmModule vm
@@ -946,11 +1014,11 @@ dispatch vm 0x7B a b _ _ _ _ = do
     writeReg vm a w
     execLoop vm
 
--- SHOWC: r = show(char)
+-- SHOWC: r = show(char) — wraps in single quotes: 'A'
 dispatch vm 0x7C a b _ _ _ _ = do
     val <- readReg vm b
     let str = if isCharW val
-              then T.singleton (getCharW val)
+              then T.pack ('\'' : getCharW val : "\'")
               else T.pack "<non-char>"
     w <- strAlloc (vmStrings vm) str
     writeReg vm a w
