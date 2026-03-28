@@ -846,11 +846,17 @@ loadFileNew nm = do
 loadFileNewImpl :: String -> IntState ()
 loadFileNewImpl nm = do
     logProgress $ "Loading file: " ++ nm
-    -- Add the file's directory to search paths so imports resolve relative to it
+    -- Add the file's directory AND its parent to search paths so imports resolve.
+    -- The parent is needed for module-qualified imports: if loading P05/Main.tl
+    -- with `import P05.Stack`, the parent directory is where P05/Stack.tl lives.
     let fileDir = takeDirectory nm
+        parentDir = takeDirectory fileDir
     st0 <- get
-    when (fileDir /= "" && fileDir `notElem` libSearchPaths st0) $
+    let paths = libSearchPaths st0
+    when (fileDir /= "" && fileDir `notElem` paths) $
         modify (\s -> s { libSearchPaths = fileDir : libSearchPaths s })
+    when (parentDir /= "" && parentDir /= fileDir && parentDir `notElem` paths) $
+        modify (\s -> s { libSearchPaths = parentDir : libSearchPaths s })
     fileText <- liftIO (T.readFile nm)
     -- Save and clear parsedModule so we only parse/check THIS file's expressions
     stPre <- get

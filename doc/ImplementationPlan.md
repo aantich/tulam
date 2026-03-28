@@ -38,6 +38,8 @@ All phases below are fully implemented and tested. See git history for details.
 | — | Safety passes (positivity, termination, coverage checking) | ✅ |
 | — | CLM optimization (eta-reduce, inline-small, constant-fold, known-constructor, DCE) | ✅ |
 | — | OOP classes (single inheritance, abstract/sealed, dynamic dispatch, implements) | ✅ |
+| — | Class subtyping (Dog <: Animal in TC, subsumption in dependent Pi, 1:1 target mapping) | ✅ |
+| — | Bidirectional type elaboration (top-down expected-type propagation for morphism dispatch) | ✅ |
 | — | Str type (UTF-8 encoded immutable strings) | ✅ |
 
 **Test suite**: 533 hspec tests, all passing.
@@ -109,8 +111,6 @@ CLM → LIR → LLVM IR → native binary via clang++. All 9 AWFY benchmarks pas
 4. **Monomorphization**: Return-type dispatch (toEnum), morphism dispatch (convert), and lambda enrichment (flip/map/fold) now work. Nested morphism dispatch (e.g., `nat_to_int(convert(True))`) now works via bidirectional type elaboration + Stage-R callee-param propagation. Remaining edge cases: generic unresolved algebra methods in polymorphic instance bodies (combine/inverse with type var "a")
 5. **Native backend gaps**: no capturing closures, no class dispatch, no effect handlers
 6. **Bytecode VM performance**: Haskell GC overhead (~1564x vs C++)
-7. **REPL `:load` import resolution**: When loading multi-file tests (e.g., P05/Main.tl importing P05.Stack), the REPL adds the file's own directory to search paths but import paths are resolved relative to that — creating double-nested paths. Module system needs parent-directory-relative import resolution for REPL loads.
-8. **Class subtyping not fully implemented**: Passing subclass values to functions expecting superclass (e.g., Dog to Animal parameter) fails in TC. Pattern matching on subclass constructors works (via `lookupAnyConstructor` classDecls fallback).
 
 ---
 

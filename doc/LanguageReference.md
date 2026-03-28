@@ -2198,6 +2198,26 @@ Type elaboration uses **bidirectional propagation**:
 
 This top-down propagation is critical for **morphism dispatch**: `nat_to_int(convert(True))` needs `convert(True)` to know its return type is `Nat` (from `nat_to_int`'s parameter type), not `b` (the unresolved type variable from `convert`'s signature). Without this context, the monomorphizer would construct the wrong dispatch key.
 
+### Class Subtyping
+
+The type checker supports **nominal subtyping** for OOP classes. If `class Dog extends Animal`, then `Dog <: Animal` — a `Dog` value can be passed wherever an `Animal` is expected.
+
+Subtyping is checked via **subsumption**: when checking an argument against a parameter type, the TC first tries exact unification, then falls back to a subtype check using the class hierarchy (`isSubclassOf` walks the `cmParent` chain in `classDecls`).
+
+```
+class Animal(name:String, age:Int) = { ... };
+class Dog(breed:String) extends Animal = { ... };
+
+function animalName(a:Animal) : String = a.name;
+
+// OK: Dog <: Animal, so Dog.new(...) is accepted where Animal is expected
+function test() : String = animalName(Dog.new("Rex", 5, "Lab"));
+```
+
+**Design choice — OOP static typing**: When a subclass value is passed to a function with a named parameter (dependent Pi), the type variable is bound to the **declared parameter type** (e.g., `Animal`), not the concrete argument type (`Dog`). This matches target platform semantics (`.NET`/`JS`/`C++`) where the function body only sees the static parameter type, and preserves the 1:1 class mapping to codegen targets.
+
+Subtyping is **transitive**: if `Puppy extends Dog` and `Dog extends Animal`, then `Puppy <: Animal`.
+
 ### Constructor Lookup
 
 Constructor lookup uses a **type-directed** approach. The `lookupAnyConstructor` helper checks both:

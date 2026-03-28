@@ -1467,15 +1467,32 @@ infer e =
 -- | Apply a function type to arguments
 inferApp :: Expr -> [Expr] -> TC Expr
 inferApp fTy [] = tcPure fTy
--- Dependent Pi: substitute the bound variable in return type
+-- Dependent Pi: substitute the bound variable in return type.
+-- Uses subsumption: if unify fails, try subtype (e.g., Dog <: Animal).
+-- On subtype success, bind the variable to paramTy (the declared static type),
+-- not argTy — this matches OOP semantics where the function body sees only
+-- the declared parameter type, preserving 1:1 mapping to target platforms.
 inferApp (Pi (Just name) paramTy retTy) (arg:rest) =
   infer arg `tcBind` \argTy ->
-    tcWithContext "argument of dependent application" (unify argTy paramTy) `tcBind` \_ ->
-      withCompilerEnv (tcPure (substTyVar name argTy retTy)) (\env ->
-        let retTy' = normalizeTy env (substTyVar name argTy retTy)
-        in tcPure retTy') `tcBind` \retTy'' ->
-          applySubst retTy'' `tcBind` \retTy''' ->
-             inferApp retTy''' rest
+    tcTry (tcWithContext "argument of dependent application" (unify argTy paramTy)) `tcBind` \unifyResult ->
+      let -- On exact unify: substitute with argTy (precise type)
+          -- On subtype: substitute with paramTy (declared static type)
+          substTy = case unifyResult of
+            Just _  -> argTy
+            Nothing -> paramTy
+          proceed =
+            withCompilerEnv (tcPure (substTyVar name substTy retTy)) (\env ->
+              let retTy' = normalizeTy env (substTyVar name substTy retTy)
+              in tcPure retTy') `tcBind` \retTy'' ->
+                applySubst retTy'' `tcBind` \retTy''' ->
+                   inferApp retTy''' rest
+      in case unifyResult of
+        Just _  -> proceed
+        Nothing ->
+          tcTry (subtype argTy paramTy) `tcBind` \subResult ->
+            case subResult of
+              Just _  -> proceed
+              Nothing -> tcWarnOrFail (Mismatch paramTy argTy) `tcBind` \_ -> proceed
 -- Non-dependent arrow
 inferApp (Pi Nothing paramTy retTy) (arg:rest) =
   tcWithContext "argument of application" (check arg paramTy) `tcBind` \_ ->
@@ -1931,15 +1948,25 @@ inferAppElab f' fTy args =
     goApp (Pi Nothing paramTy retTy) (arg:rest) acc =
       checkElab arg paramTy `tcBind` \arg' ->
         applySubst retTy `tcBind` \retTy' -> goApp retTy' rest (arg':acc)
-    -- Dependent Pi
+    -- Dependent Pi: with subsumption for class subtyping.
+    -- On subtype match, bind variable to paramTy (static type) for OOP semantics.
     goApp (Pi (Just pname) paramTy retTy) (arg:rest) acc =
       inferElab arg `tcBind` \(arg', argTy) ->
-        tcWithContext "argument of dependent application" (unify argTy paramTy) `tcBind` \_ ->
-          withCompilerEnv (tcPure (substTyVar pname argTy retTy)) (\env ->
-            let retTy' = normalizeTy env (substTyVar pname argTy retTy)
-            in tcPure retTy') `tcBind` \retTy'' ->
-              applySubst retTy'' `tcBind` \retTy''' ->
-                goApp retTy''' rest (arg':acc)
+        tcTry (tcWithContext "argument of dependent application" (unify argTy paramTy)) `tcBind` \unifyResult ->
+          let substTy = case unifyResult of { Just _ -> argTy; Nothing -> paramTy }
+              proceed =
+                withCompilerEnv (tcPure (substTyVar pname substTy retTy)) (\env ->
+                  let retTy' = normalizeTy env (substTyVar pname substTy retTy)
+                  in tcPure retTy') `tcBind` \retTy'' ->
+                    applySubst retTy'' `tcBind` \retTy''' ->
+                      goApp retTy''' rest (arg':acc)
+          in case unifyResult of
+            Just _  -> proceed
+            Nothing ->
+              tcTry (subtype argTy paramTy) `tcBind` \subResult ->
+                case subResult of
+                  Just _  -> proceed
+                  Nothing -> tcWarnOrFail (Mismatch paramTy argTy) `tcBind` \_ -> proceed
     -- Unknown function type: create fresh vars
     goApp (Meta v) remaining acc =
       tcMapM inferElab remaining `tcBind` \pairs ->
