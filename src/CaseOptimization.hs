@@ -112,7 +112,7 @@ maybeEither (Just x) d f = f x
 -- and fixes the expression properly
 fixEmptyConstructor :: Environment -> Expr -> Expr
 fixEmptyConstructor env ex@(Id name) =
-    let mcons = lookupConstructor name env in
+    let mcons = lookupAnyConstructor name env in
     case mcons of
         Nothing -> ex
         Just (cons,i) -> ConTuple (ConsTag name i) []
@@ -214,7 +214,7 @@ expandCase lam e = pure e
 caseTransformId :: (Expr->Expr) -> Environment -> Expr -> Name -> Expr -> IntState (Either String ([Expr],Expr))
 caseTransformId f env boundVarExpr name expr = do
     -- liftIO $ putStrLn $ "Inside caseTransformId: name = " ++ name ++ " boundVar = " ++ ppr boundVarExpr
-    maybeEither (lookupConstructor name env)
+    maybeEither (lookupAnyConstructor name env)
             (let vt = Var name UNDEFINED (f boundVarExpr)
                  expr' = betaReduce vt expr
              in  do
@@ -252,9 +252,9 @@ caseTransformApp1 :: Environment -> Expr -> Name -> [Expr] -> IntState (Either S
 caseTransformApp1 env boundVarExpr name ex = do
     -- liftIO $ putStrLn $ "Inside caseTransformApp1m name: " ++ name
     -- liftIO $ putStrLn $ "Bound var: " ++ ppr boundVarExpr
-    maybeEither (lookupConstructor name env)
+    maybeEither (lookupAnyConstructor name env)
             (return $ Left ("Error: constructor " ++ name ++ " is not found in the environment"))
-            -- ^^^ nothing found in the environment, it's an ERROR!
+            -- ^^^ nothing found in the environment (neither constructors nor classDecls), it's an ERROR!
             -- otherwise
             (\(lambda, i) ->
                 if (arity lambda == Prelude.length ex)

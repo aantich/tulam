@@ -216,28 +216,68 @@ lowerStageRExpr debug monoLevel env tInstances handlerOps typeEnv mLamRet = lowe
                     _ -> Typed UNDEFINED retTy
     lower (ESurface e) = resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet e
     lower (ECall kind headExpr args retTy) =
-        let loweredArgs = map (lower . elabArgExpr) args
+        let -- Lower arguments with callee parameter type context for morphism dispatch.
+            -- For DirectCall to a known function, propagate param types as mLamRet context
+            -- so that nested SemanticCalls (e.g., convert(True) inside nat_to_int) can
+            -- resolve morphism dispatch using the expected return type from the call site.
+            loweredArgs = case (kind, calleeHeadName (lower headExpr)) of
+                (DirectCall, Just funcName) ->
+                    case lookupLambdaRep ElabLambdaRep funcName env of
+                        Just calleeLam ->
+                            let valParams = filter (not . isImplicitVar) (params calleeLam)
+                            in [ case (safeIdx i valParams >>= exprToTypeName . typ) of
+                                     Just ptn | not (null ptn) && head ptn >= 'A' && head ptn <= 'Z' ->
+                                         lowerStageRExpr debug monoLevel env tInstances handlerOps typeEnv (Just ptn) (elabArgExpr a)
+                                     _ -> lower (elabArgExpr a)
+                               | (i, a) <- zip [0..] args
+                               ]
+                        Nothing -> map (lower . elabArgExpr) args
+                _ -> map (lower . elabArgExpr) args
+            safeIdx i xs = if i < length xs then Just (xs !! i) else Nothing
             loweredHead = lower headExpr
             wrapRet e = case exprToTypeName retTy of
               Just _ -> Typed e retTy
               Nothing -> e
+            -- | Check if a type name is concrete (starts with uppercase), not a type variable.
+            isConcreteTypeName n = not (null n) && head n >= 'A' && head n <= 'Z'
+            -- | Return type name from ECall retTy (propagated from Typed wrapper).
+            callRetTypeName = exprToTypeName retTy
             resolveByObligation funcName obl =
               case obl of
                 HandlerObligation{} -> case Map.lookup funcName handlerOps of
                   Just handlerLam -> goSurface (substituteInstanceBody handlerLam loweredArgs)
                   Nothing -> wrapRet (App (Id funcName) loweredArgs)
                 StructureObligation{} ->
-                  let inferredArgs = nub' (catMaybes (map (inferExprTypeName env typeEnv) loweredArgs))
-                      inferredOblArgs = nub' (catMaybes (map (inferExprTypeName env typeEnv) (oblExprArgs obl)))
-                      types1Base = if null (oblTypeArgs obl) then (if null inferredArgs then inferredOblArgs else inferredArgs) else oblTypeArgs obl
-                      types1 = nub' types1Base
-                  in case resolveTargetInstanceMulti tInstances funcName types1 of
-                      Just resolvedBody -> wrapRet (goSurface (substituteInstanceBody resolvedBody loweredArgs))
-                      Nothing -> case monoLevel of
-                        MonoFull -> case resolveInstanceLambdaWithKey env funcName types1 of
-                          Just (instKey, _) -> wrapRet (App (Id instKey) loweredArgs)
-                          Nothing -> wrapRet (App (Id funcName) loweredArgs)
-                        _ -> wrapRet (App (Id funcName) loweredArgs)
+                  let inferredArgs = catMaybes (map (inferExprTypeName env typeEnv) loweredArgs)
+                      inferredOblArgs = catMaybes (map (inferExprTypeName env typeEnv) (oblExprArgs obl))
+                      -- Only use oblTypeArgs if they contain concrete types (not type variables like "a", "b")
+                      concreteOblTypes = filter isConcreteTypeName (oblTypeArgs obl)
+                      types1 = if not (null concreteOblTypes) then concreteOblTypes
+                               else if not (null inferredArgs) then inferredArgs
+                               else inferredOblArgs
+                      -- Morphism fallback: append return type from ECall retTy for multi-param dispatch
+                      typesWithRet = case callRetTypeName of
+                          Just r | r `notElem` types1 -> types1 ++ [r]
+                          _ -> types1
+                      -- Try with return type first (morphisms), then without
+                      tryResolve ts = case resolveTargetInstanceMulti tInstances funcName ts of
+                          Just resolvedBody -> Just $ wrapRet (goSurface (substituteInstanceBody resolvedBody loweredArgs))
+                          Nothing -> case monoLevel of
+                            MonoFull -> case resolveInstanceLambdaWithKey env funcName ts of
+                              Just (instKey, _) -> Just $ dbg debug ("  [stageR] " ++ funcName ++ " → instance " ++ instKey ++ " for " ++ show ts) $
+                                                   wrapRet (App (Id instKey) loweredArgs)
+                              Nothing -> Nothing
+                            _ -> Nothing
+                  in dbg debug ("[stageR] resolveByObl " ++ funcName ++ " oblTypes=" ++ show (oblTypeArgs obl)
+                                ++ " concrete=" ++ show concreteOblTypes ++ " inferred=" ++ show inferredArgs
+                                ++ " retTy=" ++ show callRetTypeName ++ " types1=" ++ show types1
+                                ++ " withRet=" ++ show typesWithRet) $
+                     case tryResolve typesWithRet of
+                      Just result -> result
+                      Nothing -> case tryResolve types1 of
+                          Just result -> result
+                          Nothing -> dbg debug ("  [stageR] UNRESOLVED " ++ funcName ++ " types=" ++ show typesWithRet) $
+                                     wrapRet (App (Id funcName) loweredArgs)
         in case (kind, calleeHeadName loweredHead) of
             (DirectCall, _) -> wrapRet (App loweredHead loweredArgs)
             (IntrinsicCall _, _) -> wrapRet (App loweredHead loweredArgs)
@@ -270,16 +310,22 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
         -- Be elaboration-aware: the callee head may be wrapped in Typed.
         App f args
             | Just funcName <- calleeHeadName f ->
-                let -- Phase 1: Check ANY implicit param (not just evidence roles).
-                    -- Functions like foldl have type-constructor implicit params (c:Type1)
-                    -- that need dispatch, even though they're not "semantic evidence".
+                let -- Check if function has implicit params that need dispatch.
+                    -- Two ways a function can need dispatch:
+                    -- 1. Semantic role (evidence/handler): classic algebra methods like (+), show
+                    -- 2. Has ANY implicit params AND instance lambdas exist: morphism methods
+                    --    like convert, where implicit params are typed as Type but dispatch is needed
                     isSemanticImplicit = case lookupLambdaRep ElabLambdaRep funcName env of
                         Just fun ->
                             let infos = lookupAnyLambdaBinderInfo funcName env
-                            in or
-                                [ binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)
-                                | bi <- take (length (params fun)) (infos ++ repeat defaultExplicitBinderInfo)
-                                ]
+                                hasSemanticBinder = or
+                                    [ binderVisibility bi == EM.Implicit && isSemanticRole (binderRole bi)
+                                    | bi <- take (length (params fun)) (infos ++ repeat defaultExplicitBinderInfo)
+                                    ]
+                                -- Also check: has implicit params AND registered instance lambdas
+                                hasImplicitWithInstances = hasImplicit fun
+                                    && hasAnyInstanceLambda funcName env
+                            in hasSemanticBinder || hasImplicitWithInstances
                         _ -> False
                     hasTargetInstance = hasAnyTargetInstance funcName tInstances
                     -- Phase 1: Don't pre-process lambda args with `go` — instead pass
@@ -290,9 +336,21 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                         _ -> go a) args
                     unwrapTyped (Typed e _) = e
                     unwrapTyped e = e
+                    -- Check if there are untyped lambda args that need enrichment
+                    hasUntypedLamArgs = any (\a -> case unwrapTyped a of
+                        Function lam -> any (\v -> not (isImplicitVar v) && typ v == UNDEFINED) (params lam)
+                        _ -> False) args
                 in if isSemanticImplicit || hasTargetInstance || Map.member funcName handlerOps
                     then resolveImplicitCall funcName smartArgs
-                    else App (go f) (map go args)
+                    -- Even for non-implicit functions: enrich lambda args using callee signature
+                    -- so that implicit calls INSIDE the lambda body can resolve.
+                    -- E.g., flip(fn(x,y) = x - y, 10, 42) — enrich x,y to Int from flip's sig.
+                    else if hasUntypedLamArgs
+                        then let argTypes = map (inferExprTypeName env typeEnv) args
+                                 knownTypes = catMaybes argTypes
+                                 enrichedArgs = enrichLambdaArgsFromCallee funcName knownTypes args
+                             in App (go f) (map go enrichedArgs)
+                        else App (go f) (map go args)
 
         -- Nullary implicit-param reference (e.g., `zero`, `one`, `empty`, `readLine`)
         Id funcName ->
@@ -340,6 +398,13 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                 inferredEnv = buildTypeEnvFromLetPairs env typeEnv binds'
                 letTypeEnv = Map.union inferredEnv typeEnv
             in LetIn binds' (resolveImplicitCalls debug monoLevel env tInstances handlerOps letTypeEnv mLamRet bodyExpr)
+        -- Typed (App f args) t: propagate t as return type context for dispatch.
+        -- This enables morphism dispatch (e.g., convert(x) : Int) and return-type-driven
+        -- dispatch (e.g., toEnum(65) : Char) in the Surface path.
+        Typed e@(App _ _) t ->
+            let retName = exprToTypeName t
+                innerRet = retName <|> mLamRet
+            in Typed (resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv innerRet e) t
         Typed e t -> Typed (go e) t
         ExpandedCase checks bodyExpr si ->
             ExpandedCase (map goPatternCheck checks) (go bodyExpr) si
@@ -374,7 +439,7 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                 go (substituteInstanceBody handlerLam args')
             Nothing ->
                 let argTypes = map (inferExprTypeName env typeEnv) args'
-                    knownTypes = nub' (catMaybes argTypes)
+                    knownTypes = catMaybes argTypes
                     -- Phase 1: Enrich lambda args using callee-directed type propagation
                     enrichedArgs = enrichLambdaArgsFromCallee funcName knownTypes args'
                     enrichedArgTypes = map (inferExprTypeName env typeEnv) enrichedArgs
@@ -384,7 +449,7 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                         resolveWithTypes funcName types enrichedArgs
                     Nothing ->
                         -- Partial: try with just the known types
-                        let enrichedKnown = nub' (catMaybes enrichedArgTypes)
+                        let enrichedKnown = catMaybes enrichedArgTypes
                         in if null enrichedKnown
                             then dbg debug ("UNRESOLVED " ++ funcName ++ " — no arg types inferred, args=" ++ show (map showExprBrief enrichedArgs)) $
                                  App (Id funcName) enrichedArgs
@@ -587,26 +652,65 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
                 (_:ts') -> v : zipEnrichParams vs ts'
                 [] -> v : vs
 
-    -- | Try to resolve given known arg types, with morphism fallback.
+    -- | Try to resolve given known arg types, with return-type-aware dispatch.
     resolveWithTypes :: Name -> [Name] -> [Expr] -> Expr
     resolveWithTypes funcName types args' =
-        -- 1. Try target instances (algebra methods)
-        case resolveTargetInstanceMulti tInstances funcName types of
-            Just resolvedBody ->
-                dbg debug ("  " ++ funcName ++ " → target instance for " ++ show types) $
+        let -- Exact key lookup only (no single-param fallback) for multi-param keys
+            tryExact ts = Map.lookup (mkInstanceKey funcName ts Nothing) tInstances
+            -- Full cascade including single-param fallback
+            tryTarget ts = resolveTargetInstanceMulti tInstances funcName ts
+            applyTarget ts resolvedBody =
+                dbg debug ("  " ++ funcName ++ " → target instance for " ++ show ts) $
                 let result = go (substituteInstanceBody resolvedBody args')
                 in wrapWithReturnType funcName types result
-            Nothing ->
-                -- 2. Try with return type appended (for morphisms like Convertible)
-                case mLamRet of
-                    Just ret ->
-                        case resolveTargetInstanceMulti tInstances funcName (types ++ [ret]) of
-                            Just resolvedBody ->
-                                dbg debug ("  " ++ funcName ++ " → target instance (morphism) for " ++ show (types ++ [ret])) $
-                                let result = go (substituteInstanceBody resolvedBody args')
-                                in wrapWithReturnType funcName types result
-                            Nothing -> tryInstanceLambdaFallback funcName types args'
+        in case mLamRet of
+            Just ret | ret `notElem` types ->
+                -- Strategy: morphism exact key first, then arg dispatch (with return-type validation),
+                -- then return-type only, then fallback.
+                case tryExact (types ++ [ret]) of
+                    Just rb -> applyTarget (types ++ [ret]) rb
+                    _ -> case tryTarget types of
+                        Just rb | instanceRetMatchesFn funcName ret ->
+                            applyTarget types rb
+                        _ -> case tryTarget [ret] of
+                            Just rb -> applyTarget [ret] rb
+                            _ -> case tryTarget types of
+                                Just rb -> applyTarget types rb
+                                Nothing -> tryInstanceLambdaFallback funcName types args'
+            _ ->
+                case tryTarget types of
+                    Just rb -> applyTarget types rb
                     Nothing -> tryInstanceLambdaFallback funcName types args'
+
+    -- | Check if arg-type dispatch is valid for a function, or if it has
+    -- return-type-only type variables that require return-type dispatch.
+    -- Returns True if arg-type dispatch is fine (e.g., == dispatches on arg types).
+    -- Returns False if the function has type vars only in the return type (e.g., toEnum).
+    instanceRetMatchesFn :: Name -> Name -> Bool
+    instanceRetMatchesFn funcName' _expectedRet =
+        not (dispatchesOnReturnType funcName')
+
+    -- | Cached check: does this function dispatch on its return type?
+    -- True for functions like toEnum where the implicit type param only appears
+    -- in the return type, not in value parameter types.
+    dispatchesOnReturnType :: Name -> Bool
+    dispatchesOnReturnType fn =
+        case lookupLambdaRep ElabLambdaRep fn env <|> lookupLambda fn env of
+            Just lam ->
+                let implParams = filter isImplicitVar (params lam)
+                    valParams = filter (not . isImplicitVar) (params lam)
+                    valParamTypeVars = concatMap (collectLowercaseIds . typ) valParams
+                    retTypeVars = collectLowercaseIds (lamType lam)
+                    retOnlyVars = filter (\tv -> tv `elem` map name implParams && tv `notElem` valParamTypeVars) retTypeVars
+                    result = not (null retOnlyVars)
+                in result
+            Nothing -> False
+      where
+        collectLowercaseIds (Id n) | not (null n) && head n >= 'a' && head n <= 'z' = [n]
+        collectLowercaseIds (App f as) = concatMap collectLowercaseIds (f : as)
+        collectLowercaseIds (Pi _ a b) = collectLowercaseIds a ++ collectLowercaseIds b
+        collectLowercaseIds (Function lam) = collectLowercaseIds (lamType lam)
+        collectLowercaseIds _ = []
 
     -- | Wrap a resolved expression with the function's return type if determinable.
     -- After target instance substitution, the result may not carry type info.
@@ -641,30 +745,39 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
     tryInstanceLambdaFallback funcName argTypes args'
         | monoLevel /= MonoFull = App (Id funcName) args'
         | otherwise =
-            -- Try with return type appended first (for morphisms)
+            -- Try arg+ret first (morphisms), then args alone, then ret-only (return-type dispatch).
             let withRet = case mLamRet of
-                    Just ret -> resolveInstanceLambdaWithKey env funcName (argTypes ++ [ret])
-                    Nothing  -> Nothing
+                    Just ret | ret `notElem` argTypes -> resolveInstanceLambdaWithKey env funcName (argTypes ++ [ret])
+                    _ -> Nothing
+                withRetOnly = case mLamRet of
+                    Just ret | ret `notElem` argTypes -> resolveInstanceLambdaWithKey env funcName [ret]
+                    _ -> Nothing
             in case withRet of
                 Just (instKey, instLam)
-                    -- Skip intrinsic instances — they can't be compiled to bytecode
-                    -- and the original dispatch will handle them at runtime
                     | body instLam /= Intrinsic ->
-                        dbg debug ("  " ++ funcName ++ " → instance " ++ instKey ++ " (morphism fallback)") $
+                        dbg debug ("  " ++ funcName ++ " → instance " ++ instKey ++ " (morphism dispatch)") $
                         App (Id instKey) args'
                     | otherwise ->
-                        dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (kept as dispatch)") $
+                        dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (morphism, kept as dispatch)") $
                         App (Id funcName) args'
                 _ ->
                     case resolveInstanceLambdaWithKey env funcName argTypes of
+                      Just (instKey, instLam)
+                        | body instLam /= Intrinsic ->
+                            dbg debug ("  " ++ funcName ++ " → instance " ++ instKey) $
+                            App (Id instKey) args'
+                        | otherwise ->
+                            dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (kept as dispatch)") $
+                            App (Id funcName) args'
+                      Nothing -> case withRetOnly of
                         Just (instKey, instLam)
                             | body instLam /= Intrinsic ->
-                                dbg debug ("  " ++ funcName ++ " → instance " ++ instKey) $
+                                dbg debug ("  " ++ funcName ++ " → instance " ++ instKey ++ " (ret-type dispatch)") $
                                 App (Id instKey) args'
                             | otherwise ->
-                                dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (kept as dispatch)") $
+                                dbg debug ("  " ++ funcName ++ " → intrinsic " ++ instKey ++ " (ret-type, kept as dispatch)") $
                                 App (Id funcName) args'
-                        Nothing ->
+                        _ ->
                             dbg debug ("  UNRESOLVED " ++ funcName ++ " — no instance found for types=" ++ show argTypes) $
                             App (Id funcName) args'
 
@@ -970,6 +1083,13 @@ hasAnyTargetInstance :: Name -> HashMap Name a -> Bool
 hasAnyTargetInstance funcName m =
     let prefix = funcName ++ "\0"
     in any (\k -> k == funcName || take (length prefix) k == prefix) (Map.keys m)
+
+-- | Check if any instance lambda exists for a function name.
+hasAnyInstanceLambda :: Name -> Environment -> Bool
+hasAnyInstanceLambda funcName env =
+    let instLams = instanceLambdas env
+        prefix = funcName ++ "\0"
+    in any (\k -> k == funcName || take (length prefix) k == prefix) (Map.keys instLams)
 
 firstJust :: [Maybe a] -> Maybe a
 firstJust [] = Nothing

@@ -40,11 +40,11 @@ All phases below are fully implemented and tested. See git history for details.
 | — | OOP classes (single inheritance, abstract/sealed, dynamic dispatch, implements) | ✅ |
 | — | Str type (UTF-8 encoded immutable strings) | ✅ |
 
-**Test suite**: 1086+ hspec tests, all passing.
+**Test suite**: 533 hspec tests, all passing.
 
-**Standard library**: 13 consolidated modules in `lib/`, loaded via `loadModuleTree "lib/Base.tl"`.
+**Standard library**: 36 modules in `lib/`, loaded via `loadModuleTree "lib/Base.tl"`.
 
-**Compilation pipeline**: Pass 0 → 0.25 → 0.5 → 1 → 1.5 → 2 → 2.1/2.2/2.3 → 3 → 3.1 → 4 → 4.5 → 5+ (codegen).
+**Compilation pipeline**: Pass 0 → 0.25 → 0.5 → 1 → 1.5 → 2 → 2.1/2.2/2.3 → 3 → 3.1 → 3.2 → [on-demand mono] → 4 → 4.5 → 5+ (codegen).
 
 ---
 
@@ -106,9 +106,11 @@ CLM → LIR → LLVM IR → native binary via clang++. All 9 AWFY benchmarks pas
 1. **Type checker permissive by default**: errors are warnings; `strictTypes` flag makes them fatal
 2. **SIMD Vec operations are stubs** (need native backend integration)
 3. **TC pattern variable warnings**: spurious "Unbound variable" for pattern match binders (~95 warnings in stdlib)
-4. **Monomorphization gap**: Pattern-match variable type inference now covers constructor destructuring; remaining edge cases: nested patterns, inline match with parameterized types (TypeEnv only stores type name, not args)
+4. **Monomorphization**: Return-type dispatch (toEnum), morphism dispatch (convert), and lambda enrichment (flip/map/fold) now work. Nested morphism dispatch (e.g., `nat_to_int(convert(True))`) now works via bidirectional type elaboration + Stage-R callee-param propagation. Remaining edge cases: generic unresolved algebra methods in polymorphic instance bodies (combine/inverse with type var "a")
 5. **Native backend gaps**: no capturing closures, no class dispatch, no effect handlers
 6. **Bytecode VM performance**: Haskell GC overhead (~1564x vs C++)
+7. **REPL `:load` import resolution**: When loading multi-file tests (e.g., P05/Main.tl importing P05.Stack), the REPL adds the file's own directory to search paths but import paths are resolved relative to that — creating double-nested paths. Module system needs parent-directory-relative import resolution for REPL loads.
+8. **Class subtyping not fully implemented**: Passing subclass values to functions expecting superclass (e.g., Dog to Animal parameter) fails in TC. Pattern matching on subclass constructors works (via `lookupAnyConstructor` classDecls fallback).
 
 ---
 

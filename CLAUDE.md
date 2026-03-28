@@ -23,17 +23,21 @@ Once in the REPL: `:load <file>`, `:list types`, `:list functions`, `:env`, `:al
 
 ## Architecture
 
-### Compilation Pipeline (7 passes)
+### Compilation Pipeline
 
 ```
 Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
   → Pass 0: After-parser desugaring (BinaryOp→App, IfThenElse→match, LetIn→lambda, etc.)
   → Pass 1: Environment Building (types, constructors, lambdas, primitives, instances, intrinsics)
   → Pass 2: Case Optimization (beta reduction, pattern expansion)
+  → Pass 2.1/2.2/2.3: Positivity, Termination, Coverage checks
   → Pass 3: Type Checking (bidirectional type checker with row polymorphism, permissive by default)
+  → Pass 3.1: Type Annotation (fills UNDEFINED types in Lambdas from TC inference)
   → Pass 3.2: Type Elaboration (wraps sub-expressions with Typed annotations for downstream passes)
+  → [On-demand] Monomorphization (Surface-level instance dispatch resolution via CompileDriver)
   → Pass 4: CLM Conversion (Surface AST → Core List Machine IR, intrinsic → CLMPRIMCALL)
-  → Pass 5: Code Generation (target-specific output)
+  → Pass 4.5: CLM Optimization (eta-reduce, inline-small, constant-fold, dead-code-elim)
+  → Pass 5: Code Generation (target-specific output: bytecode VM or LLVM native)
 ```
 
 ### Key Modules
@@ -46,9 +50,12 @@ Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
 | `src/Pipeline.hs` | All compilation passes. Environment building, case optimization, CLM conversion. |
 | `src/CLM.hs` | Core List Machine IR. Simply-typed intermediate form using explicit n-lists. Beta reduction, lambda application. Class nodes: `CLMMCALL`, `CLMSCALL`, `CLMNEW`. |
 | `src/State.hs` | Interpreter state and monad stack. Environment maps (types, constructors, topLambdas, clmLambdas, classDecls). `ClassMeta` stores class hierarchy. |
-| `src/Interpreter.hs` | CLM evaluator. Pattern matching resolution, expression evaluation, intrinsic dispatch. |
+| `src/Monomorphize.hs` | Surface-level monomorphization: resolves implicit-param dispatch to direct calls before CLM conversion. Three strategies: arg-type, morphism (arg+ret), return-type. Lambda enrichment for HOF. Stage-R (from TC obligations) and Surface (fallback) paths. |
+| `src/ElabCore.hs` | Stage-R intermediate representation: `ElabLambda`, `ElabExpr`, `ElabCallKind` (DirectCall, SemanticCall, EvidenceCall, HandlerCall, IntrinsicCall). Bridges TC output to monomorphizer. |
+| `src/ElabObligation.hs` | `SemanticObligation` (method, class, tag, typeArgs, exprArgs) and `SemanticWitness` (resolved instance key). Carried in `ECall` nodes for structured dispatch. |
 | `src/Intrinsics.hs` | Intrinsic function registry. Maps `(funcName, typeName)` to Haskell evaluation functions for Int/Float64 arithmetic and comparison. |
-| `src/TypeElaborate.hs` | Pass 3.2: Type elaboration. Wraps sub-expressions with `Typed expr type` after TC. Bottom-up walk using ElabEnv (var→type map). Resolves constructor type params from arg types. Downstream mono/spec reads from Typed wrappers. |
+| `src/TypeElaborate.hs` | Pass 3.2: Type elaboration. Bidirectional: bottom-up inference + top-down expected-type propagation. `elaborateExpr env elabEnv mExpected expr` takes optional expected type from call site context (e.g., callee param types). `wrapTypedWithFallback` uses expected type when bottom-up produces unresolved type variables. `elaborateArgsWithCallee` propagates callee parameter types to each argument. `lookupConstructorLam` for constructor param type lookup. Downstream mono/spec reads from Typed wrappers. |
+| `src/CaseOptimization.hs` | Pass 2: Case optimization. Beta reduction, pattern expansion. Uses `lookupAnyConstructor` (not `lookupConstructor`) to support both sum-type and class constructors in pattern matching. |
 | `src/TypeCheck.hs` | Bidirectional type checker with row polymorphism. Internal types (`Ty`: TVar, TRigid, TCon, TApp, TPi, TSigma, TId, TForall, TRecord, TU), row types (REmpty, RExtend, RVar, RRigid), unification engine, structure constraint resolution. Permissive mode by default (errors are warnings). |
 | `src/Logs.hs` | Error handling with source location tracking. |
 | `src/MetadataResolver.hs` | Stub interface for codegen-time extern class metadata resolution (.NET/JS/native). No-op in interpreter. |

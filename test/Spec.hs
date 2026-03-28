@@ -3693,52 +3693,52 @@ main = do
                 let emptyEnv = initialEnvironment
 
                 it "wraps literals with Typed" $ do
-                    let result = elaborateExpr emptyEnv Map.empty (Lit (LInt 42))
+                    let result = elaborateExpr emptyEnv Map.empty Nothing (Lit (LInt 42))
                     result `shouldBe` Typed (Lit (LInt 42)) (Id "Int")
 
                 it "wraps float literals with Typed" $ do
-                    let result = elaborateExpr emptyEnv Map.empty (Lit (LFloat 3.14))
+                    let result = elaborateExpr emptyEnv Map.empty Nothing (Lit (LFloat 3.14))
                     result `shouldBe` Typed (Lit (LFloat 3.14)) (Id "Float64")
 
                 it "wraps string literals with Typed" $ do
-                    let result = elaborateExpr emptyEnv Map.empty (Lit (LString "hello"))
+                    let result = elaborateExpr emptyEnv Map.empty Nothing (Lit (LString "hello"))
                     result `shouldBe` Typed (Lit (LString "hello")) (Id "String")
 
                 it "wraps char literals with Typed" $ do
-                    let result = elaborateExpr emptyEnv Map.empty (Lit (LChar 'a'))
+                    let result = elaborateExpr emptyEnv Map.empty Nothing (Lit (LChar 'a'))
                     result `shouldBe` Typed (Lit (LChar 'a')) (Id "Char")
 
                 it "wraps variables from ElabEnv" $ do
                     let elabEnv = Map.fromList [("x", Id "Int")]
-                        result = elaborateExpr emptyEnv elabEnv (Id "x")
+                        result = elaborateExpr emptyEnv elabEnv Nothing (Id "x")
                     result `shouldBe` Typed (Id "x") (Id "Int")
 
                 it "leaves unknown variables unwrapped" $ do
-                    let result = elaborateExpr emptyEnv Map.empty (Id "unknown")
+                    let result = elaborateExpr emptyEnv Map.empty Nothing (Id "unknown")
                     result `shouldBe` Id "unknown"
 
                 it "preserves existing Typed wrappers" $ do
                     let input = Typed (Id "x") (Id "Bool")
-                        result = elaborateExpr emptyEnv Map.empty input
+                        result = elaborateExpr emptyEnv Map.empty Nothing input
                     result `shouldBe` Typed (Id "x") (Id "Bool")
 
                 it "wraps action blocks as Unit" $ do
                     let input = ActionBlock [ActionExpr (Lit (LInt 1))]
-                        result = elaborateExpr emptyEnv Map.empty input
+                        result = elaborateExpr emptyEnv Map.empty Nothing input
                     case result of
                         Typed (ActionBlock _) (Id "Unit") -> return ()
                         _ -> expectationFailure $ "Expected Typed ActionBlock Unit, got: " ++ show result
 
                 it "wraps if-then-else with then-branch type" $ do
                     let input = IfThenElse (Lit (LInt 1)) (Lit (LInt 2)) (Lit (LInt 3))
-                        result = elaborateExpr emptyEnv Map.empty input
+                        result = elaborateExpr emptyEnv Map.empty Nothing input
                     case result of
                         Typed (IfThenElse _ _ _) (Id "Int") -> return ()
                         _ -> expectationFailure $ "Expected Typed IfThenElse Int, got: " ++ show result
 
                 it "elaborates let-in body type" $ do
                     let input = LetIn [(Var "x" (Id "Int") UNDEFINED, Lit (LInt 42))] (Id "x")
-                        result = elaborateExpr emptyEnv Map.empty input
+                        result = elaborateExpr emptyEnv Map.empty Nothing input
                     case result of
                         Typed (LetIn _ (Typed (Id "x") (Id "Int"))) (Id "Int") -> return ()
                         _ -> expectationFailure $ "Expected Typed LetIn with body type Int, got: " ++ show result

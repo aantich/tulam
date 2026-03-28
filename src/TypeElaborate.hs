@@ -2,13 +2,18 @@
 -- | Pass 3.2: Type Elaboration — wraps sub-expressions with Typed annotations.
 --
 -- Runs after Pass 3.1 (type annotate) which fills in Lambda param/return types.
--- This pass walks every lambda body bottom-up, wrapping each sub-expression with
--- `Typed expr type` where the type can be determined from:
---   - Literal types (Int, Float64, String, Char, etc.)
---   - Variable types from the local environment (params, let-bindings, case patterns)
---   - Constructor application: infer type params from args, apply to constructor return type
---   - Function application: return type from lambda lookup
---   - Instance keys: return type from instanceLambdas lookup
+-- This pass walks every lambda body using bidirectional elaboration:
+--
+--   Bottom-up (inference): wraps each sub-expression with `Typed expr type`
+--   where the type can be determined from literals, variables, constructors,
+--   function return types, or instance keys.
+--
+--   Top-down (checking): propagates expected types from call sites downward.
+--   When a function call like f(g(x)) is elaborated and f's parameter type is
+--   known, that type is passed as expected context to g(x). If bottom-up
+--   inference produces an unresolved type variable, the expected type is used
+--   as a fallback. This enables morphism dispatch in the downstream
+--   monomorphizer (e.g., convert(True) inside nat_to_int gets expected type Nat).
 --
 -- Downstream passes (Monomorphize, Specialize) read types directly from Typed
 -- wrappers instead of re-inferring them.
@@ -59,10 +64,14 @@ typeElaboratePass = do
 -- ============================================================================
 
 -- | Elaborate a single Lambda: build ElabEnv from params, elaborate body.
+-- The lambda's declared return type is passed as expected context for the body.
 elaborateLambda :: Environment -> Lambda -> Lambda
 elaborateLambda env lam =
     let elabEnv = buildElabEnv (params lam)
-        body' = elaborateExpr env elabEnv (body lam)
+        mExpected = case lamType lam of
+            UNDEFINED -> Nothing
+            t         -> concreteType t
+        body' = elaborateExpr env elabEnv mExpected (body lam)
     in lam { body = body' }
 
 -- | Build initial ElabEnv from Lambda parameters.
@@ -79,16 +88,19 @@ buildElabEnv = Map.fromList . mapMaybe extract
 -- Core Elaboration
 -- ============================================================================
 
--- | Elaborate an expression bottom-up: elaborate children, then wrap with Typed.
+-- | Elaborate an expression with optional expected-type context.
+-- Bottom-up: elaborate children, infer types from structure.
+-- Top-down: when mExpected is Just, use it as fallback if bottom-up produces
+-- an unresolved type variable or no type at all.
 -- Never fails — returns the expression unwrapped if the type can't be determined.
-elaborateExpr :: Environment -> ElabEnv -> Expr -> Expr
-elaborateExpr env elabEnv expr = case expr of
+elaborateExpr :: Environment -> ElabEnv -> Maybe Expr -> Expr -> Expr
+elaborateExpr env elabEnv mExpected expr = case expr of
     -- Already typed: elaborate inner but preserve outer type
     Typed e t ->
-        let e' = elaborateExpr env elabEnv e
+        let e' = elaborateExpr env elabEnv Nothing e
         in Typed e' t
 
-    -- Literals: known types
+    -- Literals: known types (no need for expected type)
     Lit lit -> case litTypeName lit of
         Just tn -> Typed (Lit lit) (Id tn)
         Nothing -> Lit lit
@@ -108,34 +120,36 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- Constructor application: resolve type params from arg types
     App (Id n) args | isUpperName n ->
-        let args' = map (elaborateExpr env elabEnv) args
+        let args' = elaborateArgsWithCallee env elabEnv (lookupConstructorLam n env) args
         in case lookupConstructor n env of
             Just (consLam, _) ->
                 let resolvedType = resolveConstructorType env consLam args'
-                in wrapTyped (App (Id n) args') resolvedType
+                in wrapTypedWithFallback mExpected (App (Id n) args') resolvedType
             Nothing -> App (Id n) args'
 
     -- Instance key call (contains \0): look up return type from instanceLambdas
     App (Id n) args | '\0' `elem` n ->
-        let args' = map (elaborateExpr env elabEnv) args
-        in case Map.lookup n (instanceLambdas env) of
+        let mLam = Map.lookup n (instanceLambdas env)
+            args' = elaborateArgsWithCallee env elabEnv mLam args
+        in case mLam of
             Just instLam ->
                 let retType = resolveReturnType env instLam args'
-                in wrapTyped (App (Id n) args') retType
+                in wrapTypedWithFallback mExpected (App (Id n) args') retType
             Nothing -> App (Id n) args'
 
     -- Regular function call: look up return type
     App (Id n) args ->
-        let args' = map (elaborateExpr env elabEnv) args
-        in case lookupLambda n env of
+        let mLam = lookupLambda n env
+            args' = elaborateArgsWithCallee env elabEnv mLam args
+        in case mLam of
             Just lam ->
                 let retType = resolveReturnType env lam args'
-                in wrapTyped (App (Id n) args') retType
+                in wrapTypedWithFallback mExpected (App (Id n) args') retType
             Nothing -> App (Id n) args'
 
     -- Desugared let-in: App (Function lam) [args]
     App (Function lam) args ->
-        let args' = map (elaborateExpr env elabEnv) args
+        let args' = map (elaborateExpr env elabEnv Nothing) args
             -- Infer param types from elaborated args
             paramEnv = Map.fromList
                 [ (name v, t)
@@ -143,20 +157,23 @@ elaborateExpr env elabEnv expr = case expr of
                 , Just t <- [typeOfExpr arg]
                 ]
             innerEnv = Map.union paramEnv (Map.union (buildElabEnv (params lam)) elabEnv)
-            body' = elaborateExpr env innerEnv (body lam)
+            body' = elaborateExpr env innerEnv mExpected (body lam)
             lam' = lam { body = body' }
-        in wrapTyped (App (Function lam') args') (typeOfExpr body')
+        in wrapTypedWithFallback mExpected (App (Function lam') args') (typeOfExpr body')
 
     -- General application
     App f args ->
-        let f' = elaborateExpr env elabEnv f
-            args' = map (elaborateExpr env elabEnv) args
+        let f' = elaborateExpr env elabEnv Nothing f
+            args' = map (elaborateExpr env elabEnv Nothing) args
         in App f' args'
 
     -- Function/Lambda: elaborate body with extended env, wrap with return type
     Function lam ->
         let innerEnv = Map.union (buildElabEnv (params lam)) elabEnv
-            body' = elaborateExpr env innerEnv (body lam)
+            innerExpected = case lamType lam of
+                UNDEFINED -> mExpected
+                t         -> concreteType t
+            body' = elaborateExpr env innerEnv innerExpected (body lam)
             lam' = lam { body = body' }
             -- If lambda has known return type, use it; otherwise infer from body
             retType = case lamType lam of
@@ -167,12 +184,12 @@ elaborateExpr env elabEnv expr = case expr of
     -- Let-in: elaborate bindings, extend env, elaborate body
     LetIn binds bodyExpr ->
         let (elabEnv', binds') = elaborateLetBinds env elabEnv binds
-            body' = elaborateExpr env elabEnv' bodyExpr
-        in wrapTyped (LetIn binds' body') (typeOfExpr body')
+            body' = elaborateExpr env elabEnv' mExpected bodyExpr
+        in wrapTypedWithFallback mExpected (LetIn binds' body') (typeOfExpr body')
 
     -- ConTuple: tagged constructor
     ConTuple ct@(ConsTag cname _) args ->
-        let args' = map (elaborateExpr env elabEnv) args
+        let args' = elaborateArgsWithCallee env elabEnv (lookupConstructorLam cname env) args
         in case lookupConstructor cname env of
             Just (consLam, _) ->
                 let resolvedType = resolveConstructorType env consLam args'
@@ -183,29 +200,29 @@ elaborateExpr env elabEnv expr = case expr of
     -- PatternMatches must remain unwrapped because lambdaToCLMLambda' pattern-matches
     -- on Lambda{body = PatternMatches cases} directly. Wrapping breaks this.
     PatternMatches cases ->
-        PatternMatches (map (elaborateExpr env elabEnv) cases)
+        PatternMatches (map (elaborateExpr env elabEnv mExpected) cases)
 
     -- ExpandedCase: elaborate checks and body. Don't wrap — ExpandedCase is a
     -- structural form used by CLM converter and wrapping can interfere.
     ExpandedCase checks bodyExpr si ->
         let checks' = map (elaborateCheck env elabEnv) checks
-            body' = elaborateExpr env elabEnv bodyExpr
+            body' = elaborateExpr env elabEnv mExpected bodyExpr
         in ExpandedCase checks' body' si
 
     -- CaseOf: extract pattern-bound types, extend env
     CaseOf cv bodyExpr si ->
         let patEnv = extractCasePatternTypes env elabEnv cv
             innerEnv = Map.union patEnv elabEnv
-            cv' = map (\v -> v { val = elaborateExpr env innerEnv (val v) }) cv
-            body' = elaborateExpr env innerEnv bodyExpr
-        in wrapTyped (CaseOf cv' body' si) (typeOfExpr body')
+            cv' = map (\v -> v { val = elaborateExpr env innerEnv mExpected (val v) }) cv
+            body' = elaborateExpr env innerEnv mExpected bodyExpr
+        in wrapTypedWithFallback mExpected (CaseOf cv' body' si) (typeOfExpr body')
 
-    -- If-then-else: type of then-branch
+    -- If-then-else: propagate expected type to both branches
     IfThenElse c t e ->
-        let c' = elaborateExpr env elabEnv c
-            t' = elaborateExpr env elabEnv t
-            e' = elaborateExpr env elabEnv e
-        in wrapTyped (IfThenElse c' t' e') (typeOfExpr t')
+        let c' = elaborateExpr env elabEnv Nothing c
+            t' = elaborateExpr env elabEnv mExpected t
+            e' = elaborateExpr env elabEnv mExpected e
+        in wrapTypedWithFallback mExpected (IfThenElse c' t' e') (typeOfExpr t')
 
     -- Action blocks return Unit
     ActionBlock stmts ->
@@ -216,16 +233,16 @@ elaborateExpr env elabEnv expr = case expr of
     -- BinaryOp is desugared to App in afterparserPass, but may appear in
     -- pre-desugar contexts. Look up the operator as a function for return type.
     BinaryOp op l r ->
-        let l' = elaborateExpr env elabEnv l
-            r' = elaborateExpr env elabEnv r
-            retType = case lookupLambda op env of
+        let mLam = lookupLambda op env
+            (l', r') = elaborateOperands env elabEnv mLam l r
+            retType = case mLam of
                 Just lam -> resolveReturnType env lam [l', r']
                 Nothing  -> Nothing
         in wrapTyped (BinaryOp op l' r') retType
 
     -- NTuple: elaborate fields, produce record type if all fields are named+typed
     NTuple fields ->
-        let fields' = map (\(mn, e) -> (mn, elaborateExpr env elabEnv e)) fields
+        let fields' = map (\(mn, e) -> (mn, elaborateExpr env elabEnv Nothing e)) fields
             -- If all fields have names and types, create a RecordType
             namedTypes = [ (n, t) | (Just n, e) <- fields', Just t <- [typeOfExpr e] ]
             recType = if length namedTypes == length fields' && not (null fields')
@@ -235,11 +252,11 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- DeclBlock: elaborate members
     DeclBlock exprs ->
-        DeclBlock (map (elaborateExpr env elabEnv) exprs)
+        DeclBlock (map (elaborateExpr env elabEnv Nothing) exprs)
 
     -- Array literals: infer element type
     ArrayLit es ->
-        let es' = map (elaborateExpr env elabEnv) es
+        let es' = map (elaborateExpr env elabEnv Nothing) es
             elemType = case es' of
                 (e:_) -> typeOfExpr e
                 [] -> Nothing
@@ -248,7 +265,7 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- RecFieldAccess: elaborate inner, try to resolve field type from class/record
     RecFieldAccess ac@(fieldName, _) e ->
-        let e' = elaborateExpr env elabEnv e
+        let e' = elaborateExpr env elabEnv Nothing e
             -- Try to find field type from base expression's type (class fields)
             fieldType = case typeOfExpr e' of
                 Just (Id className) -> case lookupClass className env of
@@ -261,15 +278,15 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- ReprCast: elaborate inner
     ReprCast e t ->
-        Typed (ReprCast (elaborateExpr env elabEnv e) t) t
+        Typed (ReprCast (elaborateExpr env elabEnv Nothing e) t) t
 
     -- Instance: elaborate implementations
     Instance sn mTag ta impls reqs ->
-        Instance sn mTag ta (map (elaborateExpr env elabEnv) impls) reqs
+        Instance sn mTag ta (map (elaborateExpr env elabEnv Nothing) impls) reqs
 
     -- RecordConstruct: elaborate fields, look up constructor type
     RecordConstruct consName fields ->
-        let fields' = map (\(n, e) -> (n, elaborateExpr env elabEnv e)) fields
+        let fields' = map (\(n, e) -> (n, elaborateExpr env elabEnv Nothing e)) fields
             retType = case lookupConstructor consName env of
                 Just (consLam, _) ->
                     let args' = map snd fields'
@@ -280,31 +297,35 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- RecordUpdate: elaborate base and fields, preserve base type
     RecordUpdate e fields ->
-        let e' = elaborateExpr env elabEnv e
-            fields' = map (\(n, ex) -> (n, elaborateExpr env elabEnv ex)) fields
+        let e' = elaborateExpr env elabEnv Nothing e
+            fields' = map (\(n, ex) -> (n, elaborateExpr env elabEnv Nothing ex)) fields
         in wrapTyped (RecordUpdate e' fields') (typeOfExpr e')
 
     -- RecordPattern: elaborate fields
     RecordPattern nm fields ->
-        RecordPattern nm (map (\(n, e) -> (n, elaborateExpr env elabEnv e)) fields)
+        RecordPattern nm (map (\(n, e) -> (n, elaborateExpr env elabEnv Nothing e)) fields)
 
     -- HandleWith: elaborate both, result type is the computation's type
     HandleWith c h ->
-        let c' = elaborateExpr env elabEnv c
-            h' = elaborateExpr env elabEnv h
+        let c' = elaborateExpr env elabEnv Nothing c
+            h' = elaborateExpr env elabEnv Nothing h
         in wrapTyped (HandleWith c' h') (typeOfExpr c')
 
     -- UnaryOp: elaborate operand, look up operator
     UnaryOp op e ->
-        let e' = elaborateExpr env elabEnv e
-            retType = case lookupLambda op env of
+        let mLam = lookupLambda op env
+            paramType = case mLam of
+                Just lam -> getValParamType lam 0
+                Nothing  -> Nothing
+            e' = elaborateExpr env elabEnv (paramType >>= concreteType) e
+            retType = case mLam of
                 Just lam -> resolveReturnType env lam [e']
                 Nothing  -> Nothing
         in wrapTyped (UnaryOp op e') retType
 
     -- Statements: type is the last statement's type
     Statements stmts ->
-        let stmts' = map (elaborateExpr env elabEnv) stmts
+        let stmts' = map (elaborateExpr env elabEnv Nothing) stmts
             lastType = case reverse stmts' of
                 (s:_) -> typeOfExpr s
                 []    -> Nothing
@@ -312,14 +333,14 @@ elaborateExpr env elabEnv expr = case expr of
 
     -- PropEq: type is a PropEq type
     PropEq e1 e2 ->
-        let e1' = elaborateExpr env elabEnv e1
-            e2' = elaborateExpr env elabEnv e2
+        let e1' = elaborateExpr env elabEnv Nothing e1
+            e2' = elaborateExpr env elabEnv Nothing e2
         in PropEq e1' e2'
 
     -- Implies: elaborate both sides
     Implies e1 e2 ->
-        let e1' = elaborateExpr env elabEnv e1
-            e2' = elaborateExpr env elabEnv e2
+        let e1' = elaborateExpr env elabEnv Nothing e1
+            e2' = elaborateExpr env elabEnv Nothing e2
         in Implies e1' e2'
 
     -- Everything else: pass through
@@ -340,6 +361,37 @@ typeOfExpr _ = Nothing
 wrapTyped :: Expr -> Maybe Expr -> Expr
 wrapTyped e (Just t) = Typed e t
 wrapTyped e Nothing  = e
+
+-- | Wrap with Typed, using expected type as fallback when the inferred type
+-- is an unresolved type variable or missing.  This is the key mechanism for
+-- top-down type propagation: if bottom-up inference produced (Id "b") but the
+-- call site expects (Id "Nat"), use (Id "Nat").
+wrapTypedWithFallback :: Maybe Expr -> Expr -> Maybe Expr -> Expr
+wrapTypedWithFallback mExpected e mInferred =
+    case mInferred >>= validType of
+        Just t
+            | isUnresolvedTypeVar t
+            , Just expected <- mExpected >>= concreteType
+            -> Typed e expected
+            | otherwise -> Typed e t
+        Nothing
+            | Just expected <- mExpected >>= concreteType
+            -> Typed e expected
+            | otherwise -> wrapTyped e mInferred
+
+-- | Check if a type expression is an unresolved type variable (lowercase Id).
+-- These come from polymorphic function return types that couldn't be resolved
+-- bottom-up (e.g., convert(x:a):b where b is unresolved).
+isUnresolvedTypeVar :: Expr -> Bool
+isUnresolvedTypeVar (Id (c:_)) = c >= 'a' && c <= 'z'
+isUnresolvedTypeVar _ = False
+
+-- | Filter to only concrete types — not unresolved type variables.
+-- Used to avoid propagating unresolved vars as expected types.
+concreteType :: Expr -> Maybe Expr
+concreteType t
+    | isUnresolvedTypeVar t = Nothing
+    | otherwise = validType t
 
 -- | Check if an expression is a valid type expression (not a value form).
 -- Rejects UNDEFINED, Function/Lambda, PatternMatches, and other value-level forms
@@ -364,13 +416,50 @@ isUpperName :: Name -> Bool
 isUpperName [] = False
 isUpperName (c:_) = c >= 'A' && c <= 'Z'
 
+-- | Elaborate function arguments, propagating callee parameter types as
+-- expected types for each argument (top-down checking context).
+elaborateArgsWithCallee :: Environment -> ElabEnv -> Maybe Lambda -> [Expr] -> [Expr]
+elaborateArgsWithCallee env elabEnv mLam args =
+    [ elaborateExpr env elabEnv (expectedForArg i) arg
+    | (i, arg) <- zip [0..] args
+    ]
+  where
+    expectedForArg i = case mLam of
+        Just lam -> getValParamType lam i >>= concreteType
+        Nothing  -> Nothing
+
+-- | Elaborate binary operator operands with callee param type context.
+elaborateOperands :: Environment -> ElabEnv -> Maybe Lambda -> Expr -> Expr -> (Expr, Expr)
+elaborateOperands env elabEnv mLam l r =
+    let lExpected = case mLam of
+            Just lam -> getValParamType lam 0 >>= concreteType
+            Nothing  -> Nothing
+        rExpected = case mLam of
+            Just lam -> getValParamType lam 1 >>= concreteType
+            Nothing  -> Nothing
+    in (elaborateExpr env elabEnv lExpected l, elaborateExpr env elabEnv rExpected r)
+
+-- | Get the type of the i-th value parameter (skipping implicit params).
+getValParamType :: Lambda -> Int -> Maybe Expr
+getValParamType lam i =
+    let valParams = filter (not . isImplicitVar) (params lam)
+    in if i < length valParams
+       then case typ (valParams !! i) of
+           UNDEFINED -> Nothing
+           t         -> Just t
+       else Nothing
+
+-- | Look up a constructor's lambda for param type propagation.
+lookupConstructorLam :: Name -> Environment -> Maybe Lambda
+lookupConstructorLam n env = fmap fst (lookupConstructor n env)
+
 -- | Elaborate let-bindings sequentially, extending the env as we go.
 elaborateLetBinds :: Environment -> ElabEnv -> [(Var, Expr)] -> (ElabEnv, [(Var, Expr)])
 elaborateLetBinds env = go []
   where
     go acc elabEnv [] = (elabEnv, reverse acc)
     go acc elabEnv ((v, rhs):rest) =
-        let rhs' = elaborateExpr env elabEnv rhs
+        let rhs' = elaborateExpr env elabEnv Nothing rhs
             elabEnv' = case typeOfExpr rhs' of
                 Just t  -> Map.insert (name v) t elabEnv
                 Nothing -> case typ v of
@@ -381,14 +470,14 @@ elaborateLetBinds env = go []
 -- | Elaborate a pattern check expression.
 elaborateCheck :: Environment -> ElabEnv -> Expr -> Expr
 elaborateCheck env elabEnv (PatternGuard pc e) =
-    PatternGuard pc (elaborateExpr env elabEnv e)
+    PatternGuard pc (elaborateExpr env elabEnv Nothing e)
 elaborateCheck _ _ other = other
 
 -- | Elaborate action statements.
 elaborateActionStmt :: Environment -> ElabEnv -> ActionStmt -> ActionStmt
-elaborateActionStmt env elabEnv (ActionExpr e) = ActionExpr (elaborateExpr env elabEnv e)
-elaborateActionStmt env elabEnv (ActionBind n e) = ActionBind n (elaborateExpr env elabEnv e)
-elaborateActionStmt env elabEnv (ActionLet n e) = ActionLet n (elaborateExpr env elabEnv e)
+elaborateActionStmt env elabEnv (ActionExpr e) = ActionExpr (elaborateExpr env elabEnv Nothing e)
+elaborateActionStmt env elabEnv (ActionBind n e) = ActionBind n (elaborateExpr env elabEnv Nothing e)
+elaborateActionStmt env elabEnv (ActionLet n e) = ActionLet n (elaborateExpr env elabEnv Nothing e)
 
 -- ============================================================================
 -- Constructor Type Resolution

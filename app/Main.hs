@@ -87,7 +87,7 @@ processNew line = do
                     -- This gives mono type information for dispatch resolution in REPL expressions.
                     st <- get
                     let env = currentEnvironment st
-                        ex' = elaborateExpr env Map.empty ex
+                        ex' = elaborateExpr env Map.empty Nothing ex
                     result <- liftIO $ evalInteractive env st ex'
                     case result of
                         BCRunOK val -> liftIO $ putStrLn $ T.unpack (valToString val)

@@ -1,8 +1,18 @@
 // P24: Class Subtyping and Safe Downcast Tests
 
-// Reuse hierarchy from P20 (loaded before this file)
-// Animal(name:String, age:Int), Dog(breed:String) extends Animal,
-// Cat() extends Animal, Puppy(toy:String) extends Dog
+// Class hierarchy (self-contained — no dependency on P20)
+class Animal(name:String, age:Int) = {
+    function speak(self:Animal) : String = "...";
+};
+class Dog(breed:String) extends Animal = {
+    function speak(self:Dog) : String = "Woof!";
+};
+class Cat() extends Animal = {
+    function speak(self:Cat) : String = "Meow!";
+};
+class Puppy(toy:String) extends Dog = {
+    function speak(self:Puppy) : String = "Yap!";
+};
 
 // T1: Pass subclass to function expecting superclass (value-level polymorphism)
 function animalName(a:Animal) : String = a.name;

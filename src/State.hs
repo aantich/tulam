@@ -820,6 +820,25 @@ lookupLambda n env = Map.lookup n (topLambdas env)
 lookupConstructor :: Name -> Environment -> Maybe (Lambda, Int)
 lookupConstructor n env = Map.lookup n (constructors env)
 
+-- | Unified constructor lookup: checks both constructors map (sum types)
+-- AND classDecls (OOP classes). Class constructors are synthesized from ClassMeta
+-- to produce a compatible (Lambda, Int) result for pattern matching.
+-- This is the type-directed approach: classDecls is authoritative for class types.
+lookupAnyConstructor :: Name -> Environment -> Maybe (Lambda, Int)
+lookupAnyConstructor n env =
+    case lookupConstructor n env of
+        Just result -> Just result
+        Nothing -> case Map.lookup n (classDecls env) of
+            Just cm ->
+                let tag = cmTag cm
+                    fields = cmAllFields cm
+                    consLam = mkLambda n fields
+                                (ConTuple (ConsTag n tag)
+                                    (Prelude.map (\v -> Id (name v)) fields))
+                                (Id n)
+                in Just (consLam, tag)
+            Nothing -> Nothing
+
 lookupType :: Name -> Environment -> Maybe Expr
 lookupType n env = Map.lookup n (types env)
 

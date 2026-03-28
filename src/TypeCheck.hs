@@ -2393,10 +2393,68 @@ resolveMetasInExpr subst = resolveDeep
 toStageRBinder :: Var -> ElabBinder
 toStageRBinder v = ElabBinder (name v) (typ v) (binderInfoFromVar v)
 
+-- | Enrich a SemanticCall obligation's type args by resolving type variables
+-- against concrete argument types and the known return type.
+-- E.g., for toEnum(65) : Char, the obligation has oblTypeArgs = ["a"] (from Enum(a)).
+-- We match value params against actual args and return type to get {a -> Char},
+-- then substitute to produce oblTypeArgs = ["Char"].
+enrichCallKindTypeArgs :: Environment -> ElabCallKind -> [Expr] -> Expr -> ElabCallKind
+enrichCallKindTypeArgs env (SemanticCall obl@StructureObligation{}) args retTy =
+    let oblTAs = oblTypeArgs obl
+        -- Check if any oblTypeArgs are type variables (lowercase)
+        hasTypeVars = Prelude.any (\n -> not (Prelude.null n) && head n >= 'a' && head n <= 'z') oblTAs
+    in if not hasTypeVars then SemanticCall obl
+       else case lookupLambda (oblMethod obl) env of
+         Nothing -> SemanticCall obl
+         Just lam ->
+           let implParams = Prelude.filter isImplicitVar (params lam)
+               valParams = Prelude.filter (not . isImplicitVar) (params lam)
+               -- Build type-var substitution from matching value params against actual arg types
+               argBindings = Maybe.catMaybes
+                   [ case (exprToTypeNameR argExpr, safeIdx i valParams) of
+                       (Just tn, Just vp) -> matchTyVar (Prelude.map name implParams) (typ vp) tn
+                       _ -> Nothing
+                   | (i, argExpr) <- zip [0..] args
+                   ]
+               -- Also match return type against lambda return type
+               retBindings = case exprToTypeNameR retTy of
+                   Just rtn -> case matchTyVar (Prelude.map name implParams) (lamType lam) rtn of
+                       Just bs -> bs
+                       Nothing -> []
+                   Nothing -> []
+               tvSubst = Map.fromList (concat argBindings ++ retBindings)
+               -- Apply substitution to oblTypeArgs
+               enrichedTAs = Prelude.map (\ta -> Maybe.fromMaybe ta (Map.lookup ta tvSubst)) oblTAs
+           in SemanticCall (obl { oblTypeArgs = enrichedTAs })
+  where
+    safeIdx i xs = if i < length xs then Just (xs !! i) else Nothing
+    -- Match a param type against a concrete type name to extract a type variable binding.
+    matchTyVar tvNames (Id n) concrete
+        | n `elem` tvNames = Just [(n, concrete)]
+    matchTyVar tvNames (App (Id n) _) concrete
+        | n `elem` tvNames = Just [(n, concrete)]
+    matchTyVar _ _ _ = Nothing
+enrichCallKindTypeArgs _ ck _ _ = ck
+
 toStageRExpr :: Environment -> HashMap Name SemanticWitness -> Expr -> ElabExpr
 toStageRExpr env wmap expr = case expr of
   Typed e ty ->
     case e of
+      -- App inside Typed: propagate concrete return type directly into ECall retTy
+      -- so that the monomorphizer can use it for morphism dispatch and type resolution.
+      -- Also enrich obligation type args by resolving type variables against actual
+      -- arg types and the known return type.
+      App f args ->
+        let headR = toStageRExpr env wmap f
+            argRs = Prelude.map (\a -> ElabArg (toStageRExpr env wmap a) defaultExplicitBinderInfo) args
+            callKind0 = case calleeExprHead f of
+              Just fname ->
+                let mWitness = Map.lookup fname wmap
+                in callKindForHead env mWitness fname args UNDEFINED
+              Nothing -> DirectCall
+            -- Enrich obligation type args: resolve type variables using concrete arg/return types
+            callKind = enrichCallKindTypeArgs env callKind0 args ty
+        in ECall callKind headR argRs ty  -- ty instead of UNDEFINED
       RecFieldAccess fa base -> EAnn (EProject fa (toStageRExpr env wmap base) ty) ty
       IfThenElse c t f -> EAnn (EIf (toStageRExpr env wmap c) (toStageRExpr env wmap t) (toStageRExpr env wmap f) ty) ty
       CaseOf pats bodyExpr _ -> EAnn (ECase [ElabAlt [] (toStageRExpr env wmap bodyExpr)] ty) ty

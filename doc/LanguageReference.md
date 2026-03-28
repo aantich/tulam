@@ -1284,18 +1284,22 @@ The `[a:Type]` is an implicit parameter that gets resolved at compile time based
 
 ### Type-Directed Dispatch
 
-When a function's return type determines the correct dispatch (e.g., `toEnum(0) : Bool`), the argument types alone are insufficient. tulam uses **type-directed dispatch** to handle this:
+Instance dispatch is resolved at the **Surface AST level** during monomorphization (on-demand via CompileDriver), before CLM conversion. The monomorphizer uses three dispatch strategies:
 
-1. During CLM conversion (Pass 4), `maybeAddTypeHint` wraps the body of functions with concrete return types in a `CLMTYPED` annotation.
-2. The interpreter first attempts normal argument-based dispatch.
-3. If dispatch fails (function returned unevaluated), the return type hint is used as a fallback to find the correct intrinsic or instance.
-4. If dispatch succeeds but the result type doesn't match the declared return type, re-dispatch using the hint type is attempted.
+**1. Argument-type dispatch** (default): Infer concrete types from call-site arguments and look up the instance key. E.g., `(+)(x, y)` where `x : Int` dispatches to `"+\0Int"`.
+
+**2. Morphism dispatch** (multi-param): For morphisms like `Convertible(a, b)`, the instance key includes both source and target types. The return type (from the enclosing function's type annotation or a `Typed` wrapper) is appended to the argument types. E.g., `convert(Succ(Z)) : Int` dispatches to `"convert\0Nat\0Int"`.
+
+**3. Return-type dispatch**: When a function's implicit type parameter appears *only* in the return type (not in value parameters), the return type determines dispatch. The monomorphizer detects this via `dispatchesOnReturnType` analysis. E.g., `toEnum(0) : Bool` dispatches to `"toEnum\0Bool"` (not `"toEnum\0Int"`).
+
+**Lambda argument enrichment**: When a lambda with untyped parameters is passed to a higher-order function, the monomorphizer infers parameter types from the callee's signature. E.g., `flip(fn(x,y) = x - y, 10, 42)` — `flip`'s signature `(f: a -> b -> c, x: b, y: a)` combined with `10 : Int` and `42 : Int` enriches the lambda's `x` and `y` to `Int`, enabling `-` to resolve inside the lambda body.
 
 This enables patterns like:
 ```
-function testToEnumBool() : Bool = toEnum(0);       // → False
-function testToEnumOrd() : Ordering = toEnum(2);     // → GreaterThan
-function testFromEnumBool() : Int = fromEnum(True);  // → 1
+function testToEnumBool() : Bool = toEnum(0);            // → False
+function testToEnumOrd() : Ordering = toEnum(2);          // → GreaterThan
+function testConvert() : Int = convert(Succ(Succ(Z)));    // → 2
+function testFlip() : Int = flip(fn(x,y) = x - y, 10, 42); // → 32
 ```
 
 ---
@@ -2182,6 +2186,26 @@ Row types: `REmpty` (empty row), `RExtend` (label:type + rest), `RVar` (row vari
 ### Unification
 
 The type checker uses a HashMap-based substitution with occurs check. Unification resolves type variables by finding the most general substitution that makes two types equal. The occurs check prevents infinite types (e.g., `a = List(a)`).
+
+### Type Elaboration (Pass 3.2)
+
+After type checking (Pass 3) and type annotation (Pass 3.1), the **type elaboration** pass wraps sub-expressions with `Typed expr type` annotations that downstream passes can read without re-inferring types.
+
+Type elaboration uses **bidirectional propagation**:
+
+- **Bottom-up (inference)**: Literal types, variable types from the environment, constructor return types, function return types.
+- **Top-down (checking)**: When a function call like `f(g(x))` is elaborated and `f`'s parameter type is known, that type is passed as expected context to `g(x)`. If bottom-up inference produces an unresolved type variable (e.g., `b` from a polymorphic morphism), the expected type from the call site is used as a fallback.
+
+This top-down propagation is critical for **morphism dispatch**: `nat_to_int(convert(True))` needs `convert(True)` to know its return type is `Nat` (from `nat_to_int`'s parameter type), not `b` (the unresolved type variable from `convert`'s signature). Without this context, the monomorphizer would construct the wrong dispatch key.
+
+### Constructor Lookup
+
+Constructor lookup uses a **type-directed** approach. The `lookupAnyConstructor` helper checks both:
+
+1. **`constructors` map**: For sum-type constructors (e.g., `Just`, `Nothing`, `Cons`, `Nil`)
+2. **`classDecls` map**: For OOP class constructors (e.g., `Dog`, `Cat` from class declarations)
+
+This ensures pattern matching works for both sum types and class types, even when the `constructors` map is incomplete (e.g., during multi-module loading).
 
 ---
 
