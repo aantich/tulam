@@ -344,7 +344,22 @@ lowerExpr (CLMID name) = do
   mop <- lookupVar name
   case mop of
     Just op -> return op
-    Nothing -> return $ LVar name LTPtr  -- assume global function ref
+    Nothing -> do
+      -- Check if this is a known top-level function used as a value
+      -- (e.g., passed as argument to higher-order function).
+      -- If so, create a closure wrapper that adapts the calling convention:
+      -- closure dispatch calls funcptr(_cls, args...) but top-level functions
+      -- don't have _cls. We emit a small wrapper that forwards args without _cls.
+      fmap' <- getsS lsFuncMap
+      case Map.lookup name fmap' of
+        Just (llvmName, paramTys, retTy) -> do
+          wrapperName <- wrapTopLevelAsClosure llvmName paramTys retTy
+          -- Create closure: field 0 = funcptr to the wrapper
+          clsObj <- emitFresh "fncls_" LTPtr (LAllocInline closureTag 1)
+          fpAsI64 <- emitFresh "fnfp_" LTInt64 (LPtrToInt (LFuncRef wrapperName) LTInt64)
+          void $ emitFresh "_sfnfp_" LTVoid (LStore fpAsI64 clsObj 0)
+          return clsObj
+        Nothing -> return $ LVar name LTPtr  -- unknown global reference
 
 -- Phase N1: Ref operations — always inline as direct load/store.
 -- readRef/__readref(ref) → direct load i64 from pointer (no function call)
@@ -394,7 +409,8 @@ lowerExpr (CLMAPP (CLMID fn_) [arrExpr, idxExpr, valExpr])
   emitFresh "_mwr_" LTVoid (LGepStore coercedVal arrOp offsetOp LTInt64)
 
 -- Direct function application: CLMAPP (CLMID funcName) args
--- Resolution order: (1) declarative ExternMap, (2) legacy intrinsicToLIR, (3) function call
+-- Resolution order: (1) declarative ExternMap, (2) legacy intrinsicToLIR,
+-- (3) known top-level function, (4) local variable → closure dispatch
 lowerExpr (CLMAPP (CLMID funcName) args) = do
   extMap <- getsS lsExternMap
   case resolveExtern extMap funcName of
@@ -416,15 +432,29 @@ lowerExpr (CLMAPP (CLMID funcName) args) = do
         emitFresh "t_" (instrResultType instr) instr
 
       Nothing -> do
-        ops <- mapM lowerExpr args
         fmap' <- getsS lsFuncMap
-        let llvmName = "tulam_" ++ sanitizeName funcName
-            (_, expectedPtys, retTy) = case Map.lookup funcName fmap' of
-              Just info -> info
-              Nothing   -> (llvmName, map operandType ops, LTInt64)
-        -- Coerce arguments to match expected parameter types
-        coercedOps <- zipWithM coerceArg ops (expectedPtys ++ repeat LTInt64)
-        emitFresh "r_" retTy (LCall llvmName coercedOps retTy)
+        mLocalOp <- lookupVar funcName
+        case (Map.member funcName fmap', mLocalOp) of
+          -- Known top-level function: direct call
+          (True, _) -> do
+            ops <- mapM lowerExpr args
+            let llvmName = "tulam_" ++ sanitizeName funcName
+                (_, expectedPtys, retTy) = case Map.lookup funcName fmap' of
+                  Just info -> info
+                  Nothing   -> (llvmName, map operandType ops, LTInt64)
+            coercedOps <- zipWithM coerceArg ops (expectedPtys ++ repeat LTInt64)
+            emitFresh "r_" retTy (LCall llvmName coercedOps retTy)
+
+          -- Local variable (closure or function pointer): closure dispatch
+          (False, Just localOp) -> do
+            ops <- mapM lowerExpr args
+            dispatchClosure localOp ops
+
+          -- Unknown function: assume it's a global (legacy fallback)
+          (False, Nothing) -> do
+            ops <- mapM lowerExpr args
+            let llvmName = "tulam_" ++ sanitizeName funcName
+            emitFresh "r_" LTInt64 (LCall llvmName ops LTInt64)
 
 -- Immediately-applied lambda: beta-reduce (let bindings, if/then/else)
 -- CLMAPP (CLMLAM (CLMLam [vars] body)) [args] → bind vars=args, lower body
@@ -442,11 +472,11 @@ lowerExpr (CLMAPP (CLMLAM (CLMLamCases vars cases)) args) = do
   -- Lower cases as a chain of checks (same as lowerCaseChain but inline)
   lowerCaseExprChain cases
 
--- Application where func is not a simple name
+-- Application where func is not a simple name — closure dispatch
 lowerExpr (CLMAPP func args) = do
   funcOp <- lowerExpr func
   ops <- mapM lowerExpr args
-  emitFresh "r_" LTInt64 (LCallPtr funcOp ops LTInt64)
+  dispatchClosure funcOp ops
 
 -- Bool constructors: unboxed i1 values (no heap allocation)
 lowerExpr (CLMCON (ConsTag "True" _) [])  = return $ LLitBool True
@@ -552,17 +582,64 @@ lowerExpr (CLMLAM (CLMLamCases vars cases)) =
     liftLambda vars (CLMPROG cases)
 lowerExpr (CLMLAM clm)        = throwL $ "Unsupported CLMLam shape: " ++ take 200 (show clm)
 
--- Unsupported nodes
-lowerExpr (CLMIAP f args)     = throwL $ "CLMIAP not supported in Phase A.1 (needs monomorphization): " ++ take 200 (show f) ++ " applied to " ++ show (length args) ++ " args"
-lowerExpr (CLMPAP _ _)        = throwL "CLMPAP not supported in Phase A.1 (needs closures)"
-lowerExpr (CLMMCALL _ _ _)    = throwL "CLMMCALL not supported in Phase A.1"
-lowerExpr (CLMSCALL _ _ _)    = throwL "CLMSCALL not supported in Phase A.1"
-lowerExpr (CLMNEW _ _)        = throwL "CLMNEW not supported in Phase A.1"
-lowerExpr (CLMHANDLE _ _ _ _) = throwL "CLMHANDLE not supported in Phase A.1"
-lowerExpr (CLMREF _)          = throwL "CLMREF not supported in Phase A.1"
-lowerExpr (CLMMUTARRAY _)     = throwL "CLMMUTARRAY not supported in Phase A.1"
-lowerExpr (CLMARRAY _)        = throwL "CLMARRAY not supported in Phase A.1"
-lowerExpr CLMPRIMCALL         = throwL "Bare CLMPRIMCALL — should be wrapped in CLMAPP"
+-- Phase 2: Residual CLMIAP — should be mostly resolved by monomorphization.
+-- Fallback: treat as direct call or closure dispatch.
+lowerExpr (CLMIAP (CLMID name) []) = do
+  -- Zero-arg CLMIAP on a name: just read the variable (local or function ref)
+  mop <- lookupVar name
+  case mop of
+    Just op -> return op
+    Nothing -> return $ LVar name LTPtr
+lowerExpr (CLMIAP (CLMID name) args) = do
+  -- Delegate to the regular CLMAPP (CLMID name) path
+  lowerExpr (CLMAPP (CLMID name) args)
+lowerExpr (CLMIAP func args) = do
+  -- General: lower func, closure dispatch
+  funcOp <- lowerExpr func
+  ops <- mapM lowerExpr args
+  dispatchClosure funcOp ops
+
+-- Phase 6: Partial application — delegate to CLMAPP (bytecode does the same)
+lowerExpr (CLMPAP func args) = lowerExpr (CLMAPP func args)
+
+-- Phase 5: OOP classes (TODO: full implementation)
+lowerExpr (CLMMCALL _ _ _)    = throwL "CLMMCALL not yet supported (Phase 5)"
+lowerExpr (CLMSCALL _ _ _)    = throwL "CLMSCALL not yet supported (Phase 5)"
+lowerExpr (CLMNEW _ _)        = throwL "CLMNEW not yet supported (Phase 5)"
+
+-- Phase 4: Effect handlers — static binding (monomorphization resolved dispatch)
+lowerExpr (CLMHANDLE body _effName lets ops) = do
+  -- Bind ops (effect implementations) into scope
+  forM_ ops $ \(opName, impl) -> do
+    implOp <- lowerExpr impl
+    bindVar opName implOp
+  -- Bind lets into scope
+  forM_ lets $ \(letName, letExpr) -> do
+    letOp <- lowerExpr letExpr
+    bindVar letName letOp
+  -- Lower the body
+  lowerExpr body
+
+-- Phase 3: Opaque ref/mutarray handles — not expected after monomorphization
+lowerExpr (CLMREF _)          = return LLitNull
+lowerExpr (CLMMUTARRAY _)     = return LLitNull
+
+-- Phase 3: Array literals
+lowerExpr (CLMARRAY elems) = do
+  ops <- mapM lowerExpr elems
+  let n = length ops
+  -- Allocate mutable array via runtime: __newmutarray(size, 0)
+  arr <- emitFresh "arr_" LTPtr
+           (LCall "__newmutarray" [LLitInt (fromIntegral n) LTInt64, LLitInt 0 LTInt64] LTPtr)
+  -- Store each element (offset by 1 for length header)
+  forM_ (zip [0..] ops) $ \(i, op) -> do
+    coercedVal <- coerceToI64ForStore op
+    let idx = LLitInt (fromIntegral (i :: Int)) LTInt64
+    offsetOp <- emitFresh "aoff_" LTInt64 (LAdd idx (LLitInt 1 LTInt64))
+    void $ emitFresh "_as_" LTVoid (LGepStore coercedVal arr offsetOp LTInt64)
+  return arr
+
+lowerExpr CLMPRIMCALL         = return LLitNull  -- Bare primcall marker; should be resolved upstream
 
 -- ============================================================================
 -- Pattern check lowering
@@ -745,6 +822,11 @@ lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
   defLabel <- freshBlock "sw_default_"
   failLabel <- freshBlock "match_fail_"
 
+  -- When there's no default body, the switch default goes directly to the
+  -- failure block. The failure block will be emitted on `defLabel` (the current
+  -- block after all case bodies), so use that as the default target.
+  let defTarget = case mDefault of { Just _ -> defLabel; Nothing -> defLabel }
+
   -- Phase N3: Null guard — if any case matches a nullary-as-null tag,
   -- emit null check before LGetTag (which would segfault on null).
   nullSet <- getsS lsNullaryAsNull
@@ -755,7 +837,6 @@ lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
       -- No nullary-as-null tags: emit LGetTag + switch directly
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
       let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels ]
-          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
       sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
     ((nullTag, nullLabel):_) -> do
       -- Emit: if (scrut == null) goto nullBody else goto tagSwitch
@@ -766,7 +847,6 @@ lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
       let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels
                                                    , not (HSet.member tag nullSet) ]
-          defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
       sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
 
   -- Emit each body
@@ -1178,28 +1258,63 @@ inferParamType _ = LTInt64
 coerceArg :: LOperand -> LType -> LowerM LOperand
 coerceArg op expected
   | operandType op == expected = return op
-  | operandType op == LTInt64 && expected == LTPtr =
+  -- ptr ↔ i64
+  | (operandType op == LTInt64 || operandType op == LTWord64) && expected == LTPtr =
       emitFresh "i2p_" LTPtr (LIntToPtr op)
-  | operandType op == LTPtr && expected == LTInt64 =
-      emitFresh "p2i_" LTInt64 (LPtrToInt op LTInt64)
-  | operandType op == LTBool && expected == LTInt64 =
-      emitFresh "zext_" LTInt64 (LZext op LTInt64)
-  | operandType op == LTInt64 && expected == LTBool =
+  | operandType op == LTPtr && (expected == LTInt64 || expected == LTWord64) =
+      emitFresh "p2i_" expected (LPtrToInt op expected)
+  -- ptr → narrower int (ptrtoint to i64, then trunc if needed)
+  | operandType op == LTPtr && isIntType expected && expected /= LTInt64 && expected /= LTWord64 =
+      do wide <- emitFresh "p2i_" LTInt64 (LPtrToInt op LTInt64)
+         emitFresh "trunc_" expected (LTrunc wide expected)
+  -- narrow int → ptr (widen to i64, then inttoptr)
+  | isIntType (operandType op) && expected == LTPtr =
+      do wide <- emitFresh "widen_" LTInt64 (if isSignedType (operandType op)
+                                               then LSext op LTInt64
+                                               else LZext op LTInt64)
+         emitFresh "i2p_" LTPtr (LIntToPtr wide)
+  -- bool ↔ int
+  | operandType op == LTBool && isIntType expected =
+      emitFresh "zext_" expected (LZext op expected)
+  | isIntType (operandType op) && expected == LTBool =
       emitFresh "trunc_" LTBool (LTrunc op LTBool)
-  | operandType op == LTBool && expected == LTPtr =
-      -- Bool → i64 → ptr (two-step)
-      do ext <- emitFresh "zext_" LTInt64 (LZext op LTInt64)
-         emitFresh "i2p_" LTPtr (LIntToPtr ext)
+  -- int width conversions
+  | isIntType (operandType op) && isIntType expected =
+      let srcSize = typeSize (operandType op)
+          dstSize = typeSize expected
+      in if srcSize < dstSize
+         then emitFresh "widen_" expected (if isSignedType (operandType op)
+                                            then LSext op expected
+                                            else LZext op expected)
+         else if srcSize > dstSize
+         then emitFresh "narrow_" expected (LTrunc op expected)
+         else return op  -- same size, different signedness
+  -- float ↔ i64
   | operandType op == LTInt64 && expected == LTFloat64 =
       emitFresh "i2f_" LTFloat64 (LBitcast op LTFloat64)
   | operandType op == LTFloat64 && expected == LTInt64 =
       emitFresh "f2i_" LTInt64 (LBitcast op LTInt64)
-  | operandType op == LTFloat64 && expected == LTPtr =
+  -- float ↔ ptr (via i64 bitcast)
+  | isFloatType (operandType op) && expected == LTPtr =
       do bc <- emitFresh "f2i_" LTInt64 (LBitcast op LTInt64)
          emitFresh "i2p_" LTPtr (LIntToPtr bc)
   | operandType op == LTPtr && expected == LTFloat64 =
       do bc <- emitFresh "p2i_" LTInt64 (LPtrToInt op LTInt64)
          emitFresh "i2f_" LTFloat64 (LBitcast bc LTFloat64)
+  | operandType op == LTPtr && expected == LTFloat32 =
+      do bc <- emitFresh "p2i_" LTInt64 (LPtrToInt op LTInt64)
+         f64 <- emitFresh "i2f_" LTFloat64 (LBitcast bc LTFloat64)
+         emitFresh "ftrunc_" LTFloat32 (LFPTrunc f64 LTFloat32)
+  -- float width conversions
+  | operandType op == LTFloat32 && expected == LTFloat64 =
+      emitFresh "fext_" LTFloat64 (LFPExt op LTFloat64)
+  | operandType op == LTFloat64 && expected == LTFloat32 =
+      emitFresh "ftrunc_" LTFloat32 (LFPTrunc op LTFloat32)
+  -- int ↔ float (sitofp/fptosi)
+  | isIntType (operandType op) && isFloatType expected =
+      emitFresh "i2f_" expected (LSIToFP op expected)
+  | isFloatType (operandType op) && isIntType expected =
+      emitFresh "f2i_" expected (LFPToSI op expected)
   | otherwise = return op  -- trust the types match close enough
 
 -- | Coerce an operand to i64 for storing in a heap object field.
@@ -1221,6 +1336,58 @@ coerceToI64ForStore op = case operandType op of
     ext <- emitFresh "fext_" LTFloat64 (LFPExt op LTFloat64)
     emitFresh "f2i_" LTInt64 (LBitcast ext LTInt64)
   _         -> return op
+
+-- ============================================================================
+-- Top-level function → closure wrapper
+-- ============================================================================
+
+-- | Wrap a top-level function as a closure-compatible function.
+-- Top-level functions don't have _cls param, but closure dispatch calls
+-- funcptr(_cls, args...). This emits a thin wrapper:
+--   define retTy @wrapper(ptr %_cls, paramTy1 %a0, ...) {
+--     %r = call retTy @original(%a0, ...)
+--     ret retTy %r
+--   }
+-- Returns the wrapper's name.
+wrapTopLevelAsClosure :: Name -> [LType] -> LType -> LowerM Name
+wrapTopLevelAsClosure llvmName paramTys retTy = do
+  cnt <- getsS lsLiftedCount
+  prefix <- getsS lsGlobalPrefix
+  modifyS $ \s -> s { lsLiftedCount = cnt + 1 }
+  let wrapperName = "tulam_" ++ prefix ++ "wrap_" ++ show cnt
+      -- Wrapper params: _cls (ignored) + original params
+      wrapParams = ("_cls", LTPtr) : [("a" ++ show i, ty) | (i, ty) <- zip [(0::Int)..] paramTys]
+      -- Call the original function with just the real args
+      callArgs = [LVar ("a" ++ show i) ty | (i, ty) <- zip [(0::Int)..] paramTys]
+      callInstr = ("_wr", LCall llvmName callArgs retTy)
+      (term, instrs) = if retTy == LTVoid
+        then (LRetVoid, [callInstr])
+        else (LRet (LVar "_wr" retTy), [callInstr])
+      wrapFunc = LFunction wrapperName wrapParams retTy
+                   [LBlock "entry" instrs term] False ["alwaysinline"]
+  modifyS $ \s -> s { lsLiftedFuncs = wrapFunc : lsLiftedFuncs s }
+  return wrapperName
+
+-- ============================================================================
+-- Closure dispatch
+-- ============================================================================
+
+-- | Dispatch a call through a closure object.
+-- Closure layout: field 0 = funcptr (i64), fields 1..N = captures (loaded by callee).
+-- Convention: call funcptr(closure, arg1, arg2, ...)
+dispatchClosure :: LOperand -> [LOperand] -> LowerM LOperand
+dispatchClosure closureOp argOps = do
+  -- Coerce closure to ptr first (may be i64 if loaded from a field)
+  closurePtr <- coerceArg closureOp LTPtr
+  -- Load function pointer from field 0
+  fpRaw <- emitFresh "fp_raw_" LTInt64 (LLoad closurePtr 0 LTInt64)
+  -- Convert i64 → ptr (function pointer)
+  fpPtr <- emitFresh "fp_" LTPtr (LIntToPtr fpRaw)
+  -- Coerce all args to i64 for uniform calling convention
+  coercedArgs <- mapM coerceToI64ForStore argOps
+  -- Call: funcptr(closure, arg1, arg2, ...)
+  let allArgs = closurePtr : coercedArgs
+  emitFresh "r_cls_" LTInt64 (LCallPtr fpPtr allArgs LTInt64)
 
 -- ============================================================================
 -- Nullary-as-null detection (Phase 2)
@@ -1555,9 +1722,16 @@ freeVarsCLM (CLMLAM (CLMLamCases vars cases)) =
     HSet.difference (HSet.unions (map freeVarsCLM cases)) (HSet.fromList (map fst vars))
 freeVarsCLM _ = HSet.empty  -- conservative: other nodes treated as no free vars
 
--- | Lift a non-capturing lambda to a top-level function and return a function pointer.
--- For capturing lambdas, the captured values are passed as extra leading parameters
--- and a wrapper is emitted.
+-- | Closure tag: reserved tag for closure heap objects.
+closureTag :: Int
+closureTag = 65535
+
+-- | Lift a lambda to a top-level function and return a closure object.
+-- ALL lambda values use the closure convention:
+--   - Lifted function has _cls:ptr as first param (self-passing)
+--   - Captures are loaded from _cls fields 1..N inside the body
+--   - Closure object: tag=65535, field 0=funcptr, fields 1..N=captures
+-- At call sites, closure dispatch loads funcptr and calls with (closure, args...).
 liftLambda :: [CLMVar] -> CLMExpr -> LowerM LOperand
 liftLambda vars body = do
   -- Determine free variables (captures)
@@ -1584,12 +1758,14 @@ liftLambda vars body = do
   modifyS $ \s -> s { lsLiftedCount = cnt + 1 }
   let liftedName = "tulam_" ++ prefix ++ "lambda_" ++ show cnt
 
-  -- Build param list: captures first, then lambda params
-  let captureParams = [(n, operandType op) | (n, op) <- captureOps]
-      lamParams = [(fst v, LTInt64) | v <- vars]  -- default to i64 for lambda params
-      allParams = captureParams ++ lamParams
+  -- Build param list: _cls (self) first, then lambda params
+  -- Captures are NOT params — they're loaded from _cls inside the body.
+  let clsParam = ("_cls", LTPtr)
+      lamParams = [(fst v, LTInt64) | v <- vars]
+      allParams = clsParam : lamParams
 
   -- Lower the body in a fresh sub-lowering context
+  -- _cls and lambda params are in the initial env; captures will be loaded dynamically
   let bodyEnv = Map.fromList [(n, LVar n ty) | (n, ty) <- allParams]
   savedState <- getS
   let subState = emptyLowerState
@@ -1599,9 +1775,21 @@ liftLambda vars body = do
         , lsCurrentBlock = "entry"
         , lsGlobalPrefix = prefix ++ "lam" ++ show cnt ++ "_"
         , lsLiftedCount = lsLiftedCount savedState  -- share counter
+        , lsNullaryAsNull = lsNullaryAsNull savedState
         }
 
   result <- liftIO $ runLowerM subState $ do
+    -- Load captures from _cls (self) parameter: fields 1..N
+    forM_ (zip [1..] captureOps) $ \(i, (capName, capOp)) -> do
+      let capTy = operandType capOp
+      rawVal <- emitFresh ("cap_" ++ sanitizeName capName ++ "_")
+                  LTInt64 (LLoad (LVar "_cls" LTPtr) i LTInt64)
+      -- Coerce from i64 to the capture's original type
+      capVal <- if capTy == LTInt64 || capTy == LTWord64
+                then return rawVal
+                else coerceArg rawVal capTy
+      bindVar capName capVal
+
     resultOp <- lowerExpr body
     st <- getS
     let terminator = if operandType resultOp == LTVoid then LRetVoid else LRet resultOp
@@ -1622,15 +1810,22 @@ liftLambda vars body = do
         , lsLiftedCount = newCount
         }
 
-      -- If no captures, return a simple function pointer reference
-      if null captures
-        then return $ LVar liftedName (LTFunPtr (map snd lamParams) retTy)
-        else do
-          -- With captures: emit a call-site wrapper that partially applies captures
-          -- For now, error on true closures — we'd need PAP/closure objects
-          throwL $ "Closures with captures not yet supported: captures=" ++ show captures
+      -- Allocate closure object: field 0 = funcptr, fields 1..N = captures
+      let nFields = 1 + length captureOps  -- funcptr + captures
+      clsObj <- emitFresh "cls_" LTPtr (LAllocInline closureTag nFields)
+
+      -- Store function pointer in field 0 (ptrtoint @liftedName to i64)
+      fpAsI64 <- emitFresh "fp_" LTInt64 (LPtrToInt (LFuncRef liftedName) LTInt64)
+      void $ emitFresh "_sfp_" LTVoid (LStore fpAsI64 clsObj 0)
+
+      -- Store captured values in fields 1..N
+      forM_ (zip [1..] captureOps) $ \(i, (_capName, capOp)) -> do
+        val64 <- coerceToI64ForStore capOp
+        void $ emitFresh "_sc_" LTVoid (LStore val64 clsObj i)
+
+      return clsObj
   where
-    isPrefixOfStr prefix str = take (length prefix) str == prefix
+    isPrefixOfStr prefix' str = take (length prefix') str == prefix'
 
 -- ============================================================================
 -- Tail Call Optimization
@@ -1644,7 +1839,7 @@ optimizeTailCall :: [(Name, LInstr)] -> LOperand -> LType
 optimizeTailCall instrs retOp retTy =
     case (reverse instrs, retOp) of
         ((callName, LCall fn args callRetTy) : restRev, LVar varName _)
-            | callName == varName ->
+            | callName == varName && callRetTy == retTy ->
                 if callRetTy == LTVoid || retTy == LTVoid
                 then (reverse restRev, LTailCallVoid fn args)
                 else (reverse restRev, LTailCall fn args callRetTy)
@@ -1685,11 +1880,22 @@ optimizeTailCalls blocks =
                 _ -> [retName]
         findInBlock _ = []
 
+    -- Find the function-level return type from the first ret in any block
+    funcRetTy = case [ty | LBlock _ _ (LRet (LVar _ ty)) <- blocks] ++
+                     [ty | LBlock _ _ (LRet op) <- blocks, let ty = operandType op] of
+                  (ty:_) -> Just ty
+                  []     -> Nothing
+
+    -- Only promote to tail call if the call return type matches the function return type
+    typeMatches crt = case funcRetTy of
+      Nothing -> True
+      Just frt -> crt == frt
+
     -- Optimize a single block
     optimizeBlock :: HSet.HashSet Name -> LBlock -> LBlock
-    optimizeBlock _ block@(LBlock bname instrs (LRet (LVar retName _))) =
+    optimizeBlock _ block@(LBlock bname instrs (LRet (LVar retName _retTy'))) =
         case reverse instrs of
-            (cn, LCall fn args crt) : restRev | cn == retName ->
+            (cn, LCall fn args crt) : restRev | cn == retName && typeMatches crt ->
                 LBlock bname (reverse restRev) (LTailCall fn args crt)
             _ -> block
     optimizeBlock _ (LBlock bname instrs LRetVoid) =
@@ -1699,8 +1905,8 @@ optimizeTailCalls blocks =
             _ -> LBlock bname instrs LRetVoid
     optimizeBlock tailVars (LBlock bname instrs (LBr target)) =
         case reverse instrs of
-            -- Non-void call whose result flows to return
-            (cn, LCall fn args crt) : restRev | HSet.member cn tailVars ->
+            -- Non-void call whose result flows to return — check type compatibility
+            (cn, LCall fn args crt) : restRev | HSet.member cn tailVars && typeMatches crt ->
                 LBlock bname (reverse restRev) (LTailCall fn args crt)
             -- Void call as last instruction before branch to merge/trampoline
             (_, LCall fn args LTVoid) : restRev | mergesIntoVoidRet target ->

@@ -123,7 +123,8 @@ compileNative env state config funcNames = do
                             "LIR lowering error: " ++ err
                         Right funcsAndGlobals -> do
                             let (lirFuncLists, globalss) = unzip funcsAndGlobals
-                                lirFuncs = concat lirFuncLists
+                                lirFuncs = nubBy (\a b -> lfuncName a == lfuncName b)
+                                                 (concat lirFuncLists)
                                 -- Generate main() if entry point specified
                                 mainFunc = case ncEntryPoint config of
                                     Just ep -> [generateMain ep funcTypeMap]

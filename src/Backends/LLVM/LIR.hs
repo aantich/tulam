@@ -110,6 +110,7 @@ data LOperand
   | LLitBool Bool              -- ^ Boolean constant (i1)
   | LLitNull                   -- ^ Null pointer
   | LLitString Name String     -- ^ Reference to a global string constant (@name)
+  | LFuncRef Name              -- ^ Global function reference (@name), type = ptr
   deriving (Show, Eq)
 
 -- | Get the type of an operand.
@@ -120,6 +121,7 @@ operandType (LLitFloat _ ty)  = ty
 operandType (LLitBool _)      = LTBool
 operandType LLitNull          = LTPtr
 operandType (LLitString _ _)  = LTPtr
+operandType (LFuncRef _)      = LTPtr
 
 -- ============================================================================
 -- Instructions (A-normal form — one operation per instruction)

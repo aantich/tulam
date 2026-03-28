@@ -381,6 +381,7 @@ emitOperandBare LLitNull            = "null"
 emitOperandBare (LLitString name str) =
   let len = length str + 1  -- +1 for null terminator
   in "getelementptr inbounds ([" ++ show len ++ " x i8], ptr @" ++ name ++ ", i64 0, i64 0)"
+emitOperandBare (LFuncRef name) = "@" ++ name
 
 -- | Show a double in LLVM IR format (hex for exact representation).
 showLLVMDouble :: Double -> String
