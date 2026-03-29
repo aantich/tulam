@@ -21,6 +21,62 @@ The project uses Stack with Hpack (`package.yaml` generates `tulam.cabal`). Edit
 
 Once in the REPL: `:load <file>`, `:list types`, `:list functions`, `:env`, `:all`, `:clm`, `:quit`.
 
+### Bytecode VM commands
+- `:bc run <func>` — Compile to bytecode and run (e.g., `:bc run main`)
+- `:bc show <func>` — Show compiled bytecode
+
+### Native LLVM commands
+- `:compile native <func>` — Compile to native binary via LLVM (output: `/tmp/tulam_native`)
+
+## Testing
+
+### Unit tests (Haskell hspec)
+```bash
+stack test                     # 533 tests: TC, parser, pipeline, BC, LLVM
+```
+
+### Multi-backend correctness test
+```bash
+./tests/run_backends.sh        # Runs BCTest_Core.tl on both backends
+                                # Expected: 120 PASS / 0 FAIL on BOTH
+```
+Tests 27 sections: arithmetic, floats, comparison, conditionals, let, pattern matching, Maybe, recursion, lists, HOF/closures, show, strings, chars, bitwise, abs/signum, enum, named fields, nested patterns, Either, Pair, Nat, Ordering, combinators, morphisms, float comparison, trees, NonEmpty.
+
+### AWFY benchmarks (Are We Fast Yet)
+```bash
+./tests/run_awfy.sh            # Runs 8 AWFY benchmarks on both backends
+                                # Self-timed via clockNanos, excludes startup
+```
+Benchmarks: Sieve, Queens, Bounce, Permute, Storage, Towers, List, Mandelbrot.
+
+### Custom performance benchmarks
+```bash
+./tests/bench_backends.sh [N]  # N iterations (default 3), startup-subtracted
+```
+Benchmarks: arithmetic loops, fibonacci, list ops, closures, tree traversal, Nat recursion, string ops.
+
+### Individual test programs (39 programs, P01-P38 + BCTest_Core)
+```bash
+# Bytecode:
+printf ':load tests/programs/P20_Classes.tl\n:bc run main\n:quit\n' | stack exec tulam --
+
+# Native:
+printf ':load tests/programs/P20_Classes.tl\n:compile native main\n:quit\n' | stack exec tulam --
+/tmp/tulam_native
+```
+
+### Test file locations
+| Path | Content |
+|------|---------|
+| `test/Spec.hs` | Haskell unit tests (hspec) |
+| `tests/programs/BCTest_Core.tl` | 120 assertions across 27 sections |
+| `tests/programs/P01-P38_*.tl` | Individual feature test programs |
+| `tests/awfy/AWFY_*.tl` | Are-We-Fast-Yet benchmark ports |
+| `tests/benchmarks/B01-B05_*.tl` | Micro-benchmarks |
+| `tests/run_backends.sh` | Multi-backend correctness runner |
+| `tests/run_awfy.sh` | AWFY benchmark comparison runner |
+| `tests/bench_backends.sh` | Custom perf benchmark runner |
+
 ## Architecture
 
 ### Compilation Pipeline
@@ -60,6 +116,9 @@ Source (.tl) → Lexer/Parser → Surface AST (Expr/Lambda)
 | `src/Logs.hs` | Error handling with source location tracking. |
 | `src/MetadataResolver.hs` | Stub interface for codegen-time extern class metadata resolution (.NET/JS/native). No-op in interpreter. |
 | `src/Backends/Bytecode/` | Bytecode VM: `Value.hs` (tagged union values), `Instruction.hs` (opcode set + encode/decode), `Compile.hs` (CLM→bytecode compiler), `VM.hs` (register-based execution engine with TCO), `Module.hs` (bytecode module type), `Debug.hs` (disassembler + stack traces). |
+| `src/Backends/LLVM/` | Native LLVM backend: `LIR.hs` (low-level IR), `CLMToLIR.hs` (CLM→LIR lowering with closures, pattern matching, effect handlers), `LIRToLLVM.hs` (LIR→LLVM IR text emission), `NativeCompile.hs` (orchestration: CompileDriver→CLM→LIR→LLVM→clang++). 120/120 BCTest_Core parity with bytecode VM. ~400-3000x faster than bytecode. |
+| `runtime/LLVM/` | C++ runtime for native backend: `tlm_runtime.cpp` (arena allocator, string ops, printing, mutable refs/arrays, clock), `tlm_object.hpp` (heap object layout: 8-byte header + fields). |
+| `lib/Backend/LLVM/Native.tl` | Native backend stdlib: algebra instances mapping to LLVM inline ops and C runtime calls. Effect handlers for Console, FileIO, Ref, MutArray, Clock. |
 | `app/Main.hs` | REPL loop (Haskeline), file loading, interactive command dispatch. |
 
 ### Monad Stack

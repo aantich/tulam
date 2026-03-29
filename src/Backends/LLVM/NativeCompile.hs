@@ -17,23 +17,21 @@ module Backends.LLVM.NativeCompile
 import qualified Data.HashMap.Strict as Map
 import qualified Data.HashSet as HSet
 import Data.Maybe (fromMaybe)
-import Data.List (nubBy)
+import Data.List (nubBy, foldl')
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
 import System.Directory (doesFileExist)
 
-import Surface (Name, Lambda(..), Var(..), Expr(..), hasImplicit)
+import Surface (Name, Lambda(..), Var(..), Expr(..))
 import State (Environment(..), InterpreterState(..), lookupLambda, MonomorphLevel(..), CurrentFlags(..))
 import Pipeline (lambdaToCLMLambda)
 import CompileDriver (CompilationPlan(..), buildCompilationPlan)
 import Backends.LLVM.LIR
-import qualified Data.HashSet as HSet
 import CLM (CLMLam(..), CLMExpr(..))
 import Backends.LLVM.CLMToLIR (lowerFunction, buildExternMap,
                                 surfaceTypeToLType, surfaceRetTypeToLType,
                                 ExternMap, externDeclarations,
-                                sanitizeName, LowerError(..),
-                                collectConTags)
+                                sanitizeName, LowerError(..))
 import Backends.LLVM.LIRToLLVM (emitModule, addRuntimeExterns)
 
 -- | Compilation result.
@@ -97,17 +95,14 @@ compileNative env state config funcNames = do
                                  , surfaceRetTypeToLType (lamType lam)
                                  )) | (n, lam) <- Map.toList compilable]
 
-                    -- Detect nullary-as-null tags globally (Phase N3).
-                    -- Must collect ALL nullary/non-nullary tags globally first,
-                    -- then take the difference. Same tag integer can be nullary
-                    -- in one type (e.g., Nil=tag0) and non-nullary in another.
-                    let allClmBodies = [case clm of
-                            CLMLam _ b      -> b
-                            CLMLamCases _ cs -> CLMPROG cs
-                            | (_, clm) <- Map.toList clmFuncs]
-                        (nullaryRaw, nonNullary) = mconcat
-                            [collectConTags e | e <- allClmBodies]
-                        globalNullary = HSet.difference nullaryRaw nonNullary
+                    -- Detect nullary-as-null tags using type-aware analysis.
+                    -- A constructor is null-eligible only if:
+                    --   1. It's nullary (no fields)
+                    --   2. Its type has at least one NON-nullary constructor
+                    --   3. It's the ONLY nullary constructor in its type
+                    -- This prevents pure-enum types (Color3, Ordering) from
+                    -- having all constructors as null (indistinguishable).
+                    let globalNullary = computeNullaryAsNull env
 
                     -- Step 5: Lower CLM → LIR (with per-function error reporting)
                     results <- mapM (\(n, clm) -> do
@@ -143,6 +138,39 @@ compileNative env state config funcNames = do
                             if ncEmitIR config
                                 then return $ CompileIR llvmIR
                                 else compileWithClang config llvmIR
+
+-- | Compute nullary-as-null tags using type-aware analysis from Environment.
+-- Groups constructors by their type name, then determines which (if any)
+-- nullary constructors can be safely represented as null pointers.
+computeNullaryAsNull :: Environment -> HSet.HashSet Name
+computeNullaryAsNull env =
+    let -- Group constructors by type name
+        allCons = Map.toList (constructors env)
+        -- Extract: (typeName, consName, tag, isNullary) for each constructor
+        consInfo = [(getTypeName (lamType lam), cname, tag, null (filter (not . isImplicitVar) (params lam)))
+                   | (cname, (lam, tag)) <- allCons]
+        -- Group by type name
+        byType = foldl' (\acc (tyName, cname, _tag, isNull) ->
+                    Map.insertWith (++) tyName [(cname, isNull)] acc)
+                  Map.empty consInfo
+        -- For each type: find null-eligible constructor names
+        nullNames = concatMap findNullCons (Map.elems byType)
+    in HSet.fromList nullNames
+  where
+    -- Extract the base type name from a return type expression
+    getTypeName (Id name) = name
+    getTypeName (App (Id name) _) = name  -- parameterized: Maybe(a) → "Maybe"
+    getTypeName (App f _) = getTypeName f  -- nested app
+    getTypeName other = show other  -- fallback
+
+    -- Find at most one null-eligible constructor name for a type
+    findNullCons :: [(Name, Bool)] -> [Name]
+    findNullCons consList =
+        let nullary = [cname | (cname, True) <- consList]
+            nonNullary = [cname | (cname, False) <- consList]
+        in case (nullary, nonNullary) of
+            ([singleNull], _:_) -> [singleNull]  -- exactly 1 nullary + at least 1 non-nullary
+            _                   -> []              -- all nullary, or multiple nullary, or none
 
 -- | Invoke clang++ to compile LLVM IR + runtime to native binary.
 compileWithClang :: NativeConfig -> String -> IO CompileResult

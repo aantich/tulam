@@ -698,9 +698,14 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
         case lookupLambdaRep ElabLambdaRep fn env <|> lookupLambda fn env of
             Just lam ->
                 let implParams = filter isImplicitVar (params lam)
-                    valParams = filter (not . isImplicitVar) (params lam)
-                    valParamTypeVars = concatMap (collectLowercaseIds . typ) valParams
-                    retTypeVars = collectLowercaseIds (lamType lam)
+                    -- Collect ALL value params, including those in nested Function bodies
+                    -- (implicit-param functions store val params in a nested lambda:
+                    --  Lambda [a:Type] (Function (Lambda [x:a, y:a] body)))
+                    allValParams = collectAllValParams lam
+                    valParamTypeVars = concatMap (collectLowercaseIds . typ) allValParams
+                    -- The actual return type is the innermost lambda's return type
+                    innerRetType = innermostRetType lam
+                    retTypeVars = collectLowercaseIds innerRetType
                     retOnlyVars = filter (\tv -> tv `elem` map name implParams && tv `notElem` valParamTypeVars) retTypeVars
                     result = not (null retOnlyVars)
                 in result
@@ -709,8 +714,27 @@ resolveImplicitCalls debug monoLevel env tInstances handlerOps typeEnv mLamRet =
         collectLowercaseIds (Id n) | not (null n) && head n >= 'a' && head n <= 'z' = [n]
         collectLowercaseIds (App f as) = concatMap collectLowercaseIds (f : as)
         collectLowercaseIds (Pi _ a b) = collectLowercaseIds a ++ collectLowercaseIds b
-        collectLowercaseIds (Function lam) = collectLowercaseIds (lamType lam)
+        collectLowercaseIds (Function lam') = collectLowercaseIds (lamType lam')
         collectLowercaseIds _ = []
+
+        -- Collect all non-implicit params from a lambda and its nested Function bodies
+        collectAllValParams lam' =
+            let valHere = filter (not . isImplicitVar) (params lam')
+            in case unwrapBody (body lam') of
+                Function innerLam -> valHere ++ collectAllValParams innerLam
+                _ -> valHere
+
+        -- Get the innermost return type (unwrap nested Function bodies)
+        innermostRetType lam' =
+            case unwrapBody (body lam') of
+                Function innerLam -> innermostRetType innerLam
+                _ -> lamType lam'
+
+        -- Unwrap wrappers (Typed, PatternMatches, ExpandedCase) to find Function body
+        unwrapBody (Typed e _) = unwrapBody e
+        unwrapBody (PatternMatches [e]) = unwrapBody e
+        unwrapBody (ExpandedCase _ e _) = unwrapBody e
+        unwrapBody e = e
 
     -- | Wrap a resolved expression with the function's return type if determinable.
     -- After target instance substitution, the result may not carry type info.

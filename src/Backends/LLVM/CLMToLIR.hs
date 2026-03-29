@@ -19,7 +19,6 @@ module Backends.LLVM.CLMToLIR
   , surfaceRetTypeToLType
   , externDeclarations
   , detectNullaryAsNull
-  , collectConTags
   ) where
 
 import qualified Data.HashMap.Strict as Map
@@ -207,7 +206,7 @@ data LowerState = LowerState
   , lsLiftedFuncs   :: [LFunction]           -- Lambda-lifted anonymous functions
   , lsLiftedCount   :: !Int                  -- Counter for unique lifted function names
   , lsSingletonMap  :: HashMap Int Name      -- Zero-field constructor tag → global name
-  , lsNullaryAsNull :: HSet.HashSet Int     -- Tags represented as null pointers (Phase 2)
+  , lsNullaryAsNull :: HSet.HashSet Name   -- Constructor names represented as null pointers
   , lsAllocaRefs   :: HSet.HashSet Name    -- Ref variables eligible for alloca (Phase N1)
   , lsBodyUseCounts :: HashMap Name Int    -- Whole-body variable use counts (Phase N5)
   , lsFuncParams   :: HSet.HashSet Name   -- Function parameter names (Phase N5: don't free params)
@@ -485,9 +484,9 @@ lowerExpr (CLMCON (ConsTag "False" _) []) = return $ LLitBool False
 -- Nullary constructor: use null pointer (Phase 2 optimization)
 -- Null is safe because arena never returns null (exits on OOM).
 -- Singletons are kept as fallback for pure enum types where all constructors are nullary.
-lowerExpr (CLMCON (ConsTag _cname tag) []) = do
+lowerExpr (CLMCON (ConsTag cname tag) []) = do
   nullSet <- getsS lsNullaryAsNull
-  if HSet.member tag nullSet
+  if HSet.member cname nullSet
     then return LLitNull
     else do
       -- Allocate every time. Singleton optimization is unsound in SSA because
@@ -654,7 +653,7 @@ lowerPatternChecks (c:cs) = do
   emitFresh "chk_" LTBool (LAnd first rest)
 
 lowerOneCheck :: CLMPatternCheck -> LowerM LOperand
-lowerOneCheck (CLMCheckTag (ConsTag _ tagVal) scrutExpr) = do
+lowerOneCheck (CLMCheckTag (ConsTag consName tagVal) scrutExpr) = do
   scrut <- lowerExpr scrutExpr
   case operandType scrut of
     -- Bool is unboxed i1: True=tag0 maps to i1=1, False=tag1 maps to i1=0
@@ -666,7 +665,7 @@ lowerOneCheck (CLMCheckTag (ConsTag _ tagVal) scrutExpr) = do
     _ -> do
       nullSet <- getsS lsNullaryAsNull
       scrutPtr <- coerceArg scrut LTPtr
-      if HSet.member tagVal nullSet
+      if HSet.member consName nullSet
         then
           -- Phase N3: This tag is represented as null — check with icmp eq null
           emitFresh "eq_" LTBool (LIsNull scrutPtr)
@@ -709,7 +708,7 @@ lowerOneCheck (CLMCheckLit lit scrutExpr) = do
 -- Pass Map.empty to use only the legacy intrinsicToLIR mapping.
 lowerFunction :: Name -> CLMLam -> HashMap Name (Name, [LType], LType)
               -> ExternMap
-              -> HSet.HashSet Int    -- ^ Nullary tags represented as null (from compilation plan)
+              -> HSet.HashSet Name   -- ^ Constructor names represented as null (from compilation plan)
               -> IO (Either LowerError ([LFunction], [LGlobal]))
 lowerFunction name clmLam funcMap extMap nullaryTags = do
   let llvmName = "tulam_" ++ sanitizeName name
@@ -773,9 +772,9 @@ lowerFunction name clmLam funcMap extMap nullaryTags = do
       in return $ Right (mainFunc : lifted, globals)
 
 -- | Try to extract a simple tag-switch pattern from case arms.
--- Returns (scrutinee name, [(tag, body)], Maybe defaultBody) if all arms
+-- Returns (scrutinee name, [((tag, consName), body)], Maybe defaultBody) if all arms
 -- are single CLMCheckTag checks on the same CLMID scrutinee.
-extractTagSwitch :: [CLMExpr] -> Maybe (Name, [(Int, CLMExpr)], Maybe CLMExpr)
+extractTagSwitch :: [CLMExpr] -> Maybe (Name, [((Int, Name), CLMExpr)], Maybe CLMExpr)
 extractTagSwitch cases = go cases [] Nothing
   where
     go [] tagBodies defBody = case tagBodies of
@@ -784,10 +783,10 @@ extractTagSwitch cases = go cases [] Nothing
     go (CLMCASE [] body : rest) tagBodies _ =
       -- Default arm (no checks) — must be last or near-last
       go rest tagBodies (Just body)
-    go (CLMCASE [CLMCheckTag (ConsTag _ tag) (CLMID scrut)] body : rest) tagBodies defBody =
+    go (CLMCASE [CLMCheckTag (ConsTag cn tag) (CLMID scrut)] body : rest) tagBodies defBody =
       case tagBodies of
-        [] -> go rest ((scrut, (tag, body)) : tagBodies) defBody
-        ((s, _) : _) | s == scrut -> go rest ((scrut, (tag, body)) : tagBodies) defBody
+        [] -> go rest ((scrut, ((tag, cn), body)) : tagBodies) defBody
+        ((s, _) : _) | s == scrut -> go rest ((scrut, ((tag, cn), body)) : tagBodies) defBody
         _ -> Nothing  -- different scrutinees
     go _ _ _ = Nothing  -- non-simple pattern
 
@@ -807,7 +806,7 @@ lowerCaseChain cases retTy' =
     Nothing -> lowerCaseChainLinear cases retTy'
 
 -- | Switch-based case chain (return version: each arm returns).
-lowerTagSwitchRet :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> LType -> [CLMExpr] -> LowerM ([LBlock], [LGlobal])
+lowerTagSwitchRet :: Name -> [((Int, Name), CLMExpr)] -> Maybe CLMExpr -> LType -> [CLMExpr] -> LowerM ([LBlock], [LGlobal])
 lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
   -- Lower the scrutinee
   mScrutOp <- lookupVar scrutName
@@ -827,31 +826,31 @@ lowerTagSwitchRet scrutName tagCases mDefault retTy' originalCases = do
   -- block after all case bodies), so use that as the default target.
   let defTarget = case mDefault of { Just _ -> defLabel; Nothing -> defLabel }
 
-  -- Phase N3: Null guard — if any case matches a nullary-as-null tag,
+  -- Phase N3: Null guard — if any case matches a nullary-as-null constructor,
   -- emit null check before LGetTag (which would segfault on null).
   nullSet <- getsS lsNullaryAsNull
-  let nullCases = [(tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels
-                               , HSet.member tag nullSet]
+  let nullCases = [(tag, lbl) | (((tag, cn), _), lbl) <- zip tagCases bodyLabels
+                               , HSet.member cn nullSet]
   case nullCases of
     [] -> do
       -- No nullary-as-null tags: emit LGetTag + switch directly
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
-      let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels ]
+      let switchCases = [ (fromIntegral tag, lbl) | (((tag, _), _), lbl) <- zip tagCases bodyLabels ]
       sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
     ((nullTag, nullLabel):_) -> do
       -- Emit: if (scrut == null) goto nullBody else goto tagSwitch
       isNull <- emitFresh "isnull_" LTBool (LIsNull scrutPtr)
-      tagSwitchLabel <- freshBlock "sw_tag_"
+      tagSwitchLabel <- freshBlock "swtag_"
       sealBlock (LCondBr isNull nullLabel tagSwitchLabel) tagSwitchLabel
       -- Now emit the tag switch for non-null cases
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
-      let switchCases = [ (fromIntegral tag, lbl) | ((tag, _), lbl) <- zip tagCases bodyLabels
-                                                   , not (HSet.member tag nullSet) ]
+      let switchCases = [ (fromIntegral tag, lbl) | (((tag, cn), _), lbl) <- zip tagCases bodyLabels
+                                                   , not (HSet.member cn nullSet) ]
       sealBlock (LSwitch tagOp defTarget switchCases) (head bodyLabels)
 
   -- Emit each body
   let nextTargets = tail bodyLabels ++ [defLabel]
-  forM_ (zip3 tagCases bodyLabels nextTargets) $ \((_tag, body), _bodyLabel, nextLabel) -> do
+  forM_ (zip3 tagCases bodyLabels nextTargets) $ \(((_tag, _cn), body), _bodyLabel, nextLabel) -> do
     savedEnv <- getsS lsEnv
     resultOp <- lowerExpr body
     coercedOp <- coerceArg resultOp retTy'
@@ -948,7 +947,7 @@ lowerCaseExprChain cases =
     Nothing -> lowerCaseExprChainLinear cases
 
 -- | Switch-based case chain (expression version: produces phi).
-lowerTagSwitchExpr :: Name -> [(Int, CLMExpr)] -> Maybe CLMExpr -> [CLMExpr] -> LowerM LOperand
+lowerTagSwitchExpr :: Name -> [((Int, Name), CLMExpr)] -> Maybe CLMExpr -> [CLMExpr] -> LowerM LOperand
 lowerTagSwitchExpr scrutName tagCases mDefault originalCases = do
   mergeLabel <- freshBlock "sw_merge_"
   failLabel  <- freshBlock "sw_fail_"
@@ -967,30 +966,30 @@ lowerTagSwitchExpr scrutName tagCases mDefault originalCases = do
     return (bd, trmp)
   defLabel <- freshBlock "sw_def_"
 
-  -- Phase N3: Null guard for nullary-as-null tags
+  -- Phase N3: Null guard for nullary-as-null constructors
   nullSet <- getsS lsNullaryAsNull
-  let nullCases = [(tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels
-                                   , HSet.member tag nullSet]
+  let nullCases = [(tag, fst lbl) | (((tag, cn), _), lbl) <- zip tagCases labels
+                                   , HSet.member cn nullSet]
   case nullCases of
     [] -> do
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
-      let switchCases = [ (fromIntegral tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels ]
+      let switchCases = [ (fromIntegral tag, fst lbl) | (((tag, _), _), lbl) <- zip tagCases labels ]
           defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
       sealBlock (LSwitch tagOp defTarget switchCases) (fst (head labels))
     ((_, nullLabel):_) -> do
       isNull <- emitFresh "isnull_" LTBool (LIsNull scrutPtr)
-      tagSwitchLabel <- freshBlock "sw_tag_"
+      tagSwitchLabel <- freshBlock "swtag_"
       sealBlock (LCondBr isNull nullLabel tagSwitchLabel) tagSwitchLabel
       tagOp <- emitFresh "sw_tag_" LTInt16 (LGetTag scrutPtr)
-      let switchCases = [ (fromIntegral tag, fst lbl) | ((tag, _), lbl) <- zip tagCases labels
-                                                       , not (HSet.member tag nullSet) ]
+      let switchCases = [ (fromIntegral tag, fst lbl) | (((tag, cn), _), lbl) <- zip tagCases labels
+                                                       , not (HSet.member cn nullSet) ]
           defTarget = case mDefault of { Just _ -> defLabel; Nothing -> failLabel }
       sealBlock (LSwitch tagOp defTarget switchCases) (fst (head labels))
 
   -- Emit each body → trampoline
   let nextBlocks = map fst (tail labels) ++ [defLabel]
   bodyResults <- forM (zip3 tagCases labels nextBlocks) $
-    \((_tag, body), (_bdLabel, trmpLabel), nextBlock) -> do
+    \(((_tag, _cn), body), (_bdLabel, trmpLabel), nextBlock) -> do
       savedEnv <- getsS lsEnv
       resultOp <- lowerExpr body
       modifyS $ \s -> s { lsEnv = savedEnv }
@@ -1140,19 +1139,9 @@ lowerModule modName clmLams clmInsts requested extMap = do
         | null requested = Map.toList clmLams
         | otherwise = [(n, lam) | (n, lam) <- Map.toList allFuncs, n `elem` requested]
 
-  -- Detect nullary-as-null tags globally across ALL functions (Phase N3).
-  -- Must use allFuncs (not just toCompile) because toCompile may be a subset
-  -- but all functions share the same tag namespace.
-  -- Collect ALL nullary and non-nullary tag sets globally first, THEN take
-  -- the difference. Per-function difference followed by union is wrong because
-  -- different types can reuse the same tag integer (e.g., EQ=tag1 nullary,
-  -- Cons=tag1 non-nullary).
-  let allBodies = [case lam of CLMLam _ b -> b; CLMLamCases _ cs -> CLMPROG cs
-                  | (_, lam) <- Map.toList allFuncs]
-      (globalNullaryRaw, globalNonNullary) = mconcat (map collectConTags (concatMap flattenCLM allBodies))
-      globalNullary = HSet.difference globalNullaryRaw globalNonNullary
-      flattenCLM (CLMPROG es) = es
-      flattenCLM e = [e]
+  -- Nullary-as-null disabled in lowerModule (used by unit tests).
+  -- Full null optimization is computed in NativeCompile.hs with access to Environment.
+  let globalNullary = HSet.empty :: HSet.HashSet Name
   results <- mapM (\(n, lam) -> lowerFunction n lam funcMap extMap globalNullary) toCompile
 
   case sequence results of

@@ -181,6 +181,73 @@ extern "C" const char* __show_bool(int64_t val) {
     return val ? "True" : "False";
 }
 
+extern "C" const char* __show_char(int32_t c) {
+    char buf[16];
+    if (c == '\n')      std::snprintf(buf, sizeof(buf), "'\\n'");
+    else if (c == '\t') std::snprintf(buf, sizeof(buf), "'\\t'");
+    else if (c == '\r') std::snprintf(buf, sizeof(buf), "'\\r'");
+    else if (c == '\\') std::snprintf(buf, sizeof(buf), "'\\\\'" );
+    else if (c == '\'') std::snprintf(buf, sizeof(buf), "'\\''" );
+    else if (c >= 32 && c < 127) std::snprintf(buf, sizeof(buf), "'%c'", static_cast<char>(c));
+    else std::snprintf(buf, sizeof(buf), "'\\x%X'", static_cast<unsigned>(c));
+    return strdup(buf);
+}
+
+extern "C" const char* __string_show(const char* s) {
+    size_t len = std::strlen(s);
+    char* result = static_cast<char*>(std::malloc(len + 3)); // " + s + " + \0
+    result[0] = '"';
+    std::memcpy(result + 1, s, len);
+    result[len + 1] = '"';
+    result[len + 2] = '\0';
+    return result;
+}
+
+// ---- String comparison & query ----
+
+extern "C" int64_t __string_length(const char* s) {
+    return static_cast<int64_t>(std::strlen(s));
+}
+
+extern "C" int64_t __string_eq(const char* a, const char* b) {
+    return std::strcmp(a, b) == 0 ? 1 : 0;
+}
+
+extern "C" int64_t __string_neq(const char* a, const char* b) {
+    return std::strcmp(a, b) != 0 ? 1 : 0;
+}
+
+extern "C" int64_t __string_lt(const char* a, const char* b) {
+    return std::strcmp(a, b) < 0 ? 1 : 0;
+}
+
+extern "C" int64_t __string_le(const char* a, const char* b) {
+    return std::strcmp(a, b) <= 0 ? 1 : 0;
+}
+
+extern "C" int64_t __string_gt(const char* a, const char* b) {
+    return std::strcmp(a, b) > 0 ? 1 : 0;
+}
+
+extern "C" int64_t __string_ge(const char* a, const char* b) {
+    return std::strcmp(a, b) >= 0 ? 1 : 0;
+}
+
+extern "C" void* __string_compare(const char* a, const char* b) {
+    int cmp = std::strcmp(a, b);
+    // Return an allocated Ordering ADT object: tag 0=LessThan, 1=Equal, 2=GreaterThan
+    int tag = cmp < 0 ? 0 : (cmp == 0 ? 1 : 2);
+    auto* obj = tlm_alloc(static_cast<uint16_t>(tag), 0);
+    return obj;
+}
+
+// ---- Char operations ----
+
+extern "C" int32_t __char_succ(int32_t c) { return c + 1; }
+extern "C" int32_t __char_pred(int32_t c) { return c - 1; }
+extern "C" int32_t __int_to_char(int64_t i) { return static_cast<int32_t>(i); }
+extern "C" int64_t __char_to_int(int32_t c) { return static_cast<int64_t>(c); }
+
 // ---- Mutable arrays (i64 arrays for Phase A.1) ----
 
 extern "C" int64_t* __newmutarray(int64_t size, int64_t initVal) {

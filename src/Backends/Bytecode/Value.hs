@@ -354,8 +354,8 @@ mulFloatW a b
 divFloatW :: Word64 -> Word64 -> Maybe Word64
 divFloatW a b
     | isFloatW a && isFloatW b =
-        let y = getFloatW b
-        in if y == 0.0 then Nothing else Just (mkFloatW (getFloatW a / y))
+        -- IEEE 754: x/0.0 = ±Infinity, 0.0/0.0 = NaN — all valid
+        Just (mkFloatW (getFloatW a / getFloatW b))
     | otherwise = Nothing
 
 {-# INLINE negFloatW #-}

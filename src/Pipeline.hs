@@ -515,8 +515,10 @@ processBinding (Instance structName mTag typeArgs impls reqs, si) env = do
                     pure env
         [Intrinsic] -> do
             -- Intrinsic instance: generate placeholder lambdas for functions WITHOUT defaults.
-            -- Functions with default bodies (e.g., ⊕(x,y) = combine(x,y)) are handled by
-            -- propagateDefaults which substitutes concrete types into the default body.
+            -- Functions with default bodies (e.g., ⊕(x,y) = combine(x,y), /(x,y) = x * recip(y))
+            -- are handled by propagateDefaults which substitutes concrete types into the default body.
+            -- The defaults chain will eventually bottom out at intrinsic-registered functions
+            -- (e.g., inverse, combine, empty) which the bytecode VM executes via its intrinsic registry.
             case lookupType structName env of
                 Just (Structure structLam _) -> case body structLam of
                     DeclBlock exs -> do
@@ -530,7 +532,7 @@ processBinding (Instance structName mTag typeArgs impls reqs, si) env = do
                                 addInstanceLambda fn typeNames mTag
                                     (mkLambda fn [] Intrinsic UNDEFINED) e
                                 ) env noDefaultFuncs
-                        -- Propagate defaults for functions WITH default bodies (⊕, <>, etc.)
+                        -- Propagate defaults for functions WITH default bodies (⊕, <>, /, recip, etc.)
                         env'a <- propagateDefaultsWithTag typeNames mTag env' structName
                         env'' <- propagateToParent env'a structName typeNames intrinsicImpls si
                         pure env''
@@ -880,9 +882,13 @@ propagateDefaultsWithTag typeNames mTag env1 parentName = do
                 -- Functions with defaults: name -> (lambda, set of algebra functions referenced in default body)
                 let withDefaults = [(n, l, Set.fromList (Prelude.filter (`Set.member` allFuncNames) (collectIdRefs (body l))))
                                    | (n, l) <- allFuncs, body l /= UNDEFINED]
-                -- Start with functions already provided by the instance
-                let provided = Set.fromList [n | (n, _) <- allFuncs,
-                                             not (isNothing (lookupInstanceLambda n typeNames mTag env1))]
+                -- Start with functions already provided by the instance.
+                -- Check both the exact tag AND any tagged version — a function like
+                -- `recip` may be registered as `recip\0Float64\0@Multiplicative` while
+                -- we're propagating defaults for an untagged `Floating(Float64)`.
+                let isProvided n = not (isNothing (lookupInstanceLambda n typeNames mTag env1))
+                                || not (isNothing (lookupInstanceLambdaAnyTag n typeNames env1))
+                let provided = Set.fromList [n | (n, _) <- allFuncs, isProvided n]
                 -- Fixpoint: repeatedly resolve defaults whose deps are all provided
                 let (finalProvided, resolvedDefaults) = fixpointResolve provided withDefaults
                 -- Register resolved defaults with type params substituted

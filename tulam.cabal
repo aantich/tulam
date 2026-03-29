@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           tulam
-version:        0.9.10
+version:        0.9.11
 description:    Please see the README on GitHub at <https://github.com/githubuser/fool#readme>
 homepage:       https://github.com/githubuser/fool#readme
 bug-reports:    https://github.com/githubuser/fool/issues
