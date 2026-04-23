@@ -27,6 +27,8 @@ import Pipeline (installDefaultHandlers)
 import TypeElaborate (elaborateExpr, elaborateLambda, typeOfExpr)
 import LLVMSpec (llvmTests)
 import BytecodeSpec (bytecodeTests)
+import ElabCore (ElabExpr(..), ElabLambda(..), ElabBinder(..), countESurface, findStageRHoles)
+import ElabMetadata (defaultExplicitBinderInfo)
 -- Helper: load all modules from lib/ into state, return the state
 setupEnv :: IO InterpreterState
 setupEnv = do
@@ -43,11 +45,14 @@ runFresh :: IntState a -> IO a
 runFresh act = runIntState act emptyIntState
 
 -- Helper: run an IntState action and return collected warning messages
+-- Collects both errors and warnings. Previously only warnings were collected,
+-- but after T1.2 the structural safety passes emit errors by default; tests
+-- that exercised "detection" regardless of severity need to see both channels.
 runAndGetWarnings :: InterpreterState -> IntState () -> IO [String]
 runAndGetWarnings s act = do
     logSt <- execStateT (evalStateT act s) initLogState
     let allMsgs = Prelude.foldr (:) [] (logs logSt)
-    let msgs = [message (payload m) | m <- allMsgs, level m == LogWarning]
+    let msgs = [message (payload m) | m <- allMsgs, level m == LogWarning || level m == LogError]
     return msgs
 
 -- Helper: make a minimal InterpreterState with given env
@@ -349,6 +354,24 @@ main = do
                     case result of
                         Right _ -> pure ()
                         Left errs -> expectationFailure $ "Unexpected error: " ++ show errs
+
+                -- T2.9: extracting a field from a pure meta row binds that
+                -- meta to RowExtend l t r' AND emits CRowLack l r'. Later
+                -- unifying r' with a row that contains l again is a duplicate
+                -- and resolveConstraints must surface an error.
+                it "T2.9: CRowLack detects duplicate field on extracted tail" $ do
+                    -- Start with meta ?0 as the row. rowExtract "x" ?0 binds
+                    -- ?0 to RowExtend "x" ?1 ?2 and queues CRowLack "x" ?2.
+                    let st1 = st0 { nextMeta = 1 }
+                        step1 = rowExtract "x" (Meta 0)
+                    let Right ((_, tailTy), st2) = runTC step1 env0 st1
+                    -- Bind the fresh tail to a row containing "x" again.
+                    let step2 = unify tailTy (RowExtend "x" (Id "Bool") RowEmpty)
+                                  `tcBind` \_ -> resolveConstraints
+                    let result2 = runTC step2 env0 st2
+                    case result2 of
+                      Left _           -> pure ()
+                      Right (_, stEnd) -> tcErrors stEnd `shouldSatisfy` (not . Prelude.null)
 
             describe "Bidirectional checking" $ do
                 it "infers literal Int type" $ do
@@ -722,6 +745,112 @@ main = do
             -- ============================================================
             -- Step 1: tcWarnOrFail + tcMode
             -- ============================================================
+            -- T2.10: orphan-instance helper — find which module declared a name.
+            describe "T2.10 moduleDeclaring (orphan check helper)" $ do
+                it "finds name in its declaring module" $ do
+                    let mA = emptyModuleEnv { publicNames = Set.fromList ["Eq", "Ord"] }
+                        mB = emptyModuleEnv { publicNames = Set.fromList ["Nat", "List"] }
+                        mods = Map.fromList [("A", mA), ("B", mB)]
+                    moduleDeclaring "Eq" mods `shouldBe` Just "A"
+                    moduleDeclaring "Nat" mods `shouldBe` Just "B"
+
+                it "returns Nothing for unknown name" $ do
+                    let mA = emptyModuleEnv { publicNames = Set.fromList ["Eq"] }
+                        mods = Map.fromList [("A", mA)]
+                    moduleDeclaring "Ord" mods `shouldBe` Nothing
+
+            -- T2.7: universe cumulativity via subtype + fresh level name
+            -- infrastructure (counter, generator) are in place for future full
+            -- level-polymorphism work.
+            describe "T2.7 level infrastructure + cumulativity" $ do
+                it "U 0 is a subtype of U 1 (cumulativity)" $ do
+                    let result = runTC (subtype (U (LConst 0)) (U (LConst 1))) env0 st0
+                    case result of
+                        Right _   -> pure ()
+                        Left errs -> expectationFailure $ "Expected cumulativity: " ++ show errs
+
+                it "U 1 is not a subtype of U 0 (cumulativity direction)" $ do
+                    let result = runTC (subtype (U (LConst 1)) (U (LConst 0))) env0 st0
+                    case result of
+                        Left _  -> pure ()
+                        Right _ -> expectationFailure "U 1 should not subsume U 0"
+
+                it "freshLevelName generates unique names" $ do
+                    let result = runTC
+                          (freshLevelName `tcBind` \a ->
+                             freshLevelName `tcBind` \b -> tcPure (a, b))
+                          env0 st0
+                    case result of
+                        Right ((a, b), _) -> a `shouldNotBe` b
+                        Left errs -> expectationFailure $ show errs
+
+            -- T1.5: Stage-R hole counting. Known-bad and known-good ElabExprs.
+            describe "T1.5 countESurface (Stage-R coverage)" $ do
+                it "returns 0 for fully-elaborated expression" $ do
+                    countESurface (ELit (LInt 1)) `shouldBe` 0
+
+                it "counts ESurface at top level" $ do
+                    countESurface (ESurface (Id "foo")) `shouldBe` 1
+
+                it "counts ESurface inside ELam body" $ do
+                    let b = ElabBinder "x" (Id "Int") defaultExplicitBinderInfo
+                        body' = ESurface (Id "unresolved")
+                    countESurface (ELam [b] body' (Id "Int")) `shouldBe` 1
+
+                it "findStageRHoles reports per-lambda counts" $ do
+                    let b = ElabBinder "x" (Id "Int") defaultExplicitBinderInfo
+                        good = ElabLambda "gf" [b] (EGlobal "x") (Id "Int")
+                                 (mkLambda "gf" [] (Id "x") (Id "Int"))
+                        bad  = ElabLambda "bf" [b] (ESurface (Id "x")) (Id "Int")
+                                 (mkLambda "bf" [] (Id "x") (Id "Int"))
+                    findStageRHoles [("gf", good), ("bf", bad)] `shouldBe` [("bf", 1)]
+
+            -- T1.4: countCLMIAP surfaces residual implicit-param dispatch.
+            describe "T1.4 countCLMIAP (residual dispatch detection)" $ do
+                it "returns 0 for CLM without CLMIAP" $ do
+                    countCLMIAP (CLMAPP (CLMID "f") [CLMLIT (LInt 1)]) `shouldBe` 0
+
+                it "counts a single top-level CLMIAP" $ do
+                    countCLMIAP (CLMIAP (CLMID "show") [CLMID "x"]) `shouldBe` 1
+
+                it "counts nested CLMIAP inside CLMAPP" $ do
+                    let e = CLMAPP (CLMID "map") [CLMIAP (CLMID "show") [CLMID "y"], CLMID "xs"]
+                    countCLMIAP e `shouldBe` 1
+
+                it "counts CLMIAP inside lambda body" $ do
+                    let e = CLMLAM (CLMLam [("x", CLMEMPTY)]
+                                  (CLMIAP (CLMID "plus") [CLMID "x", CLMID "x"]))
+                    countCLMIAP e `shouldBe` 1
+
+                it "findResidualCLMIAP reports per-lambda counts" $ do
+                    let good = CLMLam [("x", CLMEMPTY)] (CLMID "x")
+                        bad  = CLMLam [("y", CLMEMPTY)]
+                                 (CLMIAP (CLMID "show") [CLMID "y"])
+                        lams = Map.fromList [("goodF", good), ("badF", bad)]
+                    findResidualCLMIAP lams `shouldBe` [("badF", 1)]
+
+            -- T1.3: verify findResidualMetas surfaces escaped metas. Given a
+            -- lambda whose parameter type is a raw Meta n with no substitution,
+            -- the residual scan must find it.
+            describe "T1.3 ground types at TC exit" $ do
+                it "findResidualMetas reports unresolved metas in lambda types" $ do
+                    let lam = mkLambda "f" [Var "x" (Meta 42) UNDEFINED] (Id "x") (Id "Int")
+                        env = initialEnvironment {
+                            topLambdas = Map.fromList [("f", lam)]
+                          }
+                        residuals = findResidualMetas env
+                    residuals `shouldSatisfy` (not . Prelude.null)
+                    case residuals of
+                        (_, metas) : _ -> metas `shouldSatisfy` elem "?t42"
+                        []             -> expectationFailure "expected at least one residual"
+
+                it "findResidualMetas returns empty for fully-typed env" $ do
+                    let lam = mkLambda "g" [Var "x" (Id "Int") UNDEFINED] (Id "x") (Id "Int")
+                        env = initialEnvironment {
+                            topLambdas = Map.fromList [("g", lam)]
+                          }
+                    findResidualMetas env `shouldBe` []
+
             describe "tcWarnOrFail and strict mode" $ do
                 it "strict mode fails fatally on type mismatch" $ do
                     let stStrict = initTCState TCStrict
@@ -735,6 +864,36 @@ main = do
                     case result of
                         Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
                         Left _ -> expectationFailure "Relaxed mode should warn, not fail"
+
+            -- T1.1 regression: tcHardWarn used to ignore strict mode. After the fix
+            -- it must halt in TCStrict (same semantics as tcWarnOrFail) but still
+            -- accumulate in TCRelaxed (so errors surface in permissive mode too).
+            describe "tcHardWarn respects strict mode (T1.1)" $ do
+                it "non-function application on concrete type halts in strict mode" $ do
+                    let stStrict = initTCState TCStrict
+                        badApp = App (Lit (LInt 5)) [Lit (LInt 6)]
+                    let result = runTC (infer badApp) env0 stStrict
+                    case result of
+                        Left _  -> pure ()
+                        Right _ -> expectationFailure "Strict mode should fail on Int applied as function"
+
+                it "non-function application on concrete type accumulates in relaxed mode" $ do
+                    let badApp = App (Lit (LInt 5)) [Lit (LInt 6)]
+                    let result = runTC (infer badApp) env0 st0
+                    case result of
+                        Right (_, st') -> tcErrors st' `shouldSatisfy` (not . null)
+                        Left _         -> pure ()  -- halting is also acceptable
+
+                it "branch type mismatch in pattern match halts in strict mode" $ do
+                    -- Two CaseOf branches with inconsistent return types: Int vs String
+                    let stStrict = initTCState TCStrict
+                        b1 = CaseOf [] (Lit (LInt 1)) SourceInteractive
+                        b2 = CaseOf [] (Lit (LString "two")) SourceInteractive
+                        pm = PatternMatches [b1, b2]
+                    let result = runTC (infer pm) env0 stStrict
+                    case result of
+                        Left _  -> pure ()
+                        Right _ -> expectationFailure "Strict mode should halt on branch type mismatch"
 
             -- ============================================================
             -- Step 2: Catch-all warnings
@@ -2569,6 +2728,35 @@ main = do
                 Prelude.length warnings `shouldBe` 1
                 Prelude.head warnings `shouldSatisfy` isInfixOf "positivity"
 
+            -- T1.2 regression: PolicyError must bump tcErrorCount so the
+            -- pipeline halt check picks it up; PolicyWarn must NOT bump it.
+            it "T1.2: PolicyError on positivity failure bumps tcErrorCount" $ do
+                let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
+                    env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
+                    s0 = mkStateWithEnv env
+                    s  = s0 { currentFlags = (currentFlags s0) { safePositivity = PolicyError } }
+                finalSt <- evalStateT (execStateT positivityCheckPass s) initLogState
+                tcErrorCount finalSt `shouldSatisfy` (> 0)
+
+            it "T1.2: PolicyWarn on positivity failure does NOT bump tcErrorCount" $ do
+                let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
+                    env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
+                    s0 = mkStateWithEnv env
+                    s  = s0 { currentFlags = (currentFlags s0) { safePositivity = PolicyWarn } }
+                finalSt <- evalStateT (execStateT positivityCheckPass s) initLogState
+                tcErrorCount finalSt `shouldBe` 0
+
+            it "T1.2: PolicyOff skips the pass entirely" $ do
+                let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
+                    badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
+                    env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
+                    s0 = mkStateWithEnv env
+                    s  = s0 { currentFlags = (currentFlags s0) { safePositivity = PolicyOff } }
+                warnings <- runAndGetWarnings s positivityCheckPass
+                warnings `shouldBe` []
+
             it "no warning for type in function codomain (positive)" $ do
                 -- type F = MkF(Int -> F) -- F only in positive position (result)
                 let mkFCon = mkLambda "MkF" [Var "f" (Pi Nothing (Id "Int") (Id "F")) UNDEFINED] (Tuple [Id "f"]) (Id "F")
@@ -2595,7 +2783,7 @@ main = do
                 let mkBadCon = mkLambda "MkBad" [Var "f" (Pi Nothing (Id "Bad") (Id "Int")) UNDEFINED] (Tuple [Id "f"]) (Id "Bad")
                     badType = SumType (mkLambda "Bad" [] (Constructors [mkBadCon]) (U (LConst 0)))
                     env = initialEnvironment { types = Map.fromList [("Bad", badType)] }
-                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkPositivity = False } }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { safePositivity = PolicyOff } }
                 warnings <- runAndGetWarnings s positivityCheckPass
                 warnings `shouldBe` []
 
@@ -2651,7 +2839,7 @@ main = do
                 let lam = mkLambda "loop" [Var "x" (Id "Int") UNDEFINED]
                             (App (Id "loop") [Id "x"]) (Id "Int")
                     env = initialEnvironment { topLambdas = Map.fromList [("loop", lam)] }
-                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkTermination = False } }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { safeTermination = PolicyOff } }
                 warnings <- runAndGetWarnings s terminationCheckPass
                 warnings `shouldBe` []
 
@@ -2788,7 +2976,7 @@ main = do
                         ],
                         topLambdas = Map.fromList [("f", lam)]
                     }
-                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { checkCoverage = False } }
+                    s = (mkStateWithEnv env) { currentFlags = (currentFlags (mkStateWithEnv env)) { safeCoverage = PolicyOff } }
                 warnings <- runAndGetWarnings s coverageCheckPass
                 warnings `shouldBe` []
 

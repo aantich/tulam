@@ -21,12 +21,13 @@ import qualified Data.Text.Lazy as TL
 
 import Surface
 import Pipeline
-import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass)
+import CaseOptimization (caseOptimizationPass, checkSealedExhaustiveness, terminationCheckPass, positivityCheckPass, coverageCheckPass)
 import TypeCheck (typeCheckPass, typeAnnotatePass)
 import TypeElaborate (elaborateExpr)
 import TypeElaborate (typeElaboratePass)
 -- addBinding, traceExpr, installDefaultHandlers are in Pipeline (imported unqualified)
 import CLM (pprSummary)
+import ElabCore (findStageRHoles)
 import Backends.Bytecode.Runner (runBytecode, evalInteractive, compileToBytecode, BytecodeResult(..))
 import Logs (SourceInfo(..) )
 import Util.PrettyPrinting as TC
@@ -446,6 +447,24 @@ processCommand (":bc":"disasm":args) = disasmBytecodeCmd args
 processCommand (":bc":_) = liftIO $ putStrLn "Usage: :bc run <funcName> | :bc disasm <funcName>"
 processCommand (":inspect":name:_) = inspectName name
 processCommand (":inspect":_) = liftIO $ putStrLn "Usage: :inspect <name>"
+
+-- T1.5 diagnostic: list lambdas whose Stage-R body still has ESurface fallback
+-- nodes. A lambda with count > 0 means the Surface-level monomorphizer must
+-- cover part of that lambda; Stage-R-only lowering isn't possible yet. When
+-- the total reaches 0, the Surface path can be retired.
+processCommand (":stage-r-holes":_) = do
+    env <- gets currentEnvironment
+    let holes = findStageRHoles (Map.toList (topLambdasR env))
+              ++ findStageRHoles (Map.toList (instanceLambdasR env))
+    case holes of
+      [] -> liftIO $ putStrLn "No Stage-R fallbacks (ESurface nodes): Stage-R-only lowering is feasible."
+      _  -> do
+        let total = sum (Prelude.map snd holes)
+        liftIO $ putStrLn $ "Total ESurface nodes: " ++ show total
+             ++ " across " ++ show (Prelude.length holes) ++ " lambdas."
+        liftIO $ mapM_ (\(n, c) -> putStrLn $ "  " ++ n ++ ": " ++ show c) (Prelude.take 30 holes)
+        when (Prelude.length holes > 30) $
+          liftIO $ putStrLn $ "  ... (" ++ show (Prelude.length holes - 30) ++ " more)"
 processCommand (":list":"types":"-d":_) = do
     liftIO $ putStrLn "\n--------------- TYPES ----------------"
     types <- get >>= \s -> pure ( (types . currentEnvironment) s)
@@ -705,33 +724,34 @@ processSet "warnings" ("off":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { showWarnings = False } })
     liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "warnings off"
 
-processSet "positivity" ("on":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkPositivity = True} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "positivity checking on"
-processSet "positivity" ("off":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkPositivity = False} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "positivity checking off"
+processSet "positivity" (arg:_) = setSafetyPolicyCmd "positivity" arg (\p fs -> fs { safePositivity = p })
+processSet "termination" (arg:_) = setSafetyPolicyCmd "termination" arg (\p fs -> fs { safeTermination = p })
+processSet "coverage"    (arg:_) = setSafetyPolicyCmd "coverage"    arg (\p fs -> fs { safeCoverage = p })
+processSet "purity"      (arg:_) = setSafetyPolicyCmd "purity"      arg (\p fs -> fs { safePurity = p })
+processSet "orphan"      (arg:_) = setSafetyPolicyCmd "orphan"      arg (\p fs -> fs { safeOrphan = p })
 
-processSet "termination" ("on":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkTermination = True} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "termination checking on"
-processSet "termination" ("off":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkTermination = False} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "termination checking off"
+-- New unified command: :s safety <key> error|warn|off
+processSet "safety" (key:arg:_) = case key of
+    "positivity"  -> setSafetyPolicyCmd "positivity"  arg (\p fs -> fs { safePositivity = p })
+    "termination" -> setSafetyPolicyCmd "termination" arg (\p fs -> fs { safeTermination = p })
+    "coverage"    -> setSafetyPolicyCmd "coverage"    arg (\p fs -> fs { safeCoverage = p })
+    "purity"      -> setSafetyPolicyCmd "purity"      arg (\p fs -> fs { safePurity = p })
+    "orphan"      -> setSafetyPolicyCmd "orphan"      arg (\p fs -> fs { safeOrphan = p })
+    _             -> liftIO $ putStrLn $ "unknown safety key: " ++ key ++ " (positivity|termination|coverage|purity|orphan)"
 
-processSet "coverage" ("on":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = True} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking on"
-processSet "coverage" ("off":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkCoverage = False} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "coverage checking off"
+processSet "residual-dispatch" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { failOnResidualDispatch = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "fail-on-residual-dispatch on"
+processSet "residual-dispatch" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { failOnResidualDispatch = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "fail-on-residual-dispatch off"
 
-processSet "purity" ("on":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkPurity = True} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "purity checking on" ++ " (effect ops outside action blocks will warn)"
-processSet "purity" ("off":_) = do
-    modify (\st -> st { currentFlags = (currentFlags st) { checkPurity = False} } )
-    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "purity checking off"
+processSet "allow-unresolved-metas" ("on":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { allowUnresolvedMetas = True } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "allow-unresolved-metas on"
+processSet "allow-unresolved-metas" ("off":_) = do
+    modify (\st -> st { currentFlags = (currentFlags st) { allowUnresolvedMetas = False } })
+    liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] "allow-unresolved-metas off"
 
 processSet "stricttypes" ("on":_) = do
     modify (\st -> st { currentFlags = (currentFlags st) { strictTypes = True } })
@@ -818,6 +838,25 @@ processSet s xs | take 4 s == "opt:" = do
         _         -> liftIO $ putStrLn $ "Usage: :s opt:" ++ passNm ++ " on/off"
 
 processSet _ _ = liftIO $ putStrLn "Unknown :set command. Type :h[elp] to show available list."
+
+-- | Parse a SafetyPolicy argument from REPL. Accepts error|warn|off, plus
+-- on (→error) and off (→off) for back-compat with the old Bool-style flags.
+parseSafetyArg :: String -> Maybe SafetyPolicy
+parseSafetyArg s = case s of
+    "error" -> Just PolicyError
+    "warn"  -> Just PolicyWarn
+    "off"   -> Just PolicyOff
+    "on"    -> Just PolicyError
+    _       -> Nothing
+
+-- | Apply a safety-policy setter to CurrentFlags, parsing the argument string.
+setSafetyPolicyCmd :: String -> String -> (SafetyPolicy -> CurrentFlags -> CurrentFlags) -> IntState ()
+setSafetyPolicyCmd label arg setter = case parseSafetyArg arg of
+    Just p -> do
+        modify (\st -> st { currentFlags = setter p (currentFlags st) })
+        liftIO $ putStrLn $ "Set " ++ TC.as [TC.bold] (label ++ " = " ++ show p)
+    Nothing ->
+        liftIO $ putStrLn $ "Usage: :s " ++ label ++ " error|warn|off (also accepts on=error)"
 
 -- | Toggle a specific optimization pass by name
 setOptPass :: String -> Bool -> IntState ()
@@ -913,35 +952,56 @@ loadFileNewImpl nm = do
                 logDetail $ "Executing pass 2: " ++ TC.as [TC.bold, TC.underlined] "initial optimizations"
                 timedPass "Pass 2 (case opt)" caseOptimizationPass
                 checkSealedExhaustiveness
+                -- T1.2: run positivity + coverage checks in the REPL load path
+                -- too (previously only runModulePasses did this). They share the
+                -- tcErrorCount counter with the TC, and the halt check below
+                -- picks up their PolicyError diagnostics.
+                positivityCheckPass
+                coverageCheckPass
                 flushLogs
                 when (v >= Verbose) $ processCommand ([":e"])
-                -- Check if all imported modules are loaded; defer TC if not
-                stPreTC <- get
-                let importedKeys = [intercalate "." d | d <- deps]
-                    loadedKeys = loadedModules (currentModuleEnv stPreTC)
-                    missingKeys = [k | k <- importedKeys, not (Map.member k loadedKeys)]
-                    thisModuleParsed = parsedModule stPreTC
-                if Prelude.null missingKeys
+                -- T1.2: if safety passes (positivity/coverage) emitted errors
+                -- under PolicyError, halt before the type checker runs. The
+                -- file is still registered as "loaded" so the user can inspect
+                -- the error in the REPL; the rest of the pipeline is skipped.
+                stSafety <- get
+                let safetyErrs = tcErrorCount stSafety
+                    safetyStrict = strictTypes (currentFlags stSafety)
+                if safetyErrs > 0 && safetyStrict
                   then do
-                    logDetail $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking"
-                    modify (\s -> s { tcErrorCount = 0 })
-                    timedPass "Pass 3 (typecheck)" typeCheckPass
-                    timedPass "Pass 3.1 (type annotate)" typeAnnotatePass
-                    timedPass "Pass 3.2 (type elaborate)" typeElaboratePass
-                    terminationCheckPass
+                    compilerMsg Errors $ "[safety] " ++ show safetyErrs
+                        ++ " safety error(s) in " ++ nm
+                        ++ " — halting before type checking (strict mode). "
+                        ++ "Use ':s safety <positivity|coverage> warn' to downgrade."
                     flushLogs
                   else do
-                    logProgress $ "  Deferring type check: imports not yet loaded: " ++ intercalate ", " missingKeys
-                    modify (\s -> s { deferredTCModules =
-                        (nm, thisModuleParsed, missingKeys) : deferredTCModules s })
-                when (v >= Verbose) $ processCommand ([":e"])
-                logDetail $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM"
-                timedPass "Pass 4 (CLM)" lamToCLMPass
-                flushLogs
-                when (v >= Verbose) $ processCommand ([":e"])
-                logDetail $ "Executing pass 4.5: " ++ TC.as [TC.bold, TC.underlined] "CLM optimization"
-                timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
-                flushLogs
+                    -- Check if all imported modules are loaded; defer TC if not
+                    stPreTC <- get
+                    let importedKeys = [intercalate "." d | d <- deps]
+                        loadedKeys = loadedModules (currentModuleEnv stPreTC)
+                        missingKeys = [k | k <- importedKeys, not (Map.member k loadedKeys)]
+                        thisModuleParsed = parsedModule stPreTC
+                    if Prelude.null missingKeys
+                      then do
+                        logDetail $ "Executing pass 3: " ++ TC.as [TC.bold, TC.underlined] "type checking"
+                        modify (\s -> s { tcErrorCount = 0 })
+                        timedPass "Pass 3 (typecheck)" typeCheckPass
+                        timedPass "Pass 3.1 (type annotate)" typeAnnotatePass
+                        timedPass "Pass 3.2 (type elaborate)" typeElaboratePass
+                        terminationCheckPass
+                        flushLogs
+                      else do
+                        logProgress $ "  Deferring type check: imports not yet loaded: " ++ intercalate ", " missingKeys
+                        modify (\s -> s { deferredTCModules =
+                            (nm, thisModuleParsed, missingKeys) : deferredTCModules s })
+                    when (v >= Verbose) $ processCommand ([":e"])
+                    logDetail $ "Executing pass 4: " ++ TC.as [TC.bold, TC.underlined] "Lambdas to CLM"
+                    timedPass "Pass 4 (CLM)" lamToCLMPass
+                    flushLogs
+                    when (v >= Verbose) $ processCommand ([":e"])
+                    logDetail $ "Executing pass 4.5: " ++ TC.as [TC.bold, TC.underlined] "CLM optimization"
+                    timedPass "Pass 4.5 (CLM opt)" runCLMOptPasses
+                    flushLogs
                 -- Restore accumulated parsedModule (this module's + previous)
                 stAfterPasses <- get
                 let allParsed = parsedModule stAfterPasses ++ prevParsedModule

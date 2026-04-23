@@ -243,6 +243,43 @@ traverseCLMExpr f (CLMNEW nm args) = CLMNEW nm (map f (map (traverseCLMExpr f) a
 traverseCLMExpr f (CLMHANDLE bdy eff lets ops) = CLMHANDLE (f $ traverseCLMExpr f bdy) eff (map (\(n,v) -> (n, f $ traverseCLMExpr f v)) lets) (map (\(n,impl) -> (n, f $ traverseCLMExpr f impl)) ops)
 traverseCLMExpr f e = f e
 
+-- | T1.4: count all CLMIAP nodes in an expression. Non-zero count after
+-- monomorphization + CLM opt means instance dispatch wasn't fully resolved —
+-- a soundness issue for LLVM native (which has no runtime dispatch).
+countCLMIAP :: CLMExpr -> Int
+countCLMIAP = go
+  where
+    go (CLMIAP f args) = 1 + go f + sum (map go args)
+    go (CLMLAM (CLMLam _ b)) = go b
+    go (CLMLAM (CLMLamCases _ bs)) = sum (map go bs)
+    go (CLMBIND _ e) = go e
+    go (CLMAPP f xs) = go f + sum (map go xs)
+    go (CLMPAP f xs) = go f + sum (map go xs)
+    go (CLMCON _ xs) = sum (map go xs)
+    go (CLMFieldAccess _ e) = go e
+    go (CLMCASE cs scrut) = go scrut + sum (map goCheck cs)
+    go (CLMPROG es) = sum (map go es)
+    go (CLMTYPED a b) = go a + go b
+    go (CLMARRAY es) = sum (map go es)
+    go (CLMMCALL obj _ args) = go obj + sum (map go args)
+    go (CLMSCALL obj _ args) = go obj + sum (map go args)
+    go (CLMNEW _ args) = sum (map go args)
+    go (CLMHANDLE bdy _ lets ops) = go bdy + sum (map (go . snd) lets) + sum (map (go . snd) ops)
+    go _ = 0
+    goCheck (CLMCheckTag _ e) = go e
+    goCheck (CLMCheckLit _ e) = go e
+
+-- | T1.4: count residual CLMIAP across the whole clmLambdas environment.
+-- Returns per-lambda counts for lambdas that have at least one CLMIAP.
+findResidualCLMIAP :: Map.HashMap Name CLMLam -> [(Name, Int)]
+findResidualCLMIAP lams =
+    [ (nm, c) | (nm, lam) <- Map.toList lams
+              , let c = countInLam lam
+              , c > 0 ]
+  where
+    countInLam (CLMLam _ body) = countCLMIAP body
+    countInLam (CLMLamCases _ bs) = sum (map countCLMIAP bs)
+
 -- | Truncate ppr output to N chars, appending "..." if truncated
 pprSummary :: Int -> CLMExpr -> String
 pprSummary n e =

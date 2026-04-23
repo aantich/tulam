@@ -163,14 +163,22 @@ computeNullaryAsNull env =
     getTypeName (App f _) = getTypeName f  -- nested app
     getTypeName other = show other  -- fallback
 
-    -- Find at most one null-eligible constructor name for a type
+    -- Find at most one null-eligible constructor name for a type.
+    -- Null is safe when the constructor carries no payload AND the choice
+    -- between null and heap-allocated forms never needs to be distinguished.
+    -- Cases:
+    --   (1 nullary, ≥1 non-nullary): classic sum type like Maybe. Nullary ↔ null,
+    --       non-nullary ↔ heap-allocated. Pattern match distinguishes by `ptr==null`.
+    --   (1 nullary, 0 non-nullary): singleton type like Unit. Only one value
+    --       possible, so null is unambiguous. This eliminates per-call Unit
+    --       allocations in tight mutating loops (Sieve, Queens).
     findNullCons :: [(Name, Bool)] -> [Name]
     findNullCons consList =
         let nullary = [cname | (cname, True) <- consList]
             nonNullary = [cname | (cname, False) <- consList]
         in case (nullary, nonNullary) of
-            ([singleNull], _:_) -> [singleNull]  -- exactly 1 nullary + at least 1 non-nullary
-            _                   -> []              -- all nullary, or multiple nullary, or none
+            ([singleNull], _) -> [singleNull]   -- 1 nullary + any number of non-nullary
+            _                 -> []               -- multiple nullary or none
 
 -- | Invoke clang++ to compile LLVM IR + runtime to native binary.
 compileWithClang :: NativeConfig -> String -> IO CompileResult

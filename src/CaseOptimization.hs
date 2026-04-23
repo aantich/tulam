@@ -345,8 +345,9 @@ checkSealedExhaustiveness = do
         let allChildren = Prelude.filter (/= parentName) (getAllSubclasses parentName env)
         let hasWildcard = Prelude.any isWildcard cases
         let missing = Prelude.filter (`Prelude.notElem` matchedNames) allChildren
-        when (not hasWildcard && not (Prelude.null missing)) $
-            logWarning (mkLogPayload (lamSrcInfo lam) ("[sealed] non-exhaustive match in " ++ funcName
+        when (not hasWildcard && not (Prelude.null missing)) $ do
+            pol <- safeCoverage . currentFlags <$> get
+            emitSafety pol (mkLogPayload (lamSrcInfo lam) ("[sealed] non-exhaustive match in " ++ funcName
                 ++ ": missing " ++ Data.List.intercalate ", " missing
                 ++ " from sealed class " ++ parentName ++ "\n"))
 
@@ -374,7 +375,7 @@ positivityCheckPass :: IntState ()
 positivityCheckPass = do
     s <- get
     let flags = currentFlags s
-    when (State.checkPositivity flags) $ do
+    when (safePositivity flags /= PolicyOff) $ do
         let env = currentEnvironment s
         mapM_ (checkTypePositivity env) (Map.toList (types env))
 
@@ -392,9 +393,11 @@ checkConstructorPositivity typName conLam = do
         paramTypes = Prelude.map typ (params conLam)
     mapM_ (\paramTy ->
         case checkPositive typName Positive paramTy of
-            Just path -> logWarning (mkLogPayload (lamSrcInfo conLam)
-                ("[positivity] type " ++ typName ++ " occurs in negative position in constructor "
-                 ++ conName ++ ": " ++ path ++ "\n"))
+            Just path -> do
+                pol <- safePositivity . currentFlags <$> get
+                emitSafety pol (mkLogPayload (lamSrcInfo conLam)
+                    ("[positivity] type " ++ typName ++ " occurs in negative position in constructor "
+                     ++ conName ++ ": " ++ path ++ "\n"))
             Nothing -> pure ()
         ) paramTypes
 
@@ -439,7 +442,7 @@ terminationCheckPass :: IntState ()
 terminationCheckPass = do
     s <- get
     let flags = currentFlags s
-    when (State.checkTermination flags) $ do
+    when (safeTermination flags /= PolicyOff) $ do
         let env = currentEnvironment s
         let lambdas = topLambdas env
         -- Scope to current module: only check functions defined in parsedModule
@@ -495,8 +498,9 @@ checkFuncTermination env (funcName, lam) = do
         let callArgs = collectRecursiveCallArgs funcName bodyForCheck
         -- Check that at least one recursive call has a structurally smaller argument
         let allSafe = Prelude.all (hasDecreasingArg subterms) callArgs
-        when (not allSafe && not (Prelude.null callArgs)) $
-            logWarning (mkLogPayload (lamSrcInfo lam)
+        when (not allSafe && not (Prelude.null callArgs)) $ do
+            pol <- safeTermination . currentFlags <$> get
+            emitSafety pol (mkLogPayload (lamSrcInfo lam)
                 ("[termination] function " ++ funcName
                  ++ " may not terminate: no structurally decreasing argument detected in recursive call(s)\n"))
 
@@ -594,7 +598,7 @@ coverageCheckPass :: IntState ()
 coverageCheckPass = do
     s <- get
     let flags = currentFlags s
-    when (State.checkCoverage flags) $ do
+    when (safeCoverage flags /= PolicyOff) $ do
         let env = currentEnvironment s
         let lambdas = topLambdas env
         mapM_ (checkLambdaCoverage env) (Map.elems lambdas)
@@ -631,8 +635,9 @@ checkTypeCoverage env lam matchedCons typName = do
             Constructors cons -> do
                 let allConsNames = Prelude.map lamName cons
                     missing = Prelude.filter (`Prelude.notElem` matchedCons) allConsNames
-                when (not (Prelude.null missing)) $
-                    logWarning (mkLogPayload (lamSrcInfo lam)
+                when (not (Prelude.null missing)) $ do
+                    pol <- safeCoverage . currentFlags <$> get
+                    emitSafety pol (mkLogPayload (lamSrcInfo lam)
                         ("[coverage] non-exhaustive pattern match in " ++ funcName
                          ++ ": missing " ++ Data.List.intercalate ", " missing
                          ++ " from type " ++ typName ++ "\n"))

@@ -16,7 +16,7 @@ module CLMOptimize
 
 import CLM
 import Surface (Name, Literal(..), ConsTag(..))
-import Logs (SourceInfo(..))
+import Logs (SourceInfo(..), mkLogPayload)
 import State
 import Intrinsics (lookupIntrinsic, boolToCLM)
 
@@ -67,6 +67,33 @@ runCLMOptPasses = do
                     then applyPassToAll pass
                     else pure ()
                 ) allCLMPasses
+    -- NOTE: residual CLMIAP diagnostics live in CompileDriver, not here.
+    -- Per-module runCLMOptPasses runs before per-target monomorphization, so
+    -- generic stdlib lambdas legitimately still carry CLMIAP at this stage.
+
+-- | T1.4: report residual CLMIAP nodes per the configured policy. Called by
+-- CompileDriver AFTER per-target monomorphization, where CLMIAP residuals are
+-- actual bugs (native/bytecode backends have no runtime dispatch).
+-- Under default flags (failOnResidualDispatch=True) this bumps tcErrorCount so
+-- the pipeline halt picks it up.
+reportResidualCLMIAP :: [(Name, Int)] -> IntState ()
+reportResidualCLMIAP [] = pure ()
+reportResidualCLMIAP residual = do
+    st <- get
+    let flags = currentFlags st
+        total = sum (Prelude.map snd residual)
+        msg = mkLogPayload SourceInteractive
+             ("[mono] " ++ show total
+              ++ " unresolved implicit-param call(s) remain after monomorphization "
+              ++ "across " ++ show (Prelude.length residual) ++ " function(s): "
+              ++ Data.List.intercalate ", " [nm ++ "=" ++ show c | (nm, c) <- residual]
+              ++ ". Native/bytecode backends require full dispatch resolution. "
+              ++ "Disable with `:s residual-dispatch off`.\n")
+    if failOnResidualDispatch flags
+      then do
+          logError msg
+          modify (\s -> s { tcErrorCount = tcErrorCount s + 1 })
+      else logWarning msg
 
 -- | Check if a specific pass is enabled
 isPassEnabled :: String -> OptFlags -> Bool

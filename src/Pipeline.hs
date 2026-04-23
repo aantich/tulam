@@ -481,6 +481,40 @@ processBinding (Instance structName mTag typeArgs impls reqs, si) env = do
         extractTypeName (App (Id nm) _) = Just nm
         extractTypeName _ = Nothing
     let typeNames = [nm | Just nm <- Prelude.map extractTypeName typeArgs]
+    -- T2.10: orphan-instance check. An instance for Structure(T1, T2, ...) is
+    -- legal in the module declaring the Structure OR the module declaring one
+    -- of the head type constructors. Otherwise it's an orphan. Emitted only
+    -- when safeOrphan /= PolicyOff (default Off).
+    stOrphan <- get
+    let orphanPol = safeOrphan (currentFlags stOrphan)
+    when (orphanPol /= PolicyOff) $ do
+        let menv = currentModuleEnv stOrphan
+            curModKey = intercalate "." (moduleName menv)
+            mods = loadedModules menv
+            structMod = moduleDeclaring structName mods
+            typeMods = [m | t <- typeNames, Just m <- [moduleDeclaring t mods]]
+            legalMods = maybe [] pure structMod ++ typeMods
+            -- Also accept declarations in the *current* module (not yet added
+            -- to loadedModules at processBinding time). If the structure or any
+            -- head type is a name defined in this module's Environment, that
+            -- counts as a local origin.
+            isLocalStruct = Map.member structName (types env)
+            isLocalType   = Prelude.any (\t -> Map.member t (types env)
+                                           || Map.member t (constructors env)) typeNames
+            isLegal = isLocalStruct
+                   || isLocalType
+                   || Prelude.elem curModKey legalMods
+        unless isLegal $
+            emitSafety orphanPol (mkLogPayload si
+                ("[orphan] instance " ++ structName ++ "(" ++ intercalate ", " typeNames
+                 ++ ") declared in module " ++ (if Prelude.null curModKey then "<none>" else curModKey)
+                 ++ " but neither the structure nor any head type is declared here"
+                 ++ (case structMod of
+                      Just m  -> " (structure declared in " ++ m ++ ")"
+                      Nothing -> "")
+                 ++ (if Prelude.null typeMods then ""
+                     else " (head types declared in " ++ intercalate ", " typeMods ++ ")")
+                 ++ ".\n"))
     -- Validate requires instances exist (with type substitution from structure params)
     unless (Prelude.null typeNames) $
         validateRequiresForInstance env reqs typeNames structName si

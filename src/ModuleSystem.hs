@@ -250,8 +250,21 @@ data CompiledModule = CompiledModule
 -- Modifies currentEnvironment in place (adds types, constructors, lambdas, CLM, etc.).
 runModulePasses :: IntState ()
 runModulePasses = do
+    -- Reset the compilation-error counter once per module. Safety passes (in
+    -- Phase 1) and the type checker (Phase 2) both bump this; we want them to
+    -- share state so a Phase-1 failure halts before Phase 2 starts.
+    modify (\s -> s { tcErrorCount = 0 })
     runPhase1Passes
-    runPhase2Passes
+    flushLogs
+    -- If safety passes (positivity/coverage/sealed) emitted errors under
+    -- PolicyError, halt before running the type checker.
+    st1 <- get
+    let phase1Errors = tcErrorCount st1
+    if phase1Errors > 0 && strictTypes (currentFlags st1)
+      then
+        compilerMsg Errors $ "[safety] " ++ show phase1Errors
+             ++ " safety error(s) found. Halting compilation (strict mode)."
+      else runPhase2Passes
 
 -- | Phase 1: Parse through case optimization (Passes 0-2).
 -- Builds the environment but does NOT type-check or generate CLM.
@@ -278,8 +291,8 @@ runPhase1Passes = do
 -- Assumes Phase 1 has run and currentEnvironment is fully populated.
 runPhase2Passes :: IntState ()
 runPhase2Passes = do
-    -- Reset TC error count before type checking this module
-    modify (\s -> s { tcErrorCount = 0 })
+    -- NOTE: tcErrorCount is reset in runModulePasses, not here. Safety passes
+    -- in Phase 1 share the counter so their failures halt before Phase 2.
     timedPass "Pass 3 (type annotate)" typeAnnotatePass
     timedPass "Pass 3.1 (typecheck)" typeCheckPass
     timedPass "Pass 3.2 (type elaborate)" typeElaboratePass

@@ -462,10 +462,19 @@ defaultFlags = CurrentFlags
     , showWarnings = True
     , newStrings = False
     , optSettings = defaultOptFlags
-    , checkPositivity = True
-    , checkTermination = True
-    , checkCoverage = True
-    , checkPurity = False
+    , safePositivity = PolicyError     -- T1.2: structural safety errors halt by default
+    , safeTermination = PolicyWarn     -- T1.2: termination checker is a Nat-descent heuristic, not strong enough to be fatal yet
+    , safeCoverage = PolicyError       -- T1.2: non-exhaustive patterns halt by default
+    , safePurity = PolicyWarn          -- effect purity stays a warning until inference is tighter
+    , safeOrphan = PolicyOff           -- T2.10: orphan-instance check opt-in; enable via :s safety orphan warn
+    , failOnResidualDispatch = True    -- T1.4: unresolved monomorphization is fatal by default
+    -- T1.3: we detect unresolved type metas that escape the type checker, but
+    -- shipping stdlib still generates many (~900) such residuals because
+    -- generalization at top-level is incomplete. Default to allow so existing
+    -- code keeps compiling; flip to False once generalization is fixed and
+    -- residual count reaches zero on lib/Base.tl. The infrastructure and
+    -- diagnostics are live: `:s allow-unresolved-metas off` enables the check.
+    , allowUnresolvedMetas = True
     , monomorphLevel = MonoFull  -- full monomorphization by default (all instance dispatch resolved)
     , specLevel = SpecFull      -- full specialization by default (for bytecode/native)
     , debugTrace = False
@@ -478,6 +487,17 @@ data Verbosity = Silent    -- ^ No output (for tests)
                | Normal    -- ^ Errors + warnings + progress (default)
                | Verbose   -- ^ All above + per-pass timing
                deriving (Show, Eq, Ord)
+
+-- | How a safety-pass failure (positivity, termination, coverage, purity) is
+-- reported. Default for the structural passes is 'PolicyError' so unsound
+-- programs don't compile silently. Older boolean flags
+-- (checkPositivity etc.) are kept as compatibility shims and mapped to
+-- PolicyError/PolicyOff on REPL toggle.
+data SafetyPolicy
+    = PolicyError  -- ^ failure halts compilation
+    | PolicyWarn   -- ^ failure logged as warning, compilation proceeds
+    | PolicyOff    -- ^ check skipped entirely
+    deriving (Show, Eq)
 
 -- | How aggressively to monomorphize instance dispatch.
 data MonomorphLevel
@@ -506,10 +526,13 @@ data CurrentFlags = CurrentFlags {
   , showWarnings :: Bool -- independently toggle warning display
   , newStrings :: Bool -- true if string literals desugar to fromStringLiteral
   , optSettings :: OptFlags -- optimization pass settings
-  , checkPositivity   :: Bool -- positivity checking for inductive types
-  , checkTermination  :: Bool -- termination checking for recursive functions
-  , checkCoverage     :: Bool -- pattern match coverage checking
-  , checkPurity       :: Bool -- effect purity checking (warn when effect ops called outside action blocks)
+  , safePositivity    :: SafetyPolicy -- severity of positivity failures (replaces old checkPositivity Bool)
+  , safeTermination   :: SafetyPolicy -- severity of termination failures
+  , safeCoverage      :: SafetyPolicy -- severity of coverage failures
+  , safePurity        :: SafetyPolicy -- severity of purity failures
+  , safeOrphan        :: SafetyPolicy -- T2.10: orphan instance check (module must declare structure or head type)
+  , failOnResidualDispatch :: Bool -- fail pipeline if monomorphization leaves unresolved dispatch
+  , allowUnresolvedMetas   :: Bool -- allow Meta n to escape type checker (default False)
   , monomorphLevel :: MonomorphLevel -- how aggressively to monomorphize (MonoNone for interpreter)
   , specLevel :: SpecLevel -- how aggressively to specialize generic instances (SpecFull for native/bytecode)
   , debugTrace :: Bool -- emit debug trace output (monomorphizer, instance resolution, etc.)
@@ -1208,6 +1231,28 @@ compilerMsg :: Verbosity -> String -> IntState ()
 compilerMsg minLevel msg = do
     v <- verbosity . currentFlags <$> get
     when (v >= minLevel) $ liftIO $ putStrLn msg
+
+-- | T2.10: find which loaded module (if any) publicly declared a name.
+-- Used by the orphan-instance check: an instance for Structure(T) is legal
+-- only when declared in the module defining the Structure or the module
+-- defining the head type T.
+moduleDeclaring :: Name -> HashMap String ModuleEnv -> Maybe String
+moduleDeclaring nm mods =
+    case [k | (k, menv) <- Map.toList mods, Set.member nm (publicNames menv)] of
+      (k:_) -> Just k
+      []    -> Nothing
+
+-- | Emit a safety-pass diagnostic according to the configured policy.
+-- PolicyError bumps tcErrorCount AND logs to the error channel, so the
+-- pipeline-halt check in runPhase1Passes / runPhase2Passes picks it up.
+-- PolicyWarn logs a warning but does not contribute to halt state.
+-- PolicyOff is a silent no-op (saves the work of formatting the message).
+emitSafety :: SafetyPolicy -> LogPayload -> IntState ()
+emitSafety PolicyOff   _   = pure ()
+emitSafety PolicyWarn  lpl = lift (Log.logWarning lpl)
+emitSafety PolicyError lpl = do
+    lift (Log.logError lpl)
+    modify (\s -> s { tcErrorCount = tcErrorCount s + 1 })
 
 -- lifted versions of the IOLogger monad functions
 logError :: LogPayload -> IntState ()

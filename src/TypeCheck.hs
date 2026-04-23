@@ -25,6 +25,8 @@ module TypeCheck
   , checkTopLevel, buildTCEnvFromEnvironment, inferLambda, inferLamType
   , resolveConstraints, showTCError, showExprBrief, showTy, showRow
   , tyToName, freeMetas, replaceMeta, occursIn
+  , rowExtract  -- T2.9: exported for tests
+  , subtype, freshLevelName  -- T2.7: exported for tests
     -- * Type-level normalization
   , normalizeTy, clmToExpr, isConcreteTy, lambdaToCLMLam, exprToCLMTC
   , bind
@@ -45,6 +47,7 @@ module TypeCheck
   , decomposePi
     -- * Post-TC meta resolution (Phase 1.2)
   , resolveMetasInEnvironment
+  , findResidualMetas  -- T1.3: exported for tests
   , resolveMetasInLambda
   , resolveMetasInType
   , resolveMetasInExpr
@@ -95,6 +98,7 @@ data Constraint
 
 data TCState = TCState
   { nextMeta      :: !Int                       -- ^ Fresh metavariable counter
+  , nextLevel     :: !Int                       -- ^ T2.7: Fresh level-variable counter
   , substitution  :: HashMap Int Expr           -- ^ Unified substitution (type vars AND row vars)
   , constraints   :: [Constraint]               -- ^ Deferred constraints
   , witnessMap    :: HashMap Name SemanticWitness -- ^ Selected semantic witnesses by method name
@@ -113,12 +117,22 @@ data TCEnv = TCEnv
 initTCState :: TCMode -> TCState
 initTCState mode = TCState
   { nextMeta      = 0
+  , nextLevel     = 0
   , substitution  = Map.empty
   , constraints   = []
   , witnessMap    = Map.empty
   , tcErrors      = []
   , tcMode        = mode
   }
+
+-- | T2.7: generate a fresh level variable name. Usable when desugaring
+-- forall-quantifiers that should be level-polymorphic (as opposed to pinned at
+-- Type 0 via the parser's current hardcode). Future work: thread these through
+-- the checker with a dedicated level substitution.
+freshLevelName :: TC Name
+freshLevelName env st =
+  let n = nextLevel st
+  in Right ("ℓ" ++ show n, st { nextLevel = n + 1 })
 
 emptyTCEnv :: TCEnv
 emptyTCEnv = TCEnv
@@ -188,8 +202,10 @@ tcWarnOrFail err env st =
     TCStrict  -> Left [wrapped]
     TCRelaxed -> Right ((), st { tcErrors = wrapped : tcErrors st })
 
--- | Hard error even in relaxed mode — for errors that MUST be caught
--- (branch type mismatch, non-function application on concrete types)
+-- | Hard error: in relaxed mode still accumulates (so error is visible even when
+-- permissive); in strict mode halts. Used for errors that MUST be reported
+-- regardless of mode (branch type mismatch, non-function application on concrete
+-- types). Previously this always accumulated; that was a soundness bug.
 tcHardWarn :: TCError -> TC ()
 tcHardWarn err env st =
   let withCtx = case tcContext env of
@@ -198,7 +214,9 @@ tcHardWarn err env st =
       wrapped = case tcSourceInfo env of
         Just si -> WithSource si withCtx
         Nothing -> withCtx
-  in Right ((), st { tcErrors = wrapped : tcErrors st })
+  in case tcMode st of
+    TCStrict  -> Left [wrapped]
+    TCRelaxed -> Right ((), st { tcErrors = wrapped : tcErrors st })
 
 tcMapM :: (a -> TC b) -> [a] -> TC [b]
 tcMapM _ [] = tcPure []
@@ -560,7 +578,9 @@ unify' row@(RowExtend _ _ _) (Id name) =
       Nothing -> tcFail (Mismatch row (Id name))
 unify' t1 t2 = tcFail (Mismatch t1 t2)
 
--- | Extract a field from a row
+-- | Extract a field from a row. When the row is an open meta tail, emit a
+-- CRowLack constraint on the new (fresh) tail so that a later attempt to add
+-- the same field is detected as a duplicate (T2.9).
 rowExtract :: Name -> Expr -> TC (Expr, Expr)
 rowExtract l (RowExtend l' t r)
   | l == l'   = tcPure (t, r)
@@ -570,7 +590,10 @@ rowExtract l (Meta v) =
   freshMeta `tcBind` \t ->
     freshMeta `tcBind` \r ->
       bind v (RowExtend l t r) `tcBind` \_ ->
-        tcPure (t, r)
+        -- The fresh tail `r` represents "the rest of the row after removing l".
+        -- It must not itself contain l, or we'd have a duplicate field.
+        tcModify (\s -> s { constraints = CRowLack l r : constraints s }) `tcBind` \_ ->
+          tcPure (t, r)
 rowExtract l RowEmpty = tcFail (MissingField l)
 rowExtract l (Id n) = tcFail (OtherError $ "Cannot extract field " ++ l ++ " from rigid row " ++ n)
 rowExtract l _ = tcFail (MissingField l)
@@ -813,7 +836,13 @@ extractTypeName (App (Id n) _) = n
 extractTypeName (Id n) = n
 extractTypeName _ = ""
 
--- | Perform GADT refinement
+-- | Perform GADT refinement.
+-- T1.6: when the constructor's return type cannot unify with the scrutinee
+-- type, the pattern is UNREACHABLE (absurd). Example: matching `VCons` against
+-- a scrutinee of type `Vec(a, Z)` — the VCons return type is `Vec(a, Succ n)`
+-- which cannot equal `Vec(a, Z)`. Emit a diagnostic instead of silently
+-- ignoring the branch, because accepting the branch would let the programmer
+-- extract a value that doesn't exist.
 gadtRefineWithParams :: [Name] -> Lambda -> Expr -> TC [(Name, Expr)]
 gadtRefineWithParams typeParams conLam scrutExpr =
   tcMapM (\_ -> freshMeta) typeParams `tcBind` \freshVars ->
@@ -825,7 +854,18 @@ gadtRefineWithParams typeParams conLam scrutExpr =
            let scrutTyFresh = Prelude.foldl (\t (n, fv) -> substTyVar n fv t) scrutTy' paramMapping
            in tcTry (unify gadtRetTy scrutTyFresh) `tcBind` \unifyResult ->
              case unifyResult of
-               Nothing -> tcPure []  -- unification failed, no refinements possible
+               Nothing ->
+                 -- T1.6: absurd pattern. Emit a hard warn so strict mode halts.
+                 applySubst gadtRetTy `tcBind` \gRet ->
+                 applySubst scrutTy' `tcBind` \sTy ->
+                   tcHardWarn (OtherError
+                     ("unreachable pattern: constructor "
+                      ++ lamName conLam
+                      ++ " has return type "
+                      ++ showTy gRet
+                      ++ " which cannot equal scrutinee type "
+                      ++ showTy sTy))
+                   `tcBind` \_ -> tcPure []
                Just _ ->
                  tcMapM (\(paramName, tv) ->
                    applySubst tv `tcBind` \resolved ->
@@ -2335,7 +2375,72 @@ typeCheckPass = do
         let env4 = currentEnvironment st3
             env5 = resolveMetasInEnvironment subst env4
         modify (\s -> s { currentEnvironment = env5 })
+    -- T1.3: after substitution, surface any remaining "?tN" placeholders. Those
+    -- mark metavariables that escaped the type checker — a soundness issue
+    -- because downstream passes (CLM, mono, codegen) can't reason about them.
+    -- The default (allowUnresolvedMetas=True) logs them as warnings so they
+    -- stay visible without halting compilation; flip to False to make them
+    -- fatal (pipeline halts via tcErrorCount).
+    stFinalEnv <- get
+    let flagsFinal = currentFlags stFinalEnv
+        residuals  = findResidualMetas (currentEnvironment stFinalEnv)
+        msgFor (lamName', metas) = mkLogPayload SourceInteractive
+            ("[TC] unresolved type metavariable(s) escaped type checker in '"
+             ++ lamName' ++ "': " ++ intercalate ", " metas
+             ++ ". This usually means the function or call lacks a type annotation.\n")
+    if allowUnresolvedMetas flagsFinal
+      then forM_ residuals (logWarning . msgFor)
+      else do
+        forM_ residuals (logError . msgFor)
+        unless (Prelude.null residuals) $
+            modify (\s -> s { tcErrorCount = tcErrorCount s + Prelude.length residuals })
     verboseLog "  Pass 3 (typecheck): meta resolution complete"
+
+-- | T1.3: After Phase 1.2 rewrote unresolved metas to Id "?tN", scan every
+-- lambda (types, params, body) and return the list of residual placeholders
+-- per-lambda. Returns [(funcName, [residualMetaNames])] for any lambda that
+-- has at least one residual; empty list means the type checker fully resolved
+-- the environment. This is the hard-invariant check: in a sound state, no
+-- residual should exist.
+findResidualMetas :: Environment -> [(Name, [String])]
+findResidualMetas env =
+    let lams = Map.elems (topLambdas env)
+              ++ Map.elems (instanceLambdas env)
+              ++ Map.elems (topLambdasElab env)
+              ++ Map.elems (instanceLambdasElab env)
+        scan lam =
+            let fromRet    = collectResidualsInExpr (lamType lam)
+                fromParams = concatMap (collectResidualsInExpr . typ) (params lam)
+                fromBody   = collectResidualsInExpr (body lam)
+                all'       = Data.List.nub (fromRet ++ fromParams ++ fromBody)
+            in if Prelude.null all' then Nothing else Just (lamName lam, all')
+    in Maybe.mapMaybe scan lams
+
+-- | Collect all "?tN" placeholders introduced by resolveMetasInType.
+collectResidualsInExpr :: Expr -> [String]
+collectResidualsInExpr e = Data.List.nub (go e)
+  where
+    go (Id s) | Prelude.take 2 s == "?t" = [s]
+    go (Meta n) = ["?t" ++ show n]  -- raw Meta that survived (shouldn't happen, but be safe)
+    go other = concatMap go (childrenOfExpr other)
+
+-- | Collect immediate expression children for traversal. A partial mirror of
+-- traverseExpr scoped to "what might contain a residual type meta": types are
+-- in positions reachable via mapTypeChildren, but bodies may also carry type
+-- annotations via Typed / Pi / App.
+childrenOfExpr :: Expr -> [Expr]
+childrenOfExpr e = case e of
+    Pi _ dom cod  -> [dom, cod]
+    Sigma _ dom cod -> [dom, cod]
+    ArrowType a b -> [a, b]
+    App f xs      -> f : xs
+    NTuple fs     -> Prelude.map snd fs
+    Tuple xs      -> xs
+    RowExtend _ t r -> [t, r]
+    RecordType fs _ -> Prelude.map snd fs
+    Typed x t     -> [x, t]
+    Function lam  -> [lamType lam, body lam] ++ Prelude.map typ (params lam)
+    _             -> []
 
 -- | Phase 1.2: Resolve all Meta nodes in the environment's lambda maps
 -- using the TC substitution. Metas that have no solution are converted to
@@ -2585,8 +2690,22 @@ resolveConstraints = resolveLoop 100
                                 else tcModify (\s -> s { constraints = CStructure structName mTag resolvedArgs mMethod : constraints s })
                    _ -> tcPure ()
                  _ -> tcPure ()
-    resolveOne _ (CRowLack n e) =
-      tcModify (\s -> s { constraints = CRowLack n e : constraints s })
+    -- T2.9: solve CRowLack by walking the row and checking field absence.
+    -- Satisfied trivially by RowEmpty and by rigid nominal rows (Id).
+    -- Fails if the field is present at the head. Recurses past other fields.
+    -- Defers (re-queues) when the tail is still a metavariable.
+    resolveOne _ (CRowLack l row) =
+      applySubst row `tcBind` \row' ->
+        case row' of
+          RowEmpty -> tcPure ()
+          RowExtend l' _ rest
+            | l == l'   -> tcWarnOrFail (OtherError ("duplicate row field " ++ l))
+            | otherwise -> tcModify (\s -> s { constraints = CRowLack l rest : constraints s })
+          Meta _ ->
+            tcModify (\s -> s { constraints = CRowLack l row' : constraints s })
+          Id _ -> tcPure ()
+          _ ->
+            tcModify (\s -> s { constraints = CRowLack l row' : constraints s })
     -- Effect constraints are satisfied by default handlers at runtime.
     -- In the future, purity enforcement will make this stricter.
     resolveOne _ (CEffect _effName) = tcPure ()
