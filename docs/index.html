@@ -43,7 +43,7 @@
 <section class="hero">
   <h1><span>(</span>tulam<span>)</span></h1>
   <p class="tagline">The most expressive type system.<br>Every backend. Native performance.</p>
-  <p class="tagline-sub">Dependent types, algebraic effects, and a compiler targeting JS, .NET, and LLVM &mdash; 20% faster than C++ on real benchmarks.</p>
+  <p class="tagline-sub">Dependent types, algebraic effects, and a compiler targeting JS, .NET, and LLVM &mdash; matches C++ on real benchmarks, up to 11&times; faster on pure work.</p>
   <div class="cta">
     <a href="#getting-started" class="btn btn-primary">Get Started</a>
     <a href="#examples" class="btn btn-secondary">See Examples</a>
@@ -283,7 +283,8 @@
   <div class="inner">
     <h2 class="section-title">Performance</h2>
     <p class="section-sub">
-      <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a> benchmarks &mdash; tulam native vs C++, Haskell (GHC), and JavaScript (Node).
+      <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a> benchmarks &mdash; tulam native vs C++ (clang++&nbsp;-O3&nbsp;-flto), Haskell (GHC&nbsp;-O2), and JavaScript (Node.js).
+      Geometric mean puts tulam within 10% of C++, faster than GHC overall, and winning on 6 of 9 benchmarks vs C++.
     </p>
 
     <div class="bench-table-wrap">
@@ -303,82 +304,82 @@
             <td>List</td>
             <td>8 &micro;s</td>
             <td>6 &micro;s</td>
-            <td>51 &micro;s</td>
+            <td>50 &micro;s</td>
             <td class="col-tulam">11 &micro;s</td>
             <td class="col-ratio">1.3x</td>
           </tr>
           <tr class="bench-win">
             <td>Queens</td>
-            <td>34 &micro;s</td>
+            <td>7 &micro;s</td>
             <td>3 &micro;s</td>
-            <td>76 &micro;s</td>
-            <td class="col-tulam">7 &micro;s</td>
-            <td class="col-ratio">0.2x</td>
+            <td>75 &micro;s</td>
+            <td class="col-tulam">6 &micro;s</td>
+            <td class="col-ratio">0.8x</td>
           </tr>
           <tr class="bench-win">
             <td>Permute</td>
-            <td>12 &micro;s</td>
-            <td>35 &micro;s</td>
-            <td>87 &micro;s</td>
-            <td class="col-tulam">2 &micro;s</td>
+            <td>11 &micro;s</td>
+            <td>36 &micro;s</td>
+            <td>79 &micro;s</td>
+            <td class="col-tulam">1 &micro;s</td>
             <td class="col-ratio">0.1x</td>
           </tr>
-          <tr>
+          <tr class="bench-win">
             <td>Sieve</td>
-            <td>7 &micro;s</td>
+            <td>9 &micro;s</td>
             <td>27 &micro;s</td>
-            <td>105 &micro;s</td>
-            <td class="col-tulam">11 &micro;s</td>
-            <td class="col-ratio">1.5x</td>
+            <td>100 &micro;s</td>
+            <td class="col-tulam">9 &micro;s</td>
+            <td class="col-ratio">1.0x</td>
           </tr>
           <tr>
             <td>Towers</td>
             <td>14 &micro;s</td>
-            <td>47 &micro;s</td>
-            <td>125 &micro;s</td>
-            <td class="col-tulam">33 &micro;s</td>
-            <td class="col-ratio">2.3x</td>
+            <td>46 &micro;s</td>
+            <td>103 &micro;s</td>
+            <td class="col-tulam">50 &micro;s</td>
+            <td class="col-ratio">3.5x</td>
           </tr>
           <tr class="bench-win">
             <td>NBody</td>
-            <td>8.9 ms</td>
-            <td>24.8 ms</td>
-            <td>12.7 ms</td>
-            <td class="col-tulam">8.8 ms</td>
+            <td>8.8 ms</td>
+            <td>23.6 ms</td>
+            <td>12.0 ms</td>
+            <td class="col-tulam">7.8 ms</td>
             <td class="col-ratio">0.9x</td>
           </tr>
-          <tr class="bench-win">
+          <tr>
             <td>Bounce</td>
-            <td>27 &micro;s</td>
-            <td>26 &micro;s</td>
-            <td>166 &micro;s</td>
-            <td class="col-tulam">8 &micro;s</td>
-            <td class="col-ratio">0.2x</td>
+            <td>5 &micro;s</td>
+            <td>18 &micro;s</td>
+            <td>159 &micro;s</td>
+            <td class="col-tulam">7 &micro;s</td>
+            <td class="col-ratio">1.4x</td>
           </tr>
           <tr class="bench-win">
             <td>Storage</td>
-            <td>192 &micro;s</td>
-            <td>86 &micro;s</td>
+            <td>196 &micro;s</td>
+            <td>63 &micro;s</td>
             <td>203 &micro;s</td>
-            <td class="col-tulam">118 &micro;s</td>
+            <td class="col-tulam">112 &micro;s</td>
             <td class="col-ratio">0.6x</td>
           </tr>
           <tr class="bench-win">
             <td>Mandelbrot</td>
-            <td>19.9 ms</td>
+            <td>19.4 ms</td>
             <td>9.4 ms</td>
-            <td>20.4 ms</td>
-            <td class="col-tulam">11.6 ms</td>
-            <td class="col-ratio">0.5x</td>
+            <td>20.0 ms</td>
+            <td class="col-tulam">12.4 ms</td>
+            <td class="col-ratio">0.6x</td>
           </tr>
         </tbody>
         <tfoot>
           <tr>
             <td>Geometric mean</td>
             <td>1.0x</td>
-            <td>1.6x</td>
-            <td>5.4x</td>
-            <td class="col-tulam">0.8x</td>
+            <td>1.9x</td>
+            <td>8.6x</td>
+            <td class="col-tulam">1.1x</td>
             <td class="col-ratio">&mdash;</td>
           </tr>
         </tfoot>
@@ -387,9 +388,9 @@
 
     <p class="bench-note">
       <span class="bench-win-dot"></span> Faster than C++ &nbsp;&mdash;&nbsp;
-      Lower is better. Ratios show time relative to C++. Benchmarks from
-      <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a>
-      (objects, closures, arrays &mdash; no micro-tricks).
+      Lower is better. Ratios show time relative to C++. Apple Silicon (arm64-darwin), measured 2026-04-23.
+      Benchmarks from <a href="https://github.com/smarr/are-we-fast-yet" target="_blank">Are We Fast Yet</a>
+      &mdash; objects, closures, arrays, no micro-tricks.
     </p>
   </div>
 </section>
